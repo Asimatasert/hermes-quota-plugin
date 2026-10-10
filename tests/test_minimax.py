@@ -412,6 +412,15 @@ class MiniMaxCnPlatformTests(unittest.TestCase):
             {"base_resp": {"status_code": 1004, "status_msg": "plan not found"}}))
         self.assertFalse(minimax._key_not_recognized("nope"))
 
+    def test_malformed_status_codes_fail_open(self):
+        for status in ("--2049", "²"):
+            with self.subTest(status=status), \
+                 mock.patch.object(minimax, "resolve_bearer", return_value="SYNTHETIC_KEY"), \
+                 mock.patch.object(minimax, "_get_json", return_value={
+                     "base_resp": {"status_code": status}}):
+                result = minimax.fetch_minimax_quota()
+                self.assertEqual(result.unavailable_reason, "fetch-error")
+
     def test_a_cn_key_falls_back_to_the_cn_platform_hosts(self):
         opener = mock.Mock(side_effect=self._platform_routes())
         result = self.fetch(opener)
