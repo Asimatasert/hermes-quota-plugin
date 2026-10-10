@@ -436,6 +436,11 @@ def fetch_minimax_quota() -> QuotaResult:
             return build_unavailable(PROVIDER_ID, "timeout")
         try:
             payload = _get_json(f"{host}{_QUOTA_PATH}", bearer, min(_REQUEST_TIMEOUT_S, remaining))
+            if _key_not_recognized(payload):
+                # Wrong-platform key: try the next host before giving up.
+                last_reason = "auth-failed"
+                continue
+            return parse_quota_payload(payload)
         except urllib.error.HTTPError as exc:
             # A 404 on the canonical host → try the mirror before giving up.
             if exc.code == 404 and index < len(_HOSTS) - 1:
@@ -444,11 +449,5 @@ def fetch_minimax_quota() -> QuotaResult:
             return build_unavailable(PROVIDER_ID, _http_reason(exc))
         except Exception as exc:  # noqa: BLE001 - fail-open by contract
             return build_unavailable(PROVIDER_ID, _http_reason(exc))
-        if _key_not_recognized(payload):
-            # Wrong-platform key: try the next host (the other platform's).
-            # Every host rejecting it ends the loop as ``auth-failed``.
-            last_reason = "auth-failed"
-            continue
-        return parse_quota_payload(payload)
 
     return build_unavailable(PROVIDER_ID, last_reason)
