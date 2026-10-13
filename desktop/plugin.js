@@ -1544,8 +1544,7 @@ function ProviderRow({ id, provider }) {
 					`${id}-w-${i}`,
 				);
 			}),
-			...(dense || id === "openrouter"
-				? details.filter((d) => facts.available == null || !/^API calls available: (yes|no)$/.test(d)).map((d, i) =>
+			...details.filter((d) => (dense || id === "openrouter" || (baseProviderId(id) === "anthropic" && /^Observed /.test(d))) && (facts.available == null || !/^API calls available: (yes|no)$/.test(d))).map((d, i) =>
 						jsx(
 							"div",
 							{
@@ -1554,8 +1553,7 @@ function ProviderRow({ id, provider }) {
 							},
 							`${id}-d-${i}`,
 						),
-					)
-				: []),
+				),
 		],
 	});
 }

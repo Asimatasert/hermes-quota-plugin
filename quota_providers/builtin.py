@@ -25,6 +25,7 @@ import stat
 import sys
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional
 
@@ -250,43 +251,173 @@ _ANTHROPIC_SHARED_STALE_MAX_S = 60 * 60
 _ANTHROPIC_SHARED_FILENAME = "quota_anthropic_shared.json"
 
 
+@contextmanager
+def _anthropic_state_lock(path: str, deadline: float):
+    """Persistent advisory lock: never unlink a lock another process may hold.
+
+    Unsupported/unwritable storage preserves the historical fail-open read.
+    Contention times out without issuing a duplicate HTTP request.
+    """
+    import time
+
+    fd = None
+    acquired = None
+    try:
+        try:
+            import fcntl
+            def try_lock():
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except ImportError:
+            import msvcrt
+            def try_lock():
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+
+        fd = _open_anthropic_state(path, os.O_CREAT | os.O_RDWR)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError('nonregular lock')
+        if os.fstat(fd).st_size == 0:
+            os.write(fd, b'\0')
+        while True:
+            try:
+                try_lock()
+                acquired = True
+                break
+            except OSError as exc:
+                import errno
+                if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    acquired = False
+                    break
+                time.sleep(min(.02, remaining))
+    except (ImportError, OSError, AttributeError):
+        pass
+    try:
+        yield acquired
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
 def _shared_payload_path() -> str:
     # Lives beside the backoff state, so whatever relocates that file relocates
     # this one too.
     return os.path.join(os.path.dirname(_backoff_state_path()) or ".", _ANTHROPIC_SHARED_FILENAME)
 
 
+_ANTHROPIC_STATE_MAX_BYTES = 1024 * 1024
+
+
+def _open_anthropic_state(path: str, flags: int):
+    """Validate both the path and the opened file, including on Windows."""
+    import stat
+
+    try:
+        before = os.lstat(path)
+        if not stat.S_ISREG(before.st_mode):
+            raise OSError('nonregular shared state')
+    except FileNotFoundError:
+        before = None
+    fd = os.open(path, flags | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_NOFOLLOW', 0)
+                 | getattr(os, 'O_BINARY', 0), 0o600)
+    try:
+        opened = os.fstat(fd)
+        after = os.lstat(path)
+        if (not stat.S_ISREG(opened.st_mode) or not stat.S_ISREG(after.st_mode)
+                or (opened.st_dev, opened.st_ino) != (after.st_dev, after.st_ino)
+                or (before is not None and (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino))):
+            raise OSError('shared state changed during open')
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _read_anthropic_state(path: str):
+    """Read only a bounded regular file without following a final symlink."""
+    import stat
+
+    fd = _open_anthropic_state(path, os.O_RDONLY)
+    with os.fdopen(fd, 'rb') as fh:
+        info = os.fstat(fh.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > _ANTHROPIC_STATE_MAX_BYTES:
+            raise ValueError('invalid shared state file')
+        body = fh.read(_ANTHROPIC_STATE_MAX_BYTES + 1)
+    if len(body) > _ANTHROPIC_STATE_MAX_BYTES:
+        raise ValueError('oversize shared state')
+    return json.loads(body)
+
+
+def _anthropic_state_writable(path: str) -> bool:
+    import stat
+
+    try:
+        return stat.S_ISREG(os.lstat(path).st_mode)
+    except FileNotFoundError:
+        return True
+
+
+def _state_number(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+        return number if math.isfinite(number) else None
+    except (OverflowError, ValueError):
+        return None
+
+
+class _ObservedAnthropicPayload(dict):
+    """Keep local cache provenance out of the vendor's payload keys."""
+
+    def __init__(self, payload, observed_at, stale):
+        super().__init__(payload)
+        self.observed_at = observed_at
+        self.stale = stale
+
+
 def _load_shared_payload(token: str, max_age: float = _ANTHROPIC_SHARED_TTL_S) -> Optional[dict[str, Any]]:
     import time
 
     try:
-        with open(_shared_payload_path(), encoding="utf-8") as fh:
-            data = json.load(fh)
+        data = _read_anthropic_state(_shared_payload_path())
         entry = data.get(_backoff_key(token)) if isinstance(data, dict) else None
         if not isinstance(entry, dict):
             return None
-        at = entry.get("at")
+        at = _state_number(entry.get("at"))
         payload = entry.get("payload")
-        if isinstance(at, bool) or not isinstance(at, (int, float)) or not isinstance(payload, dict):
+        if at is None or not isinstance(payload, dict):
             return None
         age = time.time() - float(at)
         if math.isfinite(age) and 0 <= age <= max_age:
-            return payload
+            return _ObservedAnthropicPayload(payload, float(at), age > _ANTHROPIC_SHARED_TTL_S)
     except Exception:  # noqa: BLE001 - missing/corrupt state means no shared payload
         pass
     return None
 
 
-def _store_shared_payload(token: str, payload: dict[str, Any]) -> None:
+def _store_shared_payload(token: str, payload: dict[str, Any], *, deadline=None) -> None:
+    import time
+
+    deadline = time.monotonic() + .25 if deadline is None else deadline
+    with _anthropic_state_lock(_shared_payload_path() + '.lock', deadline) as acquired:
+        if acquired is True:
+            _store_shared_payload_locked(token, payload)
+
+
+def _store_shared_payload_locked(token: str, payload: dict[str, Any]) -> None:
     import tempfile
     import time
 
     tmp = None
     try:
         path = _shared_payload_path()
+        if not _anthropic_state_writable(path):
+            return
         try:
-            with open(path, encoding="utf-8") as fh:
-                data = json.load(fh)
+            data = _read_anthropic_state(path)
         except Exception:  # noqa: BLE001
             data = {}
         if not isinstance(data, dict):
@@ -294,8 +425,8 @@ def _store_shared_payload(token: str, payload: dict[str, Any]) -> None:
         now = time.time()
         kept: dict[str, Any] = {}
         for key, entry in data.items():
-            at = entry.get("at") if isinstance(entry, dict) else None
-            if isinstance(at, (int, float)) and not isinstance(at, bool) and 0 <= now - at <= _ANTHROPIC_SHARED_STALE_MAX_S:
+            at = _state_number(entry.get("at")) if isinstance(entry, dict) else None
+            if at is not None and 0 <= now - at <= _ANTHROPIC_SHARED_STALE_MAX_S:
                 kept[str(key)] = entry
         kept[_backoff_key(token)] = {"at": now, "payload": payload}
         fd, tmp = tempfile.mkstemp(
@@ -319,8 +450,7 @@ def _backoff_key(token: str) -> str:
 
 def _load_backoff() -> dict[str, float]:
     try:
-        with open(_backoff_state_path(), encoding="utf-8") as fh:
-            data = json.load(fh)
+        data = _read_anthropic_state(_backoff_state_path())
     except Exception:  # noqa: BLE001 - missing/corrupt state means no cooldown
         return {}
     if not isinstance(data, dict):
@@ -333,10 +463,8 @@ def _load_backoff() -> dict[str, float]:
     ceiling = time.time() + _ANTHROPIC_RATE_LIMIT_COOLDOWN_S
     out: dict[str, float] = {}
     for key, value in data.items():
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            continue
-        number = float(value)
-        if not math.isfinite(number) or number > ceiling:
+        number = _state_number(value)
+        if number is None or number > ceiling:
             continue
         out[str(key)] = number
     return out
@@ -348,6 +476,8 @@ def _save_backoff(state: dict[str, float]) -> None:
     tmp = None
     try:
         path = _backoff_state_path()
+        if not _anthropic_state_writable(path):
+            return
         # mkstemp gives a unique 0600 file per writer, so concurrent writers
         # cannot interleave in one shared temp file.
         fd, tmp = tempfile.mkstemp(
@@ -372,7 +502,16 @@ def _anthropic_cooling_down(token: str) -> bool:
     return state.get(_backoff_key(token), 0.0) > now
 
 
-def _open_anthropic_cooldown(token: str) -> None:
+def _open_anthropic_cooldown(token: str, *, deadline=None) -> None:
+    import time
+
+    deadline = time.monotonic() + .25 if deadline is None else deadline
+    with _anthropic_state_lock(_backoff_state_path() + '.lock', deadline) as acquired:
+        if acquired is True:
+            _open_anthropic_cooldown_locked(token)
+
+
+def _open_anthropic_cooldown_locked(token: str) -> None:
     import time
 
     now = time.time()
@@ -384,11 +523,30 @@ def _open_anthropic_cooldown(token: str) -> None:
 def _request_anthropic_usage(
     token: str, *, timeout: float = _ANTHROPIC_TIMEOUT_S
 ) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    import time
+
+    deadline = time.monotonic() + max(0.0, timeout)
+    path = _shared_payload_path() + '.' + _backoff_key(token) + '.lock'
+    with _anthropic_state_lock(path, deadline) as acquired:
+        if acquired is False:
+            return None, 'timeout'
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None, 'timeout'
+        return _request_anthropic_usage_locked(token, timeout=remaining)
+
+
+def _request_anthropic_usage_locked(
+    token: str, *, timeout: float
+) -> tuple[Optional[dict[str, Any]], Optional[str]]:
     """One bounded, redirect-free usage read for a given bearer token.
 
     ``token`` is passed in, never resolved here, so the same request path
     serves the core-resolved account and every configured extra account.
     """
+    import time
+
+    deadline = time.monotonic() + timeout
     shared = _load_shared_payload(token)
     if shared is not None:
         return shared, None
@@ -409,7 +567,10 @@ def _request_anthropic_usage(
         method="GET",
     )
     try:
-        with urlopen_no_redirect(request, timeout=timeout) as resp:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None, 'timeout'
+        with urlopen_no_redirect(request, timeout=remaining) as resp:
             body = resp.read(_MAX_HTTP_BYTES + 1)
         if len(body) > _MAX_HTTP_BYTES:
             return None, "bad-json"
@@ -418,7 +579,7 @@ def _request_anthropic_usage(
         if exc.code in (401, 403):
             return None, "auth-failed"
         if exc.code == 429:
-            _open_anthropic_cooldown(token)
+            _open_anthropic_cooldown(token, deadline=deadline)
             stale = _load_shared_payload(token, _ANTHROPIC_SHARED_STALE_MAX_S)
             if stale is not None:
                 return stale, None
@@ -427,7 +588,7 @@ def _request_anthropic_usage(
         return None, f"fetch-error:{type(exc).__name__}"
     if not isinstance(payload, dict):
         return None, "bad-json"
-    _store_shared_payload(token, payload)
+    _store_shared_payload(token, payload, deadline=deadline)
     return payload, None
 
 
@@ -497,6 +658,14 @@ def _parse_anthropic_usage(payload: dict[str, Any]) -> tuple[list[QuotaWindow], 
             and not isinstance(monthly, bool)
         ):
             details.append(f"Extra usage: {used:.2f} / {monthly:.2f} {currency}")
+    if (windows or details) and isinstance(payload, _ObservedAnthropicPayload):
+        import time
+        from datetime import datetime, timezone
+
+        observed = datetime.fromtimestamp(payload.observed_at, timezone.utc).isoformat()
+        age = max(0, int(time.time() - payload.observed_at))
+        status = 'stale; 429 cooldown' if payload.stale else 'shared cache'
+        details.insert(0, f'Observed {observed} · {age}s old · {status}')
     return windows, details
 
 
