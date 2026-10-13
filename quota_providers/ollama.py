@@ -25,9 +25,9 @@ which was wrong by up to a month for anyone who subscribed after signing up.
 
 The percent is derived, not reported: `(allowance_usd - balance_usd) /
 allowance_usd`. Both sides are real dollars from the same response, so the
-division is arithmetic, not inference. `balance_usd` above the allowance
-(pay-as-you-go overspend) yields >100% used rather than being clamped, matching
-the old behaviour for the same situation.
+division is arithmetic, not inference. A balance above the allowance yields
+negative used percent (more than 100% remaining); a negative balance yields
+more than 100% used. Neither direction is clamped in the provider data.
 
 **The two pools are separate money.** ollama.com/settings shows "Free usage
 credits" with a percentage against a small monthly allowance, and "Usage
@@ -47,7 +47,9 @@ so, instead of implying it is the same number as the percentage's base.
 
 Legacy pre-credits plans return `included.session` / `included.weekly` with
 `remaining_percent` and `resets_at` instead of `balance_usd`/`allowance_usd`.
-Those are reported verbatim — the percent is Ollama's own, not derived.
+Valid remaining percentages are converted to used percentages; invalid values
+are omitted. Published resets are normalized to UTC independently, and windows
+with neither a usable percentage nor reset are omitted.
 
 **`GET /api/usage` — spend and request counts over a time range.** The endpoint
 was rewritten as a timeseries and no longer returns `activity` / `limits`:
@@ -65,9 +67,8 @@ was rewritten as a timeseries and no longer returns `activity` / `limits`:
 `range` is one of `24h` (hourly buckets), `7d` or `30d` (daily). Anything else
 returns 400, as does any unrecognised parameter.
 
-**No plan.** `POST /api/me` returns `"Plan": "free"`, but that is a write-shaped
-request to repeat on every refresh for a label, so it is not used. `plan` stays
-None.
+**Plan.** `POST /api/me` supplies the plan label when available. A missing or
+failed profile leaves the plan unknown, without discarding balance or usage.
 
 Both endpoints allow 10 requests per minute per user, shared across API keys and
 devices, and answer a breach with 429 + `Retry-After`. Three calls per refresh
@@ -200,7 +201,8 @@ def _dollars(value) -> Optional[str]:
         return None
     cents = round(float(number), 2)
     if cents == 0.0 and float(number) != 0.0:
-        return f"{number:.4f}"
+        mills = f"{number:.4f}"
+        return mills if Decimal(mills) != 0 else f"{number:f}"
     return f"{cents:.2f}"
 
 
@@ -331,9 +333,11 @@ def _windows(included) -> list[QuotaWindow]:
         if not isinstance(block, dict):
             continue
         used = _used_from_remaining(block.get("remaining_percent"))
+        reset_at = _iso_utc(block.get("resets_at"))
+        if used is None and reset_at is None:
+            continue
         windows.append(QuotaWindow(
-            label=label, used_percent=used,
-            reset_at=_iso_utc(block.get("resets_at"))))
+            label=label, used_percent=used, reset_at=reset_at))
     return windows
 
 
@@ -464,11 +468,11 @@ def _iso_utc(value) -> Optional[str]:
         text = text[:-1] + "+00:00"
     try:
         parsed = datetime.datetime.fromisoformat(text)
-    except (ValueError, TypeError):
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+        return parsed.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (ValueError, TypeError, OverflowError):
         return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
-    return parsed.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 @register(_PROVIDER_ID)

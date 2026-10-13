@@ -161,6 +161,45 @@ def _http_error(code):
 # the card the live account now produces
 # ---------------------------------------------------------------------------
 
+class MaintainerRegressionTests(unittest.TestCase):
+    def test_utc_conversion_overflow_loses_only_the_invalid_reset(self):
+        for stamp in ('0001-01-01T00:00:00+01:00',
+                      '9999-12-31T23:59:59-01:00'):
+            with self.subTest(stamp=stamp):
+                balance = {'included': {'allowance_usd': 2.5, 'balance_usd': 2,
+                                        'period': {'until': stamp},
+                                        'weekly': {'remaining_percent': 75,
+                                                   'resets_at': stamp}},
+                           'purchased': {'balance_usd': 5}}
+                result = _fetch(usage=REAL_USAGE, balance=balance)
+                self.assertIsNone(result.unavailable_reason)
+                self.assertEqual([w.used_percent for w in result.windows], [20, 25])
+                self.assertEqual([w.reset_at for w in result.windows], [None, None])
+                self.assertEqual(result.account_balances[0].total_balance, '5.00')
+                self.assertIn('Requests (30d): 18', result.details)
+
+    def test_legacy_windows_without_percent_or_reset_are_omitted(self):
+        for block in ({}, {'remaining_percent': 150},
+                      {'remaining_percent': 'bad', 'resets_at': 'garbage'}):
+            for name in ('session', 'weekly'):
+                with self.subTest(block=block, name=name):
+                    result = _fetch(usage={}, balance={'included': {name: block}})
+                    self.assertEqual(result.windows, [])
+                    self.assertFalse(result.has_data())
+                    self.assertEqual(result.unavailable_reason, 'no-data')
+
+    def test_nonzero_subcent_wallet_never_displays_zero(self):
+        from decimal import Decimal
+
+        for value in ('0.001', '0.00001', '-0.00001', '1e-15'):
+            with self.subTest(value=value):
+                result = _fetch(usage={}, balance={'purchased': {'balance_usd': value}})
+                displayed = result.account_balances[0].total_balance
+                self.assertNotEqual(Decimal(displayed), 0)
+                self.assertEqual(Decimal(displayed), Decimal(value))
+                self.assertIn(f'Purchased credits: ${displayed} (does not refill at reset)', result.details)
+
+
 class LiveAccountCardTests(unittest.TestCase):
     def test_the_captured_account_renders_a_window(self):
         r = _fetch_real()
@@ -181,7 +220,9 @@ class LiveAccountCardTests(unittest.TestCase):
         self.assertEqual(got, "2026-10-22T09:45:23Z")
         when = datetime.datetime.strptime(got, "%Y-%m-%dT%H:%M:%SZ").replace(
             tzinfo=datetime.timezone.utc)
-        days = (when - datetime.datetime.now(datetime.timezone.utc)).days
+        # Compare to the capture clock, not the day the suite happens to run.
+        captured_at = datetime.datetime(2026, 10, 7, 12, tzinfo=datetime.timezone.utc)
+        days = (when - captured_at).days
         self.assertEqual(days // 7, 2, "the dashboard says 'Resets in 2 weeks'")
 
     def test_the_percentage_matches_the_dashboards_own_figure(self):
