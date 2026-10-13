@@ -60,7 +60,11 @@ Anthropic observation. A non-429 failure never serves expired data. Both shared
 state readers reject symlinks, FIFOs, devices, oversized files (over 1 MiB), and
 invalid/non-finite/out-of-range timestamps. Native concurrent-process behavior
 is verified on Linux; the Windows locking fallback is unit-tested, not verified
-on a Windows installation.
+on a Windows installation. Unreadable state remains a cache miss for requests,
+but an uncertain I/O failure (such as EIO or EACCES) aborts the persistent update
+instead of replacing other accounts' state. Nonregular and oversized state is
+also left untouched. Missing files may be initialized; demonstrably corrupt
+JSON, invalid text encoding, or a non-object JSON root may be replaced.
 
 `hermes config set` parses that JSON array into a real YAML list before it is
 written (verified against the installed CLI), so no extra quoting is needed. If
