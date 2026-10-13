@@ -61,20 +61,21 @@ two paid-model requests billed to purchased credit. The card labels the line
 sub-cent balance keeps extra digits so it cannot read as `$0.00`.
 
 **Legacy pre-credits plans** return `included.session` / `included.weekly` with
-Ollama's own `remaining_percent` and `resets_at` instead of dollar fields. Those
-are reported verbatim; the percent is Ollama's, not derived.
+Ollama's own `remaining_percent` and `resets_at` instead of dollar fields. Valid
+0–100 remaining percentages are converted to used percentages. Invalid
+percentages and resets are omitted independently; a window with neither is
+not data. A missing profile plan remains unknown, never inferred from the pool.
 
 Both endpoints allow 10 requests per minute per user, shared across API keys and
 devices, and answer a breach with `429` and a `Retry-After` header — reported as
 `http-429`. The card makes three calls per refresh, well inside that.
 
-Upstream, still open:
+Related upstream discussions:
 
 - [ollama/ollama#12532 — Cloud usage stats](https://github.com/ollama/ollama/issues/12532)
 - [ollama/ollama#18653 — Cloud API: expose credit balance & true spend](https://github.com/ollama/ollama/issues/18653)
 
-#18653 is the request this landed against; it remains open because the endpoint
-is undocumented in the issue thread, not unimplemented.
+
 
 ### Antigravity
 
