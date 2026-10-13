@@ -40,7 +40,9 @@ class AnthropicUncertainReadTests(unittest.TestCase):
     def refresh_b(self, rate_limited):
         if rate_limited:
             error = urllib.error.HTTPError(b._ANTHROPIC_USAGE_URL, 429, 'synthetic', None, None)
-            self.addCleanup(error.close)
+            # Python 3.9's HTTPError.close cannot close a missing fp.
+            if error.fp is not None:
+                self.addCleanup(error.close)
             opener = mock.Mock(side_effect=error)
         else:
             response = mock.MagicMock()
