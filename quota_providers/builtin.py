@@ -418,7 +418,9 @@ def _store_shared_payload_locked(token: str, payload: dict[str, Any]) -> None:
             return
         try:
             data = _read_anthropic_state(path)
-        except Exception:  # noqa: BLE001
+        except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError):
+            # Missing or demonstrably corrupt JSON may be initialized. An
+            # uncertain read must abort, not erase other accounts' payloads.
             data = {}
         if not isinstance(data, dict):
             data = {}
@@ -448,10 +450,15 @@ def _backoff_key(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()[:24]
 
 
-def _load_backoff() -> dict[str, float]:
+def _load_backoff(*, for_update: bool = False) -> dict[str, float]:
+    """Fail open for requests, but require a certain read before merging writes."""
     try:
         data = _read_anthropic_state(_backoff_state_path())
+    except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
     except Exception:  # noqa: BLE001 - missing/corrupt state means no cooldown
+        if for_update:
+            raise
         return {}
     if not isinstance(data, dict):
         return {}
@@ -515,7 +522,10 @@ def _open_anthropic_cooldown_locked(token: str) -> None:
     import time
 
     now = time.time()
-    state = {k: v for k, v in _load_backoff().items() if v > now}
+    try:
+        state = {k: v for k, v in _load_backoff(for_update=True).items() if v > now}
+    except Exception:  # noqa: BLE001 - uncertain reads must not replace state
+        return
     state[_backoff_key(token)] = now + _ANTHROPIC_RATE_LIMIT_COOLDOWN_S
     _save_backoff(state)
 
