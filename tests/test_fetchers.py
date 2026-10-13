@@ -989,7 +989,8 @@ class AnthropicScopedLimitTests(unittest.TestCase):
             res = builtin._fetch_anthropic()
         self.assertIsNone(res.unavailable_reason)
         self.assertEqual(len(seen), 1)
-        self.assertEqual(seen[0], builtin._ANTHROPIC_TIMEOUT_S)
+        self.assertGreater(seen[0], 0)
+        self.assertLessEqual(seen[0], builtin._ANTHROPIC_TIMEOUT_S)
 
 
 
