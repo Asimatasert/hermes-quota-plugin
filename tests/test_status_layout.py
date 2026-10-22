@@ -176,7 +176,7 @@ class QuotaLayoutTests(unittest.TestCase):
             set(payload),
             {
                 "fetched_at", "providers", "age_s", "plugin_version", "installed_sha",
-                "codex_special_reset",
+                "codex_special_reset", "timezone",
             },
         )
         self.assertEqual(payload["providers"], cache["providers"])
@@ -214,6 +214,21 @@ class QuotaLayoutTests(unittest.TestCase):
         expected = datetime.fromisoformat(
             "2026-10-22T06:55:54+00:00").astimezone().strftime("%b %d %H:%M")
         self.assertIn(f"announced {expected}", render(cache))
+
+    def test_special_reset_uses_the_configured_zone_not_the_process_zone(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        cmd, _plugin = _modules()
+        cache = self.cache({"openai-codex": record("openai-codex", [window()])})
+        cache["codex_special_reset"] = self.special()
+        with mock.patch.object(cmd, "local_tz", return_value=ZoneInfo("Asia/Tokyo")):
+            line = cmd._special_reset_line(cache)
+        self.assertIn("announced Oct 22 15:55", line)
+        self.assertEqual(
+            datetime.fromisoformat("2026-10-22T06:55:54+00:00")
+            .astimezone(ZoneInfo("Asia/Tokyo")).strftime("%b %d %H:%M"),
+            "Oct 22 15:55",
+        )
 
     def test_banked_special_reset_keeps_its_own_wording(self):
         cache = self.cache({"openai-codex": record("openai-codex", [window()])})

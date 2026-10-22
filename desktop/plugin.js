@@ -687,14 +687,22 @@ const SPECIAL_RESET_STATUS = {
 	recorded: "Recorded",
 };
 
-function announcedDate(iso) {
+function announcedDate(iso, timeZone) {
 	if (!iso) return "";
 	const dt = new Date(iso);
 	if (!Number.isFinite(dt.getTime())) return "";
-	return new Intl.DateTimeFormat(undefined, {
-		year: "numeric", month: "short", day: "2-digit",
-		hour: "2-digit", minute: "2-digit",
-	}).format(dt);
+	try {
+		return new Intl.DateTimeFormat(undefined, {
+			year: "numeric", month: "short", day: "2-digit",
+			hour: "2-digit", minute: "2-digit",
+			timeZone: timeZone || undefined,
+		}).format(dt);
+	} catch {
+		return new Intl.DateTimeFormat(undefined, {
+			year: "numeric", month: "short", day: "2-digit",
+			hour: "2-digit", minute: "2-digit",
+		}).format(dt);
+	}
 }
 
 function codexSpecial(data) {
@@ -711,7 +719,8 @@ function codexSpecial(data) {
 		if (!status || !resetType) return null;
 		// Only an explicitly zoned ISO timestamp is accepted; no local guess.
 		if (typeof value.announced_at !== "string" || !/(?:Z|[+-]\d{2}:\d{2})$/.test(value.announced_at)) return null;
-		const announced = announcedDate(value.announced_at);
+		const zone = typeof data.timezone === "string" ? data.timezone : "";
+		const announced = announcedDate(value.announced_at, zone);
 		if (!announced) return null;
 		if (typeof value.source_url !== "string" || !SPECIAL_RESET_SOURCE.test(value.source_url)) return null;
 		const checked = typeof root.fetched_at === "string" ? checkedDateTime(root.fetched_at) : "";

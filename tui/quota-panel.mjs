@@ -26,15 +26,16 @@ function friendlyName(id, record, account) {
   return label ? `${name} · ${clean(label)}` : name;
 }
 
-function resetDate(value, now) {
+function resetDate(value, now, zone = '') {
   const date = new Date(value);
   if (!Number.isFinite(date.getTime())) return '';
-  const pad = n => String(n).padStart(2, '0');
-  const year = date.getFullYear() !== new Date(now).getFullYear() ? `/${date.getFullYear()}` : '';
-  return `${pad(date.getDate())}/${pad(date.getMonth() + 1)}${year} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  const fields = zoneParts(date, safeZone(zone));
+  const nowFields = zoneParts(new Date(now), safeZone(zone));
+  const year = fields.year !== nowFields.year ? `/${fields.year}` : '';
+  return `${fields.day}/${fields.month}${year} ${fields.hour}:${fields.minute}`;
 }
 
-function resetLabel(value, now) {
+function resetLabel(value, now, zone = '') {
   const time = typeof value === 'string' ? Date.parse(value) : NaN;
   if (!Number.isFinite(time)) return '';
   const minutes = Math.ceil((time - now) / 60000);
@@ -42,7 +43,7 @@ function resetLabel(value, now) {
   const days = Math.floor(minutes / 1440);
   const hours = Math.floor((minutes % 1440) / 60);
   const relative = days ? `${days}d ${hours}h` : hours ? `${hours}h ${minutes % 60}m` : `${minutes}m`;
-  return `reset ${relative} (${resetDate(value, now)})`;
+  return `reset ${relative} (${resetDate(value, now, zone)})`;
 }
 
 export function panelModel(cache, selected = [], now = Date.now()) {
@@ -63,7 +64,7 @@ export function panelModel(cache, selected = [], now = Date.now()) {
         const used = window.used_percent;
         const percent = typeof used === 'number' && Number.isFinite(used) && used >= 0 && used <= 100
           ? `${Math.round(100 - used)}% left` : '? left';
-        const reset = resetLabel(window.reset_at, now);
+        const reset = resetLabel(window.reset_at, now, cache?.timezone);
         return `${clean(window.label || 'Window')} ${percent}${reset ? ` (${reset})` : ''}`;
       });
       const balances = list(account.account_balances).filter(object).filter(b =>
@@ -92,8 +93,8 @@ export function meterModel(cache, selector, now = Date.now()) {
   const row = model.rows.find(item => item.id === selector) || model.rows[0];
   const meters = row?.unavailable ? [] : list(row?.windows).map(window => {
     const used = window.used_percent;
-    return { label: clean(window.label || 'Window'), reset: resetLabel(window.reset_at, now),
-      resetDate: typeof window.reset_at === 'string' ? resetDate(window.reset_at, now) : '',
+    return { label: clean(window.label || 'Window'), reset: resetLabel(window.reset_at, now, cache?.timezone),
+      resetDate: typeof window.reset_at === 'string' ? resetDate(window.reset_at, now, cache?.timezone) : '',
       remaining: typeof used === 'number' && Number.isFinite(used) && used >= 0 && used <= 100 ? Math.round(100 - used) : null };
   });
   return { ...model, label: row?.label || clean(selector || 'Choose a provider'),
@@ -107,6 +108,30 @@ const length = text => [...text].length;
 // forecasts, observations and scheduled_for are deliberately ignored. The X
 // source is the verified announcer account, never arbitrary cached text.
 const SPECIAL_SOURCE = /^https:\/\/x\.com\/thsottiaux\/status\/\d+$/;
+
+/** A usable IANA zone name, or '' to use the process zone. */
+function safeZone(value) {
+  const name = typeof value === 'string' ? value.trim() : '';
+  if (!name) return '';
+  try {
+    new Intl.DateTimeFormat('en-GB', { timeZone: name }).format(new Date());
+    return name;
+  } catch {
+    return '';
+  }
+}
+
+/** Calendar fields for one instant in the chosen zone. */
+function zoneParts(date, zone) {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: zone || undefined,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  }).formatToParts(date);
+  const out = {};
+  for (const part of parts) if (part.type !== 'literal') out[part.type] = part.value;
+  return out;
+}
 
 /** Provider-level announcement from the cache root, or null when unusable. */
 export function specialResetModel(cache, now = Date.now()) {
@@ -123,16 +148,18 @@ export function specialResetModel(cache, now = Date.now()) {
   if (!Number.isFinite(time)) return null;
   if (typeof announcement.source_url !== 'string' || !SPECIAL_SOURCE.test(announcement.source_url)) return null;
   const date = new Date(time);
-  const pad = n => String(n).padStart(2, '0');
-  // A stale flag and a successful fetch timestamp are both required to call
-  // this fresh; missing or malformed metadata is qualified, never assumed.
+  // Format in the user's configured zone (cache root) so a gateway or
+  // renderer running under another TZ cannot shift the announcement hour.
+  const zone = safeZone(cache?.timezone);
+  const fields = zoneParts(date, zone);
+  const nowFields = zoneParts(new Date(now), zone);
   const fetched = typeof root.fetched_at === 'string' ? Date.parse(root.fetched_at) : NaN;
-  const year = date.getFullYear() === new Date(now).getFullYear() ? '' : `/${date.getFullYear()}`;
+  const year = fields.year === nowFields.year ? '' : `/${fields.year}`;
   return {
     id: clean(announcement.id), status, resetType,
     announcedAt, sourceUrl: announcement.source_url,
     stale: root.stale !== false || !Number.isFinite(fetched),
-    date: `${pad(date.getDate())}/${pad(date.getMonth() + 1)}${year} ${pad(date.getHours())}:${pad(date.getMinutes())}`,
+    date: `${fields.day}/${fields.month}${year} ${fields.hour}:${fields.minute}`,
   };
 }
 
@@ -141,10 +168,10 @@ function announcementVariants(special) {
   const mark = special.stale ? 'STALE · ' : '';
   const banked = special.resetType === 'banked';
   return [
-    `${mark}✨ ${banked ? 'Banked special reset' : 'Special reset'} · announced ${special.date} · ${special.status} · ${ANNOUNCEMENT_CREDIT}`,
-    `${mark}✨ ${banked ? 'Banked reset' : 'Reset'} · announced ${special.date} · ${special.status} · ${ANNOUNCEMENT_CREDIT}`,
-    `${mark}announced ${special.date} · ${special.status} · ${ANNOUNCEMENT_CREDIT}`,
-    `${mark}announced ${special.date} · ${ANNOUNCEMENT_CREDIT}`,
+    `${mark}✨ ${banked ? 'Banked reset' : 'Reset'} ${special.date} · ${special.status} · ${ANNOUNCEMENT_CREDIT}`,
+    `${mark}✨ ${banked ? 'Banked reset' : 'Reset'} ${special.date} · ${ANNOUNCEMENT_CREDIT}`,
+    `${mark}✨ ${special.date} · ${special.status} · ${ANNOUNCEMENT_CREDIT}`,
+    `${mark}✨ ${special.date} · ${ANNOUNCEMENT_CREDIT}`,
     `${mark}ann. ${special.date} · ${ANNOUNCEMENT_CREDIT}`,
   ];
 }
@@ -154,8 +181,8 @@ function announcementVariants(special) {
 export function specialNoticeText(cache, now = Date.now(), cols = 120) {
   const special = specialResetModel(cache, now);
   if (!special) return '';
-  if (cols < 60) return `${special.stale ? 'STALE · ' : ''}announced ${special.date} · ${ANNOUNCEMENT_CREDIT}`;
-  return `✨ ${special.resetType === 'banked' ? 'Banked' : 'Special'} reset · announced ${special.date} · ${special.status} · ${special.stale ? 'stale · ' : ''}${ANNOUNCEMENT_CREDIT}`;
+  if (cols < 60) return `${special.stale ? 'STALE · ' : ''}✨ ${special.date} · ${ANNOUNCEMENT_CREDIT}`;
+  return `✨ ${special.resetType === 'banked' ? 'Banked' : 'Special'} reset ${special.date} · ${special.status} · ${special.stale ? 'stale · ' : ''}${ANNOUNCEMENT_CREDIT}`;
 }
 
 /** Exactly one line; tightest known window first, with explicit overflow. */
@@ -211,8 +238,14 @@ export function lineModel(cache, selector, cols, now = Date.now(), status = {}) 
     ];
     const announcements = announcementVariants(special);
     // Quota identity and state stay mandatory; only secondary detail degrades.
-    const pairs = [[0, 0], [0, 1], [0, 2], [1, 1], [1, 2], [1, 3], [2, 2], [2, 3],
-      [2, 4], [2, 5], [0, 5], [0, 6], [3, 4], [3, 5]];
+    const pairs = [
+      [0, 0], [0, 1], [0, 2],
+      [2, 1], [2, 2], [2, 3], [2, 4],
+      [1, 2], [1, 3], [1, 4],
+      [3, 3], [3, 4],
+      [4, 4],
+      [0, 5], [0, 6], [4, 5], [4, 6],
+    ];
     const candidate = pairs
       .map(([a, q]) => `${announcements[a]} · ${quotaVariants[q]}`)
       .find(value => length(value) <= width);

@@ -270,6 +270,19 @@ test('special reset announcement is a validated provider-level model, not a fore
   assert.match(old.date, /^02\/03\/2024 \d{2}:\d{2}$/);
 });
 
+test('special reset formats in the cache timezone, not the renderer zone', async () => {
+  const { specialResetModel } = await import(source);
+  const cache = specialCache({ id: 'r1', status: 'scheduled', reset_type: 'regular',
+    announced_at: '2026-10-22T06:55:54Z', source_url: SPECIAL_SOURCE });
+  const now = Date.parse('2026-10-22T12:00:00Z');
+  cache.timezone = 'Asia/Tokyo';
+  assert.equal(specialResetModel(cache, now).date, '22/10 15:55');
+  cache.timezone = 'America/Los_Angeles';
+  assert.equal(specialResetModel(cache, now).date, '21/10 23:55');
+  cache.timezone = 'Not/AZone';
+  assert.ok(specialResetModel(cache, now)); // unknown zone falls back, never hides
+});
+
 test('special reset line keeps quota at 80 cols and shows announced date, state and credit', async () => {
   const { lineModel } = await import(source);
   const now = Date.parse('2026-10-22T12:00:00Z');
@@ -277,7 +290,7 @@ test('special reset line keeps quota at 80 cols and shows announced date, state 
     const line = lineModel(specialCache({ id: 'r1', status: 'scheduled', reset_type: 'regular',
       announced_at: '2026-10-22T06:55:54Z', source_url: SPECIAL_SOURCE }), 'openai-codex', cols, now);
     assert.ok([...line.text].length <= cols, `${cols}: ${line.text}`);
-    assert.match(line.text, /announced 22\/10/, `${cols}: ${line.text}`);
+    assert.match(line.text, /\d{2}\/10 \d{2}:\d{2}/, `${cols}: ${line.text}`);
     assert.match(line.text, /scheduled/, `${cols}: ${line.text}`);
     assert.doesNotMatch(line.text, /scheduled_for|17:00|in \d|countdown/i);
     assert.match(line.text, /codex-resets\.com/, `${cols}: ${line.text}`);
@@ -291,7 +304,7 @@ test('special reset line keeps quota at 80 cols and shows announced date, state 
   assert.match(wide, /Banked/);
   assert.match(wide, /recorded/);
   assert.match(wide, /✨/);
-  assert.match(wide, /announced \d{2}\/10 \d{2}:\d{2}/);
+  assert.match(wide, /✨ Banked reset \d{2}\/10 \d{2}:\d{2}/);
   assert.doesNotMatch(wide, /happened|for you|executed/i);
   // Account renewal stays visibly separate from the announcement date.
   assert.match(wide, /reset 27\/10/);
@@ -310,13 +323,13 @@ test('special reset line degrades safely at 40 cols and is absent outside Codex'
   assert.match(line.text, /20%|80%/);
   assert.doesNotMatch(line.text, /codex-resets\.com/);
   assert.doesNotMatch(line.text, /\n/);
-  assert.match(specialNoticeText(cache, now), /✨ Special reset · announced 22\/10 \d{2}:\d{2} · scheduled · codex-resets\.com/);
+  assert.match(specialNoticeText(cache, now), /✨ Special reset 22\/10 \d{2}:\d{2} · scheduled · codex-resets\.com/);
   const narrow = specialNoticeText(cache, now, 40);
-  assert.match(narrow, /announced 22\/10 \d{2}:\d{2} · codex-resets\.com/);
+  assert.match(narrow, /✨ 22\/10 \d{2}:\d{2} · codex-resets\.com/);
   assert.ok([...narrow].length <= 40);
 
   const other = lineModel(cache, 'openai-codex:work', 120, now);
-  assert.match(other.text, /announced 22\/10/); // selected Codex account keeps the provider notice
+  assert.match(other.text, /\d{2}\/10 \d{2}:\d{2}/); // selected Codex account keeps the provider notice
   assert.match(other.text, /Personal/);
   const anthropic = lineModel({ ...cache,
     providers: { anthropic: { windows: [{ label: 'Weekly', used_percent: 10 }] } } }, 'anthropic', 120, now);
@@ -336,7 +349,7 @@ test('special reset never hides unavailable, stale or refresh-error quota state'
   assert.doesNotMatch(row.text, /\?%/);
   assert.match(row.text, /STALE/);
   assert.match(row.text, /refresh error/);
-  assert.match(row.text, /announced 22\/10/);
+  assert.match(row.text, /\d{2}\/10 \d{2}:\d{2}/);
   const stale = lineModel(base, 'openai-codex', 80, now);
   assert.doesNotMatch(stale.text, /\?%/);
 });
@@ -348,7 +361,7 @@ test('special reset hides malformed root data, marks stale, and barely styles as
     announced_at: '2026-10-22T06:55:54Z', source_url: SPECIAL_SOURCE }, { stale: true });
   const stale = lineModel(good, 'openai-codex', 120, now);
   assert.match(stale.text, /STALE/);
-  assert.match(stale.text, /announced 22\/10/);
+  assert.match(stale.text, /\d{2}\/10 \d{2}:\d{2}/);
   for (const bad of [
     { announcement: { id: 'x', status: 'nope', reset_type: 'regular', announced_at: '2026-10-22T06:55:54Z' } },
     { announcement: 'text' },

@@ -53,6 +53,7 @@ import tempfile
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 from hermes_constants import get_hermes_home
@@ -75,6 +76,39 @@ REFRESH_BUDGET_S = 20.0
 
 def _cache_path() -> str:
     return os.path.join(str(get_hermes_home()), _CACHE_FILENAME)
+
+
+def timezone_name() -> str:
+    """Hermes' configured IANA timezone; ``''`` means the host system zone.
+
+    The quota surfaces format timestamps with this zone instead of inheriting
+    whatever ``TZ`` the gateway process happened to start with: a widget or a
+    slash command must show the user's clock, not the server's.
+    """
+    try:
+        path = Path(get_hermes_home()) / "config.yaml"
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("timezone:"):
+                value = line.split(":", 1)[1].split("#", 1)[0].strip()
+                return value.strip("'\"")
+    except Exception:
+        logger.debug("quota_cache ▸ timezone read failed", exc_info=True)
+    return ""
+
+
+def local_tz():
+    """The user's timezone; the system zone when Hermes has no setting."""
+    name = timezone_name()
+    if name:
+        try:
+            from zoneinfo import ZoneInfo
+            return ZoneInfo(name)
+        except Exception:
+            logger.debug("quota_cache ▸ invalid timezone %r", name, exc_info=True)
+    try:
+        return datetime.now().astimezone().tzinfo or timezone.utc
+    except Exception:
+        return timezone.utc
 
 
 def read_quota_cache() -> dict[str, Any]:
@@ -407,6 +441,9 @@ def refresh_quota_cache(*, budget: Optional[float] = None) -> dict[str, Any]:
         "fetched_at": datetime.now(timezone.utc).isoformat(),
         "providers": providers,
         "codex_special_reset": special,
+        # Host metadata: the widgets format announcements in the user's zone
+        # instead of trusting the process TZ they happen to run under.
+        "timezone": timezone_name(),
     }
 
     try:

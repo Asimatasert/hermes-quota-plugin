@@ -96,6 +96,11 @@ class SpecialResetDesktopTests(unittest.TestCase):
                 self.assertNotIn("happened", rendered.lower())
                 self.assertNotIn("for you", rendered.lower())
 
+    def test_announcement_hour_follows_the_payload_timezone(self):
+        rendered = self.pane(payload(root=special_root(), timezone="Asia/Tokyo"))
+        self.assertRegex(rendered, r"0?3:55")  # 06:55Z -> 15:55 Tokyo
+        self.assertNotIn("06:55", rendered)
+
     def test_banked_and_recorded_wording_is_state_not_execution(self):
         root = special_root(announcement(reset_type="banked", status="recorded",
                                         announced_at="2026-10-20T06:33:48Z"))

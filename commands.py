@@ -25,7 +25,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from .quota_cache import iter_account_records, read_quota_cache, quota_cache_age_seconds, refresh_quota_cache, MAX_AGE_S
+from .quota_cache import (
+    iter_account_records,
+    local_tz,
+    read_quota_cache,
+    quota_cache_age_seconds,
+    refresh_quota_cache,
+    timezone_name,
+    MAX_AGE_S,
+)
 from .quota_providers import PROVIDER_FETCHERS
 from .codex_special_reset import normalize_entry as normalize_special_reset
 
@@ -111,8 +119,8 @@ def _short_reset(reset_iso: Optional[str]) -> str:
     dt = _parse_iso(reset_iso)
     if dt is None:
         return ""
-    local = dt.astimezone()
-    now = datetime.now()
+    local = dt.astimezone(local_tz())
+    now = datetime.now(local_tz())
     delta = (local.date() - now.date()).days
     if delta == 0:
         day = "today"
@@ -140,7 +148,7 @@ def _reset_tail(reset_iso: Optional[str]) -> str:
     days, rem_hours = divmod(hours, 24)
     if days < 7:
         return f" · resets in {days}d {rem_hours}h" if rem_hours else f" · resets in {days}d"
-    local = dt.astimezone()
+    local = dt.astimezone(local_tz())
     return f" · resets {local.strftime('%b %d %H:%M')}"
 
 
@@ -263,7 +271,7 @@ def _special_reset_line(cache: dict[str, Any]) -> str:
     parts = [
         f"✨ **{title}**",
         # Date and time: an announcement without the hour is not actionable.
-        f"announced {announced.astimezone().strftime('%b %d %H:%M')}",
+        f"announced {announced.astimezone(local_tz()).strftime('%b %d %H:%M')}",
     ]
     status = announcement.get("status")
     if status == "scheduled":
@@ -415,6 +423,9 @@ def _render_quota_json() -> str:
         "fetched_at": cache.get("fetched_at"),
         "providers": providers,
         "age_s": quota_cache_age_seconds(),
+        # The user's zone for every human timestamp on the client surfaces;
+        # clients must not inherit their own process TZ.
+        "timezone": cache.get("timezone") or timezone_name(),
         # Additive root contract shared with the TUI/Desktop reset panels.
         # It is announcement metadata only, never account quota/reset_at.
         "codex_special_reset": normalize_special_reset(

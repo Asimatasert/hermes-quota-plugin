@@ -77,8 +77,9 @@ The dock uses `dock-top`, verified above the composer in the real layout. It
 occupies exactly one right-aligned row: explicit `Quota` label, friendly
 provider/account name, labelled window, remaining-capacity bar/percentage and
 reset. When an OpenAI Codex account is selected and a validated special-reset
-announcement exists, the same row also carries it — announced date, status and
-the `codex-resets.com` credit — as long as it still fits; below 60 columns the
+announcement exists, the same row also carries it — announced date and time in
+the user's configured timezone, status and the `codex-resets.com` credit — as
+long as it still fits; below 60 columns the
 chip stays pure quota and the picker shows the notice instead. Forecasts,
 observations and unvalidated sources are never displayed. See
 [Codex special-reset announcements](codex-special-reset.md).
