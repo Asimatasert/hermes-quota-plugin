@@ -28,6 +28,7 @@ import {
 	Input,
 	icons,
 	PANES_AREA,
+	queryClient,
 	ROUTES_AREA,
 	SegmentedControl,
 	SIDEBAR_NAV_AREA,
@@ -3581,6 +3582,7 @@ function MonitorSettings() {
 	const forecast = useValue(quotaForecastAtom);
 	const days = useValue(historyDaysAtom);
 	const liveEvery = useValue(liveIntervalAtom);
+	const navBadgeOn = useValue(navBadgeAtom);
 	const notify = {};
 	for (const kind of NOTIFY_KINDS) notify[kind] = useValue(notifyAtoms[kind]);
 	return jsxs("div", {
@@ -3590,6 +3592,7 @@ function MonitorSettings() {
 			jsx("span", { className: "text-xs font-semibold text-(--ui-text-primary)", children: t("monitorSettingsTitle") }),
 			jsx(SettingSwitch, { label: t("monitorEnabledLabel"), hint: t("monitorEnabledHint"), checked: enabled, onChange: (v) => setStored(MONITOR_ENABLED_KEY, !!v, monitorEnabledAtom) }),
 			jsx(SettingSwitch, { label: t("agentsChipLabel"), checked: chip, onChange: (v) => setStored(AGENTS_CHIP_KEY, !!v, agentsChipAtom) }),
+			jsx(SettingSwitch, { label: t("navBadgeLabel"), hint: t("navBadgeHint"), checked: navBadgeOn, onChange: (v) => setStored(NAV_BADGE_KEY, !!v, navBadgeAtom) }),
 			jsx(SettingSwitch, { label: t("quotaForecastLabel"), hint: t("quotaForecastHint"), checked: forecast, onChange: (v) => setStored(QUOTA_FORECAST_KEY, !!v, quotaForecastAtom) }),
 			jsxs("div", {
 				className: "flex items-center justify-between gap-2",
@@ -3850,6 +3853,12 @@ const I18N_EN = {
 	quotaForecastHint: "History is read every few minutes, only while the Quota view is open.",
 	historyRangeLabel: "History range",
 	liveIntervalLabel: "Live refresh",
+	navBadgeLabel: "Live counts in the sidebar",
+	navBadgeHint: "Shows working agents, approvals and a low quota next to the Quota menu entry.",
+	navWorking: (n) => `${n} active`,
+	navYourTurn: (n) => `${n} your turn`,
+	navApproval: (n) => `${n} approval`,
+	navStalled: (n) => `${n} stuck`,
 	historyDay: "24 h",
 	historyWeek: "7 days",
 	notificationsTitle: "Notifications",
@@ -4051,6 +4060,12 @@ const I18N_TR = {
 	quotaForecastHint: "Geçmiş birkaç dakikada bir, yalnızca Kota görünümü açıkken okunur.",
 	historyRangeLabel: "Geçmiş aralığı",
 	liveIntervalLabel: "Canlı yenileme",
+	navBadgeLabel: "Kenar menüde canlı sayılar",
+	navBadgeHint: "Quota menüsünün yanında çalışan ajanları, onay bekleyenleri ve azalan kotayı gösterir.",
+	navWorking: (n) => `${n} aktif`,
+	navYourTurn: (n) => `${n} sıra sende`,
+	navApproval: (n) => `${n} onay`,
+	navStalled: (n) => `${n} takıldı`,
 	historyDay: "24 saat",
 	historyWeek: "7 gün",
 	notificationsTitle: "Bildirimler",
@@ -4097,6 +4112,139 @@ function registerDockedPane() {
 	}
 }
 
+// ---- sidebar nav badge -----------------------------------------------------
+//
+// The core `sidebar.nav` row only takes a label and a codicon name, so the
+// live detail rides in the label ("Quota · 2 active · ⚠ 8%") and the codicon
+// spins while an agent works. Re-registering the same id replaces the row in
+// place; it is only redone when the text actually changes.
+
+const NAV_BADGE_KEY = "navBadge";
+const navBadgeAtom = atom(true);
+const NAV_LOW_QUOTA_PCT = 15;
+
+function navCounts() {
+	const counts = { working: 0, approval: 0, yourTurn: 0, stalled: 0 };
+	try {
+		const busy = host.state.busyBySession.get() || {};
+		counts.working = Object.values(busy).filter(Boolean).length;
+	} catch {
+		/* older host */
+	}
+	try {
+		let newest = null;
+		for (const [, data] of queryClient.getQueriesData({ queryKey: [...MONITOR_QUERY_KEY, "snapshot"] })) {
+			const snap = asMonitorPayload(data);
+			if (snap && snap.live && (!newest || (snap.generated_at || 0) > (newest.generated_at || 0))) newest = snap;
+		}
+		const c = newest && newest.live && newest.live.counts;
+		if (c) {
+			counts.working = Math.max(counts.working, Number(c.working) || 0);
+			counts.approval = Number(c.needs_approval) || 0;
+			counts.yourTurn = Number(c.your_turn) || 0;
+			counts.stalled = Number(c.stalled) || 0;
+		}
+	} catch {
+		/* no snapshot yet */
+	}
+	return counts;
+}
+
+function navLowestQuota() {
+	let lowest = null;
+	try {
+		for (const [, data] of queryClient.getQueriesData({ queryKey: QUOTA_QUERY_KEY })) {
+			const providers = data && data.providers;
+			if (!providers || typeof providers !== "object") continue;
+			for (const [pid, rec] of Object.entries(providers)) {
+				if (!isProviderEnabled(pid) || !rec || rec.unavailable_reason) continue;
+				for (const w of rec.windows || []) {
+					if (typeof w.used_percent !== "number" || !Number.isFinite(w.used_percent)) continue;
+					const left = Math.max(0, Math.round(100 - w.used_percent));
+					if (lowest == null || left < lowest) lowest = left;
+				}
+			}
+		}
+	} catch {
+		/* no quota data yet */
+	}
+	return lowest;
+}
+
+/** Label + icon for the nav row; pure, so tests can pin the format. */
+function navBadge(counts, lowestLeft, t) {
+	const parts = [];
+	if (counts.approval) parts.push(t("navApproval", counts.approval));
+	if (counts.working) parts.push(t("navWorking", counts.working));
+	else if (counts.yourTurn) parts.push(t("navYourTurn", counts.yourTurn));
+	if (counts.stalled && parts.length < 2) parts.push(t("navStalled", counts.stalled));
+	if (lowestLeft != null && lowestLeft <= NAV_LOW_QUOTA_PCT) parts.push(`⚠ ${lowestLeft}%`);
+	return {
+		label: ["Quota", ...parts.slice(0, 3)].join(" · "),
+		codicon: counts.approval ? "bell-dot" : counts.working ? "sync codicon-modifier-spin" : "pulse",
+	};
+}
+
+function startNavBadge(ctx) {
+	let last = "";
+	const update = () => {
+		const t = (key, ...args) => ctx.i18n.t(key, ...args);
+		const next = navBadgeAtom.get()
+			? navBadge(navCounts(), navLowestQuota(), t)
+			: { label: "Quota", codicon: "pulse" };
+		const sig = `${next.label}|${next.codicon}`;
+		if (sig === last) return;
+		last = sig;
+		ctx.register({
+			id: "nav",
+			area: SIDEBAR_NAV_AREA,
+			order: 80,
+			data: { codicon: next.codicon, label: next.label, path: "/quota" },
+		});
+	};
+	update();
+	let pending = null;
+	const schedule = () => {
+		if (pending) return;
+		pending = setTimeout(() => {
+			pending = null;
+			update();
+		}, 250);
+	};
+	const offs = [];
+	try {
+		offs.push(host.state.busyBySession.listen(schedule));
+	} catch {
+		/* older host */
+	}
+	try {
+		offs.push(navBadgeAtom.listen(schedule));
+	} catch {
+		/* noop */
+	}
+	try {
+		offs.push(
+			queryClient.getQueryCache().subscribe((event) => {
+				const key = event && event.query && event.query.queryKey;
+				if (Array.isArray(key) && key[0] === "quota") schedule();
+			}),
+		);
+	} catch {
+		/* noop */
+	}
+	if (typeof ctx.onDispose !== "function") return;
+	ctx.onDispose(() => {
+		if (pending) clearTimeout(pending);
+		for (const off of offs) {
+			try {
+				off();
+			} catch {
+				/* noop */
+			}
+		}
+	});
+}
+
 export default {
 	id: ID,
 	name: "Quota Widget",
@@ -4135,12 +4283,8 @@ export default {
 			render: () => jsx(QuotaPane, {}),
 		});
 
-		// Sidebar nav row.
-		ctx.register({
-			id: "nav",
-			area: SIDEBAR_NAV_AREA,
-			order: 80,
-			data: { codicon: "pulse", label: "Quota", path: "/quota" },
-		});
+		// Sidebar nav row, with live counts in its label (see startNavBadge).
+		applyStoredBoolean(NAV_BADGE_KEY, navBadgeAtom, true);
+		startNavBadge(ctx);
 	},
 };

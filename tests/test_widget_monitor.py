@@ -391,6 +391,25 @@ class MonitorNotificationTest(unittest.TestCase):
         # Crossed thresholds are still recorded, so re-enabling does not flood.
         self.assertTrue(state['quota'])
 
+    def test_nav_badge_label(self):
+        expr = '''(() => {
+          const t = (k, ...a) => (typeof I18N_EN[k] === 'function' ? I18N_EN[k](...a) : I18N_EN[k]);
+          const tr = (k, ...a) => (typeof I18N_TR[k] === 'function' ? I18N_TR[k](...a) : I18N_TR[k]);
+          return [
+            navBadge({working: 0, approval: 0, yourTurn: 0, stalled: 0}, 60, t),
+            navBadge({working: 2, approval: 0, yourTurn: 3, stalled: 0}, 40, t),
+            navBadge({working: 1, approval: 1, yourTurn: 0, stalled: 1}, 8, t),
+            navBadge({working: 0, approval: 0, yourTurn: 3, stalled: 0}, null, tr),
+          ];
+        })()'''
+        out = run(expr=expr)['value']
+        self.assertEqual(out[0], {'label': 'Quota', 'codicon': 'pulse'})
+        self.assertEqual(out[1]['label'], 'Quota · 2 active')
+        self.assertIn('spin', out[1]['codicon'])
+        self.assertEqual(out[2]['label'], 'Quota · 1 approval · 1 active · ⚠ 8%')
+        self.assertEqual(out[2]['codicon'], 'bell-dot')
+        self.assertEqual(out[3]['label'], 'Quota · 3 sıra sende')
+
     def test_pure_rules_function(self):
         expr = '''(() => {
           const r1 = monitorNotifications({snapshot: SNAP, providers: {}, settings: {}}, {}, NOW);
