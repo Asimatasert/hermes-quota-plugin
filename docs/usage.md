@@ -16,7 +16,7 @@ See [TUI setup and commands](tui-panel.md).
 
 ```
 📊 Quota · updated 2m ago
-✨ Codex special reset · announced Oct 22 · scheduled · codex-resets.com
+✨ Codex special reset · announced Oct 22 07:55 · scheduled · codex-resets.com
 
 Anthropic · Conta 2 (Team)
   Current session    ░░░░░░░░░░    0% left · resets in 1h 6m

@@ -262,7 +262,8 @@ def _special_reset_line(cache: dict[str, Any]) -> str:
         else "Codex special reset"
     parts = [
         f"✨ **{title}**",
-        f"announced {announced.astimezone().strftime('%b %d')}",
+        # Date and time: an announcement without the hour is not actionable.
+        f"announced {announced.astimezone().strftime('%b %d %H:%M')}",
     ]
     status = announcement.get("status")
     if status == "scheduled":

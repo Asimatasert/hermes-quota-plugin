@@ -207,6 +207,14 @@ class QuotaLayoutTests(unittest.TestCase):
         self.assertIn("codex-resets.com", text)
         self.assertLess(text.index("Codex special reset"), text.index("OpenAI Codex"))
 
+    def test_special_reset_announcement_carries_the_local_time(self):
+        from datetime import datetime
+        cache = self.cache({"openai-codex": record("openai-codex", [window()])})
+        cache["codex_special_reset"] = self.special()
+        expected = datetime.fromisoformat(
+            "2026-10-22T06:55:54+00:00").astimezone().strftime("%b %d %H:%M")
+        self.assertIn(f"announced {expected}", render(cache))
+
     def test_banked_special_reset_keeps_its_own_wording(self):
         cache = self.cache({"openai-codex": record("openai-codex", [window()])})
         entry = self.special()
