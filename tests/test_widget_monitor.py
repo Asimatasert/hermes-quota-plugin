@@ -236,8 +236,9 @@ class MonitorViewsTest(unittest.TestCase):
 
     def test_tabs_and_settings(self):
         out = self.pane('quota')
-        tabs = find(out['tree'], lambda n: n.get('type') == 'segmented' and len(n['props'].get('options', [])) == 5)
-        self.assertEqual([o['id'] for o in tabs[0]['props']['options']], ['quota', 'live', 'health', 'usage', 'kanban'])
+        tabs = find(out['tree'], lambda n: 'data-tab' in n.get('props', {}))
+        self.assertEqual([n['props']['data-tab'] for n in tabs], ['quota', 'live', 'health', 'usage', 'kanban'])
+        self.assertEqual([n['props']['aria-selected'] for n in tabs], [True, False, False, False, False])
         settings = text(run(component='settings', data=quota_payload())['tree'])
         for expected in ('Agent monitor', 'Show working / your-turn chip', 'Burn rate, forecast and history',
                          'History range', 'Budget', 'Daily', 'Monthly', 'Notifications', 'Budget 80% / 100%',

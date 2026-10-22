@@ -463,7 +463,8 @@ function toneForRemaining(pct) {
 function toneColor(tone) {
 	if (tone === "bad") return "var(--ui-red)";
 	if (tone === "warn") return "var(--ui-yellow)";
-	if (tone === "good") return "var(--ui-accent)";
+	// Green like Agent Bar's levelColor; core uses --ui-green for "ok" too.
+	if (tone === "good") return "var(--ui-green)";
 	return "var(--ui-stroke-tertiary)";
 }
 
@@ -782,8 +783,10 @@ function UpdateBanner({ update }) {
 		type: "button",
 		className: cn(
 			"flex w-full items-center justify-between gap-2 rounded px-3 py-2 text-left text-[0.6875rem]",
-			"bg-(--chrome-action) text-(--ui-text-secondary) hover:bg-(--chrome-action-hover) transition-colors",
+			"text-(--ui-text-secondary) transition-colors",
 		),
+		// Inline: `bg-(--chrome-action)` is not in the host's prebuilt CSS.
+		style: { marginTop: 8, border: `1px solid ${tint("var(--ui-accent)", 35)}`, background: tint("var(--ui-accent)", 10) },
 		onClick: () =>
 			host.openExternal?.("https://github.com/rarf/hermes-quota-plugin"),
 		children: [
@@ -1164,7 +1167,6 @@ function QuotaChipWithBar() {
 			: jsx("span", { children: "Q:none" });
 	}
 	const tone = toneForRemaining(worst);
-	const fill = toneColor(tone);
 	const tip = makeWorstTip(worstLabel, worst, data && data.providers, stale);
 	const button = jsxs("button", {
 		type: "button",
@@ -1175,17 +1177,10 @@ function QuotaChipWithBar() {
 			if (typeof host.navigate === "function") host.navigate("/quota");
 		},
 		children: [
+			jsx(Ring, { value: worst, tone, size: 13, stroke: 2, label: `${worst}%` }),
 			jsx("span", {
 				className: "text-[0.6875rem] text-(--ui-text-secondary)",
 				children: worstLabel + " " + (worstProvider?.display_accounts ? codexValue(worst) : worst + "%"),
-			}),
-			jsx("span", {
-				className:
-					"inline-block h-1.5 w-10 overflow-hidden rounded-full bg-(--ui-stroke-secondary)",
-				children: jsx("span", {
-					className: "block h-full rounded-full",
-					style: { width: worst + "%", background: fill },
-				}),
 			}),
 		],
 	});
@@ -1290,7 +1285,11 @@ function ProviderChip({ pid, provider }) {
 				if (typeof host.navigate === "function") host.navigate("/quota");
 			},
 			children: [
-				jsx("span", { className: "inline-block h-1.5 w-1.5 rounded-full", style: { background: dot } }),
+				// A percentage gets Agent Bar's mini ring; balance/availability-only
+				// providers keep the plain dot.
+				r != null
+					? jsx(Ring, { value: r, tone, size: 13, stroke: 2, label: `${r}%` })
+					: jsx("span", { className: "inline-block h-1.5 w-1.5 rounded-full", style: { background: dot } }),
 				jsx("span", { children: label }),
 				jsx("span", { className: "tabular-nums", style: staleValue ? { textDecoration: "line-through" } : undefined, children: value }),
 			],
@@ -1378,13 +1377,283 @@ function StatusBar() {
 	});
 }
 
+// ---- design kit -------------------------------------------------------------
+//
+// The Agent Bar look: ring gauges, tinted state pills, compact rows and small
+// uppercase section headers. New layout is inline styles on purpose: the host
+// ships a PREBUILT Tailwind sheet, so a utility class core never uses simply
+// does not exist at runtime. Colours are theme variables only — the semantic
+// ones core itself uses (--ui-green / --ui-yellow / --ui-orange / --ui-red /
+// --ui-accent / --ui-purple) — so every light and dark skin follows.
+
+// The /quota route centres its content; the docked pane stays edge to edge.
+const PAGE_MAX_WIDTH = 680;
+const SETTINGS_MAX_WIDTH = 640;
+
+function tint(color, pct) {
+	return `color-mix(in srgb, ${color} ${pct}%, transparent)`;
+}
+
+const UI = {
+	card: {
+		background: "var(--ui-bg-elevated)",
+		border: "1px solid var(--ui-stroke-tertiary)",
+		borderRadius: 10,
+		minWidth: 0,
+		overflowWrap: "anywhere",
+		boxSizing: "border-box",
+	},
+	title: { fontSize: "0.8125rem", fontWeight: 600, color: "var(--ui-text-primary)" },
+	text: { fontSize: "0.75rem", color: "var(--ui-text-primary)" },
+	secondary: { fontSize: "0.75rem", color: "var(--ui-text-secondary)" },
+	meta: { fontSize: "0.6875rem", color: "var(--ui-text-tertiary)" },
+	faint: { fontSize: "0.6875rem", color: "var(--ui-text-quaternary)" },
+	tiny: { fontSize: "0.625rem", color: "var(--ui-text-quaternary)" },
+	num: { fontVariantNumeric: "tabular-nums" },
+	ellipsis: { minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+	row: { display: "flex", alignItems: "center", gap: 8, minWidth: 0 },
+	col: { display: "flex", flexDirection: "column", minWidth: 0 },
+};
+
+/** A small round status dot; `halo` is Agent Bar's "running" ring. */
+function Dot({ color, size = 7, halo = false, tone }) {
+	return jsx("span", {
+		"aria-hidden": true,
+		"data-tone": tone,
+		style: {
+			display: "inline-block",
+			width: size,
+			height: size,
+			borderRadius: 999,
+			background: color,
+			flexShrink: 0,
+			boxShadow: halo ? `0 0 0 3px ${tint(color, 24)}` : undefined,
+		},
+	});
+}
+
+/** Tinted pill: the coloured state / status badge. */
+function Pill({ color = "var(--ui-text-tertiary)", dot = false, halo = false, title, children, ...rest }) {
+	return jsxs("span", {
+		...rest,
+		title,
+		style: {
+			display: "inline-flex",
+			alignItems: "center",
+			gap: 4,
+			flexShrink: 0,
+			maxWidth: "100%",
+			borderRadius: 999,
+			padding: "0 7px",
+			fontSize: "0.625rem",
+			fontWeight: 600,
+			lineHeight: "16px",
+			whiteSpace: "nowrap",
+			color,
+			background: tint(color, 14),
+		},
+		children: [dot ? jsx(Dot, { color, size: 5, halo }) : null, children],
+	});
+}
+
+/**
+ * Donut gauge: plain inline SVG (stroke-dasharray on a circle), fixed size from
+ * props, so a pane resize needs no measuring. The arc is the share LEFT, like
+ * the bars it replaces; colour follows the same thresholds as Agent Bar's
+ * levelColor (≥85 % used red, ≥60 % used amber).
+ */
+function Ring({ value, tone, size = 52, stroke, label, children }) {
+	const sw = stroke ?? Math.max(3, Math.round(size / 11));
+	const r = (size - sw) / 2;
+	const c = 2 * Math.PI * r;
+	const pct = value == null ? 0 : Math.max(0, Math.min(100, value));
+	const mid = size / 2;
+	return jsxs("div", {
+		role: "img",
+		"aria-label": label,
+		"data-ring": tone,
+		style: { position: "relative", width: size, height: size, flexShrink: 0 },
+		children: [
+			jsxs("svg", {
+				width: size,
+				height: size,
+				viewBox: `0 0 ${size} ${size}`,
+				style: { display: "block", transform: "rotate(-90deg)" },
+				children: [
+					jsx("circle", { cx: mid, cy: mid, r, fill: "none", stroke: "var(--ui-stroke-secondary)", strokeWidth: sw }, "track"),
+					pct > 0
+						? jsx("circle", {
+								cx: mid,
+								cy: mid,
+								r,
+								fill: "none",
+								stroke: toneColor(tone),
+								strokeWidth: sw,
+								strokeLinecap: "round",
+								strokeDasharray: `${((pct / 100) * c).toFixed(2)} ${c.toFixed(2)}`,
+							}, "arc")
+						: null,
+				],
+			}),
+			children
+				? jsx("div", {
+						style: {
+							position: "absolute",
+							inset: 0,
+							display: "flex",
+							flexDirection: "column",
+							alignItems: "center",
+							justifyContent: "center",
+							textAlign: "center",
+							lineHeight: 1.05,
+						},
+						children,
+					})
+				: null,
+		],
+	});
+}
+
+function Legend({ items }) {
+	return jsx("div", {
+		style: { display: "flex", flexWrap: "wrap", gap: "2px 10px" },
+		children: items.map((it, i) =>
+			jsxs("span", { style: { ...UI.row, gap: 4, ...UI.meta }, children: [jsx(Dot, { color: it.color, size: 6 }), it.label] }, i),
+		),
+	});
+}
+
+const SERIES_COLORS = ["var(--ui-accent)", "var(--ui-green)", "var(--ui-purple)", "var(--ui-orange)", "var(--ui-cyan)"];
+const SOURCE_COLORS = { "claude-code": "var(--ui-orange)", "copilot-cli": "var(--ui-blue)", hermes: "var(--ui-purple)" };
+const SOURCE_NAMES = { "claude-code": "Claude Code", "copilot-cli": "Copilot CLI", hermes: "Hermes" };
+
+function sourceLabel(key) {
+	return SOURCE_NAMES[key] || (PROVIDER_META[baseProviderId(key)] ? providerMeta(key).name : key);
+}
+
+/** Stable colour per series key: known CLIs keep Agent Bar's colours. */
+function seriesPalette(keys) {
+	const map = new Map();
+	let i = 0;
+	for (const k of keys) {
+		if (map.has(k)) continue;
+		map.set(k, SOURCE_COLORS[k] || ["var(--ui-purple)", "var(--ui-cyan)", "var(--ui-green)", "var(--ui-yellow)", "var(--ui-accent)"][i++ % 5]);
+	}
+	return map;
+}
+
+/**
+ * Stacked column chart (tokens per minute, cost per day). viewBox scaling, so
+ * it follows the pane width with no ResizeObserver. `columns` is a list of
+ * `[key, value]` part lists; keys are coloured through `colors`.
+ */
+function StackedBars({ columns, colors, height = 56, label, marker = false, xLabels }) {
+	if (!columns.length) return null;
+	const totals = columns.map((parts) => parts.reduce((s, [, v]) => s + Math.max(0, Number(v) || 0), 0));
+	const top = Math.max(...totals, 0);
+	const w = 100 / columns.length;
+	const rects = [];
+	columns.forEach((parts, i) => {
+		let acc = 0;
+		for (const [k, v] of parts) {
+			const n = Math.max(0, Number(v) || 0);
+			if (!n || !top) continue;
+			const h = Math.max(0.6, (n / top) * (height - 1));
+			rects.push(jsx("rect", { x: i * w + w * 0.14, y: height - acc - h, width: w * 0.72, height: h, fill: colors.get(k) || "var(--ui-accent)", rx: 0.4 }, `${i}-${k}`));
+			acc += h;
+		}
+	});
+	return jsxs("div", {
+		style: { ...UI.col, gap: 3 },
+		children: [
+			jsx("svg", {
+				viewBox: `0 0 100 ${height}`,
+				preserveAspectRatio: "none",
+				width: "100%",
+				height,
+				role: "img",
+				"aria-label": label || "",
+				"data-sparkline": marker || undefined,
+				style: { display: "block", borderBottom: "1px solid var(--ui-stroke-secondary)" },
+				children: rects,
+			}),
+			xLabels && xLabels.length
+				? jsx("div", {
+						style: { display: "flex", justifyContent: xLabels.length === columns.length ? "flex-start" : "space-between", ...UI.tiny, ...UI.num },
+						children: xLabels.map((l, i) =>
+							jsx("span", { style: xLabels.length === columns.length ? { flex: "1 1 0", textAlign: "center", ...UI.ellipsis } : undefined, children: l }, i),
+						),
+					})
+				: null,
+		],
+	});
+}
+
+/** Used-% history of every window of one provider in one 0–100 chart. */
+function HistoryChart({ series, height = 54, label }) {
+	const lines = series.filter((s) => Array.isArray(s.points) && s.points.length >= 2);
+	if (!lines.length) return null;
+	let x0 = Infinity;
+	let x1 = -Infinity;
+	for (const s of lines) {
+		for (const p of s.points) {
+			const x = Number(p[0]);
+			if (!Number.isFinite(x)) continue;
+			x0 = Math.min(x0, x);
+			x1 = Math.max(x1, x);
+		}
+	}
+	const span = x1 - x0 || 1;
+	const y = (v) => (height - 1 - (Math.max(0, Math.min(100, Number(v) || 0)) / 100) * (height - 2)).toFixed(2);
+	const axis = { position: "absolute", right: 0, ...UI.tiny, fontSize: "0.5625rem", lineHeight: 1, ...UI.num };
+	return jsxs("div", {
+		style: { ...UI.col, gap: 4 },
+		children: [
+			jsxs("div", {
+				style: { position: "relative", paddingRight: 24 },
+				children: [
+					jsx("span", { style: { ...axis, top: -4 }, children: "100" }, "top"),
+					jsx("span", { style: { ...axis, top: height / 2 - 4 }, children: "50" }, "mid"),
+					jsx("span", { style: { ...axis, bottom: -3 }, children: "0" }, "zero"),
+			jsx("svg", {
+				viewBox: `0 0 100 ${height}`,
+				preserveAspectRatio: "none",
+				width: "100%",
+				height,
+				role: "img",
+				"aria-label": label || "",
+				"data-sparkline": true,
+				style: { display: "block", overflow: "visible", borderBottom: "1px solid var(--ui-stroke-secondary)" },
+				children: [
+					...[25, 50, 75, 100].map((g) =>
+						jsx("line", { x1: 0, x2: 100, y1: y(g), y2: y(g), stroke: "var(--ui-stroke-tertiary)", strokeWidth: 1, vectorEffect: "non-scaling-stroke" }, `g${g}`),
+					),
+					...lines.map((s, i) =>
+						jsx("path", {
+							d: s.points.map((p, j) => `${j ? "L" : "M"}${(((Number(p[0]) - x0) / span) * 100).toFixed(2)} ${y(p[1])}`).join(" "),
+							fill: "none",
+							stroke: s.color,
+							strokeWidth: 1.5,
+							vectorEffect: "non-scaling-stroke",
+							strokeLinejoin: "round",
+						}, `s${i}`),
+					),
+				],
+			}, "chart"),
+				],
+			}),
+			jsx(Legend, { items: lines.map((s) => ({ label: s.label, color: s.color })) }),
+		],
+	});
+}
+
 // ---- pane -----------------------------------------------------------------
 
 function QuotaBar({ value, tone }) {
 	const pct = Math.max(0, Math.min(100, value == null ? 0 : value));
 	return jsx("div", {
-		className:
-			"h-2 w-full overflow-hidden rounded-full bg-(--ui-stroke-secondary)",
+		className: "w-full overflow-hidden rounded-full",
+		style: { height: 6, background: "var(--ui-stroke-secondary)" },
 		children: jsx("div", {
 			className: "h-full rounded-full transition-all",
 			style: { width: `${pct}%`, background: toneColor(tone) },
@@ -1392,14 +1661,43 @@ function QuotaBar({ value, tone }) {
 	});
 }
 
-// One provider card: bordered box with label + plan, a thick tonal bar per
-// window, colored "% left", reset line, and provider detail lines (credits,
-// banked resets). Unavailable providers render as a muted card.
-function ProviderRow({ id, provider, monitor }) {
+/** One quota window as a ring tile: % left in the centre, label + reset under it. */
+function WindowTile({ w, size, dense, resetFormat }) {
+	const t = usePluginI18n(ID);
+	const r = remainingPct(w);
+	const tone = toneForRemaining(r);
+	const label = w.label || "window";
+	const reset = w.reset_at ? (resetFormat === "absolute" ? absoluteReset(w.reset_at) : relativeCountdown(w.reset_at)) : "";
+	const full = w.reset_at ? t("reset", formatReset(w.reset_at, resetFormat)) : "";
+	return jsxs("div", {
+		"data-window": label,
+		title: [label, r == null ? "—" : `${r}% ${t("left")}`, full].filter(Boolean).join(" · "),
+		style: { ...UI.col, alignItems: "center", gap: 3 },
+		children: [
+			jsx(Ring, {
+				value: r,
+				tone,
+				size,
+				label: `${label} ${r == null ? "—" : `${r}% ${t("left")}`}`,
+				children: [
+					jsx("span", { style: { fontSize: Math.round(size * 0.26), fontWeight: 650, color: "var(--ui-text-primary)", ...UI.num }, children: r == null ? "—" : `${r}%` }, "v"),
+					r == null ? null : jsx("span", { style: { fontSize: Math.max(8, Math.round(size * 0.17)), color: "var(--ui-text-tertiary)" }, children: t("left") }, "l"),
+				],
+			}),
+			jsx("span", { style: { ...UI.meta, color: "var(--ui-text-secondary)", textAlign: "center", lineHeight: 1.2, maxWidth: "100%", overflowWrap: "anywhere" }, children: label }),
+			dense && reset ? jsx("span", { style: { ...UI.tiny, ...UI.num, ...UI.ellipsis, maxWidth: "100%" }, children: reset }) : null,
+		],
+	});
+}
+
+// One provider card: header (logo, name, health dot, plan pill), a row of ring
+// tiles — one per window — then forecasts, the used-% history chart and detail
+// lines. Unavailable providers render as a muted compact card.
+function ProviderRow({ id, provider, monitor, page = false }) {
 	const t = usePluginI18n(ID);
 	const resetFormat = useValue(resetFormatAtom);
 	// 'dense' = every window, reset time and detail line; 'clean' = just the
-	// percentage bars, except OpenRouter's essential key/wallet scope details.
+	// rings, except OpenRouter's essential key/wallet scope details.
 	const paneDetail = useValue(paneDetailAtom);
 	const dense = paneDetail !== "clean";
 	const reason = provider ? provider.unavailable_reason : "no-data";
@@ -1408,7 +1706,7 @@ function ProviderRow({ id, provider, monitor }) {
 	const displayName = providerDisplayName(id, provider);
 	// Inline sizing is intentional: plugin-only utility classes might not be
 	// in the host's compiled Tailwind stylesheet.
-	const cardStyle = { flexShrink: 0, minWidth: 0, overflowWrap: "anywhere" };
+	const cardStyle = { flexShrink: 0, minWidth: 0, overflowWrap: "anywhere", background: "var(--ui-bg-elevated)", borderColor: "var(--ui-stroke-tertiary)", borderRadius: 10 };
 
 	if (reason) {
 		// The failure lines stay visible here: for a provider whose keys failed
@@ -1417,35 +1715,23 @@ function ProviderRow({ id, provider, monitor }) {
 		const shown = dense ? details : details.slice(0, 6);
 		const hidden = details.length - shown.length;
 		return jsxs("div", {
-			className:
-				"flex flex-col gap-0.5 rounded-lg border border-(--ui-stroke-secondary) px-3 py-2.5 opacity-60",
-			style: cardStyle,
+			className: "flex flex-col gap-0.5 rounded-lg border px-3 py-2 opacity-60",
+			style: { ...cardStyle, background: "transparent" },
 			children: [
 				jsxs("div", {
-					className: "flex items-center gap-2 text-sm",
+					style: UI.row,
 					children: [
 						jsx(ProviderBadge, { pid: id }),
-						jsx("span", {
-							className: "font-medium text-(--ui-text-primary)",
-							children: displayName,
-						}),
+						jsx("span", { style: { ...UI.text, fontWeight: 500, ...UI.ellipsis, flex: "1 1 auto" }, children: displayName }),
+						jsx("span", { style: { ...UI.faint, flexShrink: 0 }, children: t("unavailable", reason) }),
 					],
-				}),
-				jsx("div", {
-					className: "pl-7 text-xs text-(--ui-text-tertiary)",
-					children: t("unavailable", reason),
 				}),
 				shown.length
 					? jsx("div", {
-							className:
-								"flex flex-col gap-0.5 pl-7 text-[0.6875rem] text-(--ui-text-tertiary)",
+							style: { ...UI.col, gap: 2, paddingLeft: 28, ...UI.faint },
 							children: [
-								...shown.map((d, i) =>
-									jsx("div", { children: d }, `${id}-u-${i}`),
-								),
-								hidden > 0
-									? jsx("div", { children: t("moreDetails", hidden) }, `${id}-u-more`)
-									: null,
+								...shown.map((d, i) => jsx("div", { children: d }, `${id}-u-${i}`)),
+								hidden > 0 ? jsx("div", { children: t("moreDetails", hidden) }, `${id}-u-more`) : null,
 							],
 						})
 					: null,
@@ -1456,122 +1742,151 @@ function ProviderRow({ id, provider, monitor }) {
 	const windows = asWindowList(provider && provider.windows);
 	if (windows.length === 0 && details.length === 0 && facts.balances.length === 0 && facts.available == null) {
 		return jsxs("div", {
-			className:
-				"flex items-center gap-2 rounded-lg border border-(--ui-stroke-secondary) px-3 py-2.5 text-sm opacity-60",
-			style: cardStyle,
+			className: "flex items-center gap-2 rounded-lg border px-3 py-2 opacity-60",
+			style: { ...cardStyle, background: "transparent" },
 			children: [
 				jsx(ProviderBadge, { pid: id }),
-				jsx("span", {
-					className: "font-medium text-(--ui-text-primary)",
-					children: displayName,
-				}),
-				jsx("span", {
-					className: "text-xs text-(--ui-text-tertiary)",
-					children: t("noData"),
-				}),
+				jsx("span", { style: { ...UI.text, fontWeight: 500 }, children: displayName }),
+				jsx("span", { style: UI.faint, children: t("noData") }),
 			],
 		});
 	}
 
+	const tone = providerTone(provider);
+	const ringSize = page ? 62 : 50;
+	const forecasts = monitor
+		? windows
+				.map((w) => ({ w, forecast: forecastFor(burnFor(monitor.burnMap, id, provider, w.label), w, monitor.nowSec) }))
+				.filter((f) => f.forecast)
+		: [];
+	const series = monitor && monitor.history
+		? windows.map((w, i) => ({
+				label: w.label || "window",
+				color: SERIES_COLORS[i % SERIES_COLORS.length],
+				points: historyFor(monitor.history, id, provider, w.label),
+			}))
+		: [];
+	const detailLines = details.filter(
+		(d) => (dense || id === "openrouter" || (baseProviderId(id) === "anthropic" && /^Observed /.test(d))) && (facts.available == null || !/^API calls available: (yes|no)$/.test(d)),
+	);
+
 	return jsxs("div", {
-		className:
-			"flex flex-col gap-2 rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-elevated) px-3 py-2.5",
-		style: cardStyle,
+		className: "flex flex-col rounded-lg border px-3 py-2.5",
+		style: { ...cardStyle, gap: 10 },
+		"data-provider": id,
 		children: [
 			jsxs("div", {
-				className: "flex items-center justify-between gap-2",
+				style: { ...UI.row, justifyContent: "space-between" },
 				children: [
 					jsxs("span", {
-						className:
-							"flex items-center gap-2 text-sm font-semibold text-(--ui-text-primary)",
+						style: { ...UI.row, gap: 6 },
 						children: [
 							jsx(ProviderBadge, { pid: id }),
-							displayName,
-							jsx(StatusDot, {
-								tone: providerTone(provider),
-							}),
+							jsx("span", { style: { ...UI.title, ...UI.ellipsis }, children: displayName }),
+							jsx(Dot, { color: toneColor(tone), size: 6, tone }),
 						],
 					}),
-					provider.plan
-						? jsx("span", {
-								className:
-									"rounded bg-(--ui-control-hover-background) px-1.5 py-0.5 text-[0.6875rem] font-medium text-(--ui-text-secondary)",
-								children: provider.plan,
-							})
-						: null,
+					provider.plan ? jsx(Pill, { color: "var(--ui-text-secondary)", children: provider.plan }) : null,
 				],
 			}),
-			...facts.balances.map((b) => jsxs("div", {
-				key: `balance-${b.currency}`,
-				children: [
-					jsx("div", { className: "text-[0.6875rem] text-(--ui-text-tertiary)", children: "Account balance" }),
-					jsx("div", { className: "tabular-nums font-semibold text-(--ui-text-primary)", style: { fontSize: "1.25rem", lineHeight: 1.3 }, children: balanceText(b) }),
-				],
-			})),
-			facts.available != null ? jsx("div", {
-				className: "text-xs text-(--ui-text-secondary)",
-				children: `API calls available: ${facts.available ? "yes" : "no"}`,
-			}) : null,
-			...windows.map((w, i) => {
-				const r = remainingPct(w);
-				const tone = toneForRemaining(r);
-				return jsxs(
-					"div",
-					{
-						className: "flex flex-col gap-1",
-						children: [
+			...facts.balances.map((b) =>
+				jsxs("div", {
+					key: `balance-${b.currency}`,
+					children: [
+						jsx("div", { style: UI.meta, children: "Account balance" }),
+						jsx("div", { style: { ...UI.num, fontWeight: 600, color: "var(--ui-text-primary)", fontSize: "1.25rem", lineHeight: 1.3 }, children: balanceText(b) }),
+					],
+				}),
+			),
+			facts.available != null
+				? jsx("div", { style: UI.secondary, children: `API calls available: ${facts.available ? "yes" : "no"}` })
+				: null,
+			windows.length
+				? jsx("div", {
+						"data-rings": true,
+						style: { display: "grid", gridTemplateColumns: `repeat(auto-fill, minmax(${ringSize + 18}px, 1fr))`, gap: "10px 4px" },
+						children: windows.map((w, i) => jsx(WindowTile, { w, size: ringSize, dense, resetFormat }, `${id}-w-${i}`)),
+					})
+				: null,
+			// Agent monitor extras: burn rate / "fills before reset" per window and
+			// the used-% history. Absent without a monitor payload.
+			forecasts.length
+				? jsx("div", {
+						style: { ...UI.col, gap: 3, borderTop: "1px solid var(--ui-stroke-tertiary)", paddingTop: 8 },
+						children: forecasts.map(({ w, forecast }, i) =>
+							// Route page: label left, forecast right. Docked pane: stacked,
+							// so a long forecast never squeezes the window name.
 							jsxs("div", {
-								className: "flex items-center justify-between gap-2 text-xs",
+								style: page
+									? { display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 12, minWidth: 0 }
+									: { ...UI.col, gap: 0 },
 								children: [
-									jsx("span", {
-										className: "text-(--ui-text-secondary)",
-										children: w.label || "window",
-									}),
-									jsx("span", {
-										className: "tabular-nums text-[0.8125rem] font-medium",
-										style: { color: toneColor(tone) },
-										children: r == null ? "—" : `${r}% left`,
-									}),
+									jsx("span", { style: { ...UI.meta, color: "var(--ui-text-secondary)", ...UI.ellipsis }, children: w.label || "window" }),
+									jsx("div", { style: page ? { minWidth: 0, textAlign: "right" } : { minWidth: 0 }, children: jsx(ForecastLine, { forecast }) }),
 								],
-							}),
-							jsx(QuotaBar, { value: r, tone }),
-							// Agent monitor extras: burn rate / "fills before reset" and
-							// the used-% history. Absent without a monitor payload.
-							monitor
-								? jsx(ForecastLine, {
-										forecast: forecastFor(burnFor(monitor.burnMap, id, provider, w.label), w, monitor.nowSec),
-									})
-								: null,
-							monitor && monitor.history
-								? jsx(Sparkline, {
-										points: historyFor(monitor.history, id, provider, w.label),
-										max: 100,
-										height: 18,
-										color: toneColor(tone === "muted" ? "good" : tone),
-										label: `${w.label || "window"} history`,
-									})
-								: null,
-							dense && w.reset_at
-								? jsx("div", {
-										className: "text-[0.6875rem] text-(--ui-text-quaternary)",
-										children: t("reset", formatReset(w.reset_at, resetFormat)),
-									})
-								: null,
-						],
-					},
-					`${id}-w-${i}`,
-				);
-			}),
-			...details.filter((d) => (dense || id === "openrouter" || (baseProviderId(id) === "anthropic" && /^Observed /.test(d))) && (facts.available == null || !/^API calls available: (yes|no)$/.test(d))).map((d, i) =>
-						jsx(
-							"div",
-							{
-								className: "text-[0.6875rem] text-(--ui-text-tertiary)",
-								children: d,
-							},
-							`${id}-d-${i}`,
+							}, `${id}-f-${i}`),
 						),
-				),
+					})
+				: null,
+			series.length ? jsx(HistoryChart, { series, label: t("historyCaption") }) : null,
+			...detailLines.map((d, i) => jsx("div", { style: UI.meta, children: d }, `${id}-d-${i}`)),
+		],
+	});
+}
+
+// ---- settings -------------------------------------------------------------
+//
+// Grouped cards; inside a card every row is label + hint on the left and the
+// control on the right. In the narrow docked pane the control wraps under its
+// label instead of squeezing it.
+
+function SettingRow({ label, hint, children, block = false }) {
+	return jsxs("div", {
+		"data-setting-row": true,
+		style: {
+			display: "flex",
+			flexWrap: "wrap",
+			alignItems: block ? "stretch" : "center",
+			flexDirection: block ? "column" : "row",
+			justifyContent: "space-between",
+			gap: block ? 8 : "6px 16px",
+			padding: "8px 0",
+			minWidth: 0,
+		},
+		children: [
+			jsxs("div", {
+				style: { ...UI.col, gap: 2, flex: block ? "0 0 auto" : "1 1 170px" },
+				children: [
+					jsx("span", { style: { ...UI.text, lineHeight: 1.35 }, children: label }),
+					hint ? jsx("span", { style: { ...UI.tiny, lineHeight: 1.4 }, children: hint }) : null,
+				],
+			}),
+			children
+				? jsx("div", {
+						style: block
+							? { minWidth: 0 }
+							: { flexShrink: 0, display: "flex", alignItems: "center", gap: 4, marginLeft: "auto", maxWidth: "100%" },
+						children,
+					})
+				: null,
+		],
+	});
+}
+
+function SettingsCard({ icon, title, children, footer }) {
+	return jsxs("section", {
+		"data-settings-card": title,
+		style: { ...UI.card, padding: "10px 14px 6px" },
+		children: [
+			jsxs("div", {
+				style: { ...UI.row, gap: 7, padding: "2px 0 4px" },
+				children: [
+					jsx("span", { style: { display: "inline-flex", color: "var(--ui-text-tertiary)" }, children: jsx(SdkIcon, { name: icon, className: "h-3.5 w-3.5", fallback: "" }) }),
+					jsx("span", { style: { fontSize: "0.75rem", fontWeight: 600, color: "var(--ui-text-primary)" }, children: title }),
+				],
+			}),
+			jsx("div", { style: { ...UI.col }, children }),
+			footer ? jsx("div", { style: { ...UI.tiny, lineHeight: 1.4, padding: "2px 0 8px" }, children: footer }) : null,
 		],
 	});
 }
@@ -1579,22 +1894,16 @@ function ProviderRow({ id, provider, monitor }) {
 function ResetFormatControl() {
 	const t = usePluginI18n(ID);
 	const resetFormat = useValue(resetFormatAtom);
-	return jsxs("div", {
-		className: "flex items-center justify-between gap-2",
-		children: [
-			jsx("span", {
-				className: "text-xs text-(--ui-text-secondary)",
-				children: t("resetFormatLabel"),
-			}),
-			jsx(SegmentedControl, {
-				value: resetFormat,
-				onChange: (v) => setResetFormat(v),
-				options: [
-					{ id: "relative", label: t("relative") },
-					{ id: "absolute", label: t("absolute") },
-				],
-			}),
-		],
+	return jsx(SettingRow, {
+		label: t("resetFormatLabel"),
+		children: jsx(SegmentedControl, {
+			value: resetFormat,
+			onChange: (v) => setResetFormat(v),
+			options: [
+				{ id: "relative", label: t("relative") },
+				{ id: "absolute", label: t("absolute") },
+			],
+		}),
 	});
 }
 
@@ -1608,91 +1917,39 @@ function SdkIcon({ name, className, fallback = "•" }) {
 function ShowStatusBarControl() {
 	const t = usePluginI18n(ID);
 	const show = useValue(showStatusBarAtom);
-	return jsxs("div", {
-		className: "flex flex-col gap-1",
-		children: [
-			jsxs("div", {
-				className: "flex items-center justify-between gap-2",
-				children: [
-					jsx("span", {
-						className: "text-xs text-(--ui-text-secondary)",
-						children: t("showStatusBarLabel"),
-					}),
-					jsx(Switch, {
-						checked: show,
-						onCheckedChange: (v) => setShowStatusBar(v),
-					}),
-				],
-			}),
-			jsx("div", {
-				className: "text-[0.625rem] text-(--ui-text-quaternary)",
-				children: t("showStatusBarHint"),
-			}),
-		],
+	return jsx(SettingRow, {
+		label: t("showStatusBarLabel"),
+		hint: t("showStatusBarHint"),
+		children: jsx(Switch, { checked: show, onCheckedChange: (v) => setShowStatusBar(v) }),
 	});
 }
 
 function ShowDockedPaneControl() {
 	const t = usePluginI18n(ID);
 	const show = useValue(showDockedPaneAtom);
-	return jsxs("div", {
-		className: "flex items-center justify-between gap-2",
-		children: [
-			jsx("span", {
-				className: "text-xs text-(--ui-text-secondary)",
-				children: t("showDockedPaneLabel"),
-			}),
-			jsx(Switch, {
-				checked: show,
-				onCheckedChange: (v) => setShowDockedPane(v),
-			}),
-		],
+	return jsx(SettingRow, {
+		label: t("showDockedPaneLabel"),
+		children: jsx(Switch, { checked: show, onCheckedChange: (v) => setShowDockedPane(v) }),
 	});
 }
 
 function RefreshIntervalControl() {
 	const t = usePluginI18n(ID);
 	const seconds = useValue(refreshIntervalAtom);
-	return jsxs("div", {
-		className: "flex flex-col gap-1",
+	return jsx(SettingRow, {
+		label: t("refreshIntervalLabel"),
+		hint: t("refreshIntervalHint", seconds, REFRESH_INTERVAL_MIN, REFRESH_INTERVAL_MAX),
 		children: [
-			jsxs("div", {
-				className: "flex items-center justify-between gap-2",
-				children: [
-					jsx("span", {
-						className: "text-xs text-(--ui-text-secondary)",
-						children: t("refreshIntervalLabel"),
-					}),
-					jsxs("div", {
-						className: "flex items-center gap-1",
-						children: [
-							jsx(Input, {
-								type: "number",
-								min: REFRESH_INTERVAL_MIN,
-								max: REFRESH_INTERVAL_MAX,
-								step: 5,
-								value: seconds,
-								onChange: (e) =>
-									setRefreshInterval(e && e.target ? e.target.value : e),
-								className: "h-6 w-16 text-right text-xs",
-							}),
-							jsx("span", {
-								className: "text-[0.6875rem] text-(--ui-text-quaternary)",
-								children: t("seconds"),
-							}),
-						],
-					}),
-				],
-			}),
-			jsx("div", {
-				className: "text-[0.625rem] text-(--ui-text-quaternary)",
-				children: t(
-					"refreshIntervalHint",
-					seconds,
-					REFRESH_INTERVAL_MIN,
-					REFRESH_INTERVAL_MAX,
-				),
-			}),
+			jsx(Input, {
+				type: "number",
+				min: REFRESH_INTERVAL_MIN,
+				max: REFRESH_INTERVAL_MAX,
+				step: 5,
+				value: seconds,
+				onChange: (e) => setRefreshInterval(e && e.target ? e.target.value : e),
+				className: "h-6 w-16 text-right text-xs",
+			}, "input"),
+			jsx("span", { style: UI.faint, children: t("seconds") }, "unit"),
 		],
 	});
 }
@@ -1700,22 +1957,16 @@ function RefreshIntervalControl() {
 function StatusbarModeControl() {
 	const t = usePluginI18n(ID);
 	const mode = useValue(statusbarModeAtom);
-	return jsxs("div", {
-		className: "flex items-center justify-between gap-2",
-		children: [
-			jsx("span", {
-				className: "text-xs text-(--ui-text-secondary)",
-				children: t("statusbarModeLabel"),
-			}),
-			jsx(SegmentedControl, {
-				value: mode,
-				onChange: (v) => setStatusbarMode(v),
-				options: [
-					{ id: "all", label: t("statusbarModeAll") },
-					{ id: "worst", label: t("statusbarModeWorst") },
-				],
-			}),
-		],
+	return jsx(SettingRow, {
+		label: t("statusbarModeLabel"),
+		children: jsx(SegmentedControl, {
+			value: mode,
+			onChange: (v) => setStatusbarMode(v),
+			options: [
+				{ id: "all", label: t("statusbarModeAll") },
+				{ id: "worst", label: t("statusbarModeWorst") },
+			],
+		}),
 	});
 }
 
@@ -1727,96 +1978,157 @@ function DisabledProvidersControl() {
 	const allProviders =
 		data && data.providers ? Object.entries(data.providers) : [];
 	if (allProviders.length === 0) return null;
-	return jsxs("div", {
-		className: "flex flex-col gap-2",
-		children: [
-			jsx("span", {
-				className: "text-xs text-(--ui-text-secondary)",
-				children: t("disabledProvidersLabel"),
-			}),
-			jsx("div", {
-				className: "flex flex-wrap gap-1.5",
-				children: allProviders.map(([pid, p]) => {
-					const enabled = !disabled.includes(pid);
-					return jsx(
-						"button",
-						{
-							type: "button",
-							className: cn(
-								"inline-flex h-6 items-center justify-center gap-1 rounded px-2 text-xs",
-								enabled
-									? "bg-(--chrome-action) text-(--ui-text-primary) hover:bg-(--chrome-action-hover)"
-									: "bg-(--ui-stroke-secondary) text-(--ui-text-tertiary) hover:bg-(--ui-stroke-tertiary)",
-							),
-							onClick: () => {
-								const next = enabled
-									? [...disabled, pid]
-									: disabled.filter((x) => x !== pid);
-								setDisabledProviders(next);
-							},
-							title: enabled ? t("disableTooltip") : t("enableTooltip"),
-							children: jsxs("span", {
-								className: "inline-flex items-center gap-1.5",
-								children: [
-									jsx("span", {
-										className: enabled
-											? "text-(--ui-accent)"
-											: "text-(--ui-text-quaternary)",
-										children: enabled ? "●" : "○",
-									}),
-									jsx(ProviderBadge, { pid }),
-									jsx("span", { children: providerDisplayName(pid, p) }),
-								],
-							}),
+	return jsx(SettingsCard, {
+		icon: "Plug",
+		title: t("disabledProvidersLabel"),
+		children: jsx("div", {
+			style: { display: "flex", flexWrap: "wrap", gap: 6, padding: "6px 0 10px" },
+			children: allProviders.map(([pid, p]) => {
+				const enabled = !disabled.includes(pid);
+				return jsx(
+					"button",
+					{
+						type: "button",
+						"aria-pressed": enabled,
+						className: "inline-flex items-center gap-1.5 rounded-full text-xs transition-colors hover:bg-(--chrome-action-hover)",
+						style: {
+							height: 24,
+							padding: "0 9px 0 7px",
+							border: `1px solid ${enabled ? tint("var(--ui-accent)", 40) : "var(--ui-stroke-secondary)"}`,
+							background: enabled ? tint("var(--ui-accent)", 12) : "transparent",
+							color: enabled ? "var(--ui-text-primary)" : "var(--ui-text-tertiary)",
 						},
-						pid,
-					);
-				}),
+						onClick: () => {
+							const next = enabled
+								? [...disabled, pid]
+								: disabled.filter((x) => x !== pid);
+							setDisabledProviders(next);
+						},
+						title: enabled ? t("disableTooltip") : t("enableTooltip"),
+						children: jsxs("span", {
+							className: "inline-flex items-center gap-1.5",
+							children: [
+								jsx(Dot, { color: enabled ? "var(--ui-accent)" : "var(--ui-stroke-tertiary)", size: 6 }),
+								jsx(ProviderBadge, { pid }),
+								jsx("span", { children: providerDisplayName(pid, p) }),
+							],
+						}),
+					},
+					pid,
+				);
 			}),
-		],
+		}),
 	});
 }
 
 function PaneDetailControl() {
 	const t = usePluginI18n(ID);
 	const paneDetail = useValue(paneDetailAtom);
-	return jsxs("div", {
-		className: "flex items-center justify-between gap-2",
-		children: [
-			jsx("span", {
-				className: "text-xs text-(--ui-text-secondary)",
-				children: t("paneDetailLabel"),
-			}),
-			jsx(SegmentedControl, {
-				value: paneDetail,
-				onChange: (v) => setPaneDetail(v),
-				options: [
-					{ id: "clean", label: t("paneDetailClean") },
-					{ id: "dense", label: t("paneDetailDense") },
-				],
-			}),
-		],
+	return jsx(SettingRow, {
+		label: t("paneDetailLabel"),
+		hint: paneDetail === "clean" ? t("paneDetailCleanHint") : t("paneDetailDenseHint"),
+		children: jsx(SegmentedControl, {
+			value: paneDetail,
+			onChange: (v) => setPaneDetail(v),
+			options: [
+				{ id: "clean", label: t("paneDetailClean") },
+				{ id: "dense", label: t("paneDetailDense") },
+			],
+		}),
 	});
 }
 
 function QuotaSettings() {
 	const t = usePluginI18n(ID);
 	return jsxs("div", {
-		className: "flex flex-col gap-3 overflow-y-auto py-1",
+		"data-quota-settings": true,
+		style: { ...UI.col, gap: 10, paddingBottom: 4 },
 		children: [
-			jsx(ShowStatusBarControl, {}),
-			jsx(StatusbarModeControl, {}),
-			jsx(ShowDockedPaneControl, {}),
-			jsx(PaneDetailControl, {}),
-			jsx(ResetFormatControl, {}),
-			jsx(RefreshIntervalControl, {}),
+			jsxs(SettingsCard, {
+				icon: "PanelBottom",
+				title: t("settingsGroupStatusBar"),
+				children: [
+					jsx(ShowStatusBarControl, {}, "show"),
+					jsx(StatusbarModeControl, {}, "mode"),
+					jsx(AgentsChipControl, {}, "agents"),
+					jsx(NavBadgeControl, {}, "nav"),
+				],
+			}),
+			jsxs(SettingsCard, {
+				icon: "SlidersHorizontal",
+				title: t("settingsGroupQuota"),
+				children: [
+					jsx(ShowDockedPaneControl, {}, "docked"),
+					jsx(PaneDetailControl, {}, "detail"),
+					jsx(ResetFormatControl, {}, "reset"),
+					jsx(RefreshIntervalControl, {}, "interval"),
+				],
+			}),
 			jsx(DisabledProvidersControl, {}),
 			jsx(MonitorSettings, {}),
 		],
 	});
 }
 
-function QuotaPane() {
+/** Lowest "% left" over every enabled, configured quota window (or null). */
+function lowestLeft(providers) {
+	let lowest = null;
+	for (const [pid, p] of providerEntries(providers)) {
+		if (!isProviderEnabled(pid) || !isConfigured(p)) continue;
+		for (const w of asWindowList(p.windows)) {
+			const r = remainingPct(w);
+			if (r != null && (lowest == null || r < lowest.left)) lowest = { left: r, label: `${providerDisplayName(pid, p)} · ${w.label || "window"}` };
+		}
+	}
+	return lowest;
+}
+
+/** Agent Bar's summary strip: agent states, the tightest quota, spend today. */
+function SummaryStrip({ snapshot, providers }) {
+	const t = usePluginI18n(ID);
+	const counts = liveCounts(snapshot && snapshot.live);
+	const low = lowestLeft(providers);
+	const today = finiteNumber(asObject(asObject(asObject(snapshot && snapshot.usage).today).totals).cost);
+	const open = () => setPaneView("live");
+	const pill = (key, color, text, onClick) =>
+		jsx("button", {
+			type: "button",
+			onClick,
+			"data-summary": key,
+			className: "cursor-pointer",
+			style: { display: "inline-flex", border: 0, padding: 0, background: "transparent", minWidth: 0 },
+			children: jsx(Pill, { color, dot: true, children: text }),
+		}, key);
+	const items = [
+		pill("working", STATE_STYLE.working, t("chipWorking", counts.working || 0), open),
+		counts.needs_approval ? pill("approval", STATE_STYLE.needs_approval, t("chipApproval", counts.needs_approval), open) : null,
+		counts.your_turn ? pill("turn", STATE_STYLE.waiting, t("chipYourTurn", counts.your_turn), open) : null,
+		counts.stalled ? pill("stalled", STATE_STYLE.stalled, t("countStalled", counts.stalled), open) : null,
+		low ? pill("quota", toneColor(toneForRemaining(low.left)), t("summaryLowest", low.left), () => setPaneView("quota")) : null,
+		today != null ? pill("cost", "var(--ui-text-secondary)", t("summaryToday", fmtUsd(today)), () => setPaneView("usage")) : null,
+	].filter(Boolean);
+	return jsx("div", {
+		"data-summary-strip": true,
+		title: low ? low.label : undefined,
+		style: { display: "flex", flexWrap: "wrap", gap: 5, minWidth: 0, flexShrink: 0 },
+		children: items,
+	});
+}
+
+function IconButton({ title, onClick, disabled, children }) {
+	return jsx("button", {
+		type: "button",
+		className: "inline-flex items-center justify-center rounded text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground transition-colors",
+		style: { width: 24, height: 24, flexShrink: 0 },
+		title,
+		"aria-label": title,
+		disabled,
+		onClick,
+		children,
+	});
+}
+
+function QuotaPane({ page = false } = {}) {
 	const t = usePluginI18n(ID);
 	const qc = useQueryClient();
 	const [view, setView] = useState("list"); // 'list' | 'settings'
@@ -1838,6 +2150,7 @@ function QuotaPane() {
 	const nowTick = useNow(5_000);
 	const receivedAt = useRef(Date.now());
 	const pollSeconds = useValue(refreshIntervalAtom);
+	const liveSeconds = useValue(liveIntervalAtom);
 	useEffect(() => {
 		receivedAt.current = Date.now();
 	}, [data]);
@@ -1852,8 +2165,8 @@ function QuotaPane() {
 	const versionSkew =
 		data && data.plugin_version && data.plugin_version !== WIDGET_VERSION
 			? jsx("div", {
-					className:
-						"rounded-lg border border-dashed border-(--ui-stroke-secondary) bg-(--ui-bg-elevated) px-3 py-2 text-[0.6875rem] text-(--ui-text-secondary)",
+					className: "rounded-lg border border-dashed px-3 py-2",
+					style: { ...UI.meta, borderColor: "var(--ui-stroke-secondary)", marginTop: 8 },
 					children: t("versionSkew", WIDGET_VERSION, data.plugin_version),
 				})
 			: null;
@@ -1870,29 +2183,28 @@ function QuotaPane() {
 	});
 
 	const headerTitle = view === "settings" ? t("settingsTitle") : t("paneTitle");
+	// The route page centres one column (settings a little narrower); the
+	// docked pane keeps the full 300px.
+	const column = page
+		? { width: "100%", maxWidth: view === "settings" ? SETTINGS_MAX_WIDTH : PAGE_MAX_WIDTH, marginLeft: "auto", marginRight: "auto", boxSizing: "border-box" }
+		: { width: "100%" };
 
 	let body;
 	if (view === "settings") {
 		body = jsx(QuotaSettings, {});
 	} else if (activeTab !== "quota") {
-		body = jsx(MonitorBody, { mon, view: activeTab });
+		body = jsx(MonitorBody, { mon, view: activeTab, page });
 	} else if (isLoading) {
-		body = jsx("div", {
-			className: "text-xs text-(--ui-text-tertiary)",
-			children: t("loading"),
-		});
+		body = jsx(Empty, { children: t("loading") });
 	} else if (isError) {
-		body = jsx("div", {
-			className: "text-xs text-(--ui-text-tertiary)",
-			children: t("error"),
-		});
+		body = jsx(Empty, { children: t("error") });
 	} else if (
 		!data ||
 		!data.providers ||
 		Object.keys(data.providers).length === 0
 	) {
 		body = jsxs("div", {
-			className: "flex flex-col gap-1 text-xs text-(--ui-text-tertiary)",
+			style: { ...UI.col, gap: 4, ...UI.meta },
 			children: [
 				jsx("div", { children: t("empty") }),
 				jsx("div", { children: t("emptyHint") }),
@@ -1911,25 +2223,25 @@ function QuotaPane() {
 			? { burnMap: monitorBurnMap(mon.snapshot, history), history, nowSec: Date.now() / 1000 }
 			: null;
 		body = jsxs("div", {
-			className: "flex flex-col gap-2",
+			style: { ...UI.col, gap: 8 },
 			children: [
 				mon.snapshot ? jsx(AccountHints, { providers: data.providers }, "account-hints") : null,
 				...withData.map(([id, p], index) =>
-					jsx(ProviderRow, { id, provider: p, monitor: monitorExtras, key: id === "openai-codex" ? `${id}-${index}` : id }),
+					jsx(ProviderRow, { id, provider: p, monitor: monitorExtras, page, key: id === "openai-codex" ? `${id}-${index}` : id }),
 				),
 				withoutData.length > 0
 					? jsxs("details", {
-							className: "mt-1",
+							style: { marginTop: 2 },
 							children: [
 								jsx("summary", {
-									className:
-										"cursor-pointer select-none text-[0.6875rem] text-(--ui-text-quaternary) hover:text-(--ui-text-tertiary)",
+									className: "cursor-pointer select-none",
+									style: UI.faint,
 									children: t("noDataSection", withoutData.length),
 								}),
 								jsx("div", {
-									className: "mt-1.5 flex flex-col gap-2",
+									style: { ...UI.col, gap: 6, marginTop: 6 },
 									children: withoutData.map(([id, p], index) =>
-										jsx(ProviderRow, { id, provider: p, key: id === "openai-codex" ? `${id}-${index}` : id }),
+										jsx(ProviderRow, { id, provider: p, page, key: id === "openai-codex" ? `${id}-${index}` : id }),
 									),
 								}),
 							],
@@ -1939,120 +2251,82 @@ function QuotaPane() {
 		});
 	}
 
+	const online = isError ? "bad" : data ? "good" : "muted";
+	const footerText =
+		view !== "settings" && activeTab !== "quota"
+			? mon.snapshot && finiteNumber(mon.snapshot.generated_at) != null
+				? { text: t("monitorUpdated", checkedDateTime(new Date(Number(mon.snapshot.generated_at) * 1000).toISOString()), liveSeconds) }
+				: null
+			: data && data.fetched_at
+				? {
+						title: data.fetched_at,
+						text:
+							t("fetched", checkedDateTime(data.fetched_at) || data.fetched_at) +
+							(ageSeconds == null ? "" : ` · ${t("fetchedAge", formatAgeSeconds(ageSeconds), pollSeconds)}`),
+					}
+				: null;
+
 	return jsxs("div", {
-		className: "flex h-full flex-col gap-2 p-3",
-		style: { minHeight: 0, minWidth: 0, overflow: "auto", boxSizing: "border-box" },
+		className: "flex h-full flex-col",
+		"data-quota-layout": page ? "page" : "pane",
+		style: { minHeight: 0, minWidth: 0, overflow: "auto", boxSizing: "border-box", gap: 8, padding: page ? "14px 20px 10px" : "10px 12px 8px" },
 		children: [
 			jsxs("div", {
-				className: "flex items-center justify-between",
-				style: { flexShrink: 0, flexWrap: "wrap", gap: "0.5rem" },
+				style: { ...column, ...UI.row, justifyContent: "space-between", flexShrink: 0, flexWrap: "wrap", gap: 8 },
 				children: [
-					jsx("div", {
-						className: "text-sm font-medium",
-						children: headerTitle,
-					}),
 					jsxs("div", {
-						className: "flex items-center gap-1",
+						style: { ...UI.row, gap: 7 },
 						children: [
+							jsx(Dot, { color: toneColor(online), size: 7, halo: online === "good" }),
+							jsx("span", { style: { fontSize: page ? "0.9375rem" : "0.8125rem", fontWeight: 600, color: "var(--ui-text-primary)" }, children: headerTitle }),
+						],
+					}),
+					jsx("div", {
+						style: { ...UI.row, gap: 2 },
+						children:
 							view === "settings"
-								? jsx("button", {
-										type: "button",
-										className: cn(
-											"inline-flex h-6 w-6 items-center justify-center rounded",
-											"text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground transition-colors",
-										),
+								? jsx(IconButton, {
 										title: t("backTip"),
 										onClick: () => setView("list"),
-										children: jsx(SdkIcon, {
-											name: "ArrowLeft",
-											className: "h-3.5 w-3.5",
-											fallback: "‹",
-										}),
+										children: jsx(SdkIcon, { name: "ArrowLeft", className: "h-3.5 w-3.5", fallback: "‹" }),
 									})
-								: jsxs("div", {
-										className: "flex items-center",
-										children: [
-											jsx("button", {
-												type: "button",
-												className: cn(
-													"inline-flex h-6 w-6 items-center justify-center rounded",
-													"text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground transition-colors",
-												),
-												title: t("refreshTip"),
-												disabled: refresh.isPending,
-												onClick: () =>
-													activeTab === "quota"
-														? refresh.mutate()
-														: qc.invalidateQueries({ queryKey: MONITOR_QUERY_KEY }),
-												children: jsx(icons.RefreshCw, {
-													className: cn(
-														"h-3.5 w-3.5",
-														refresh.isPending && "animate-spin",
-													),
-												}),
-											}),
-											jsx("button", {
-												type: "button",
-												className: cn(
-													"inline-flex h-6 items-center justify-center gap-1 rounded px-1.5",
-													"text-xs text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground transition-colors",
-												),
-												title: t("settingsTip"),
-												onClick: () => setView("settings"),
-												children: jsxs("span", {
-													className: "inline-flex items-center gap-1",
-													children: [
-														jsx(SdkIcon, {
-															name: "Settings",
-															className: "h-3.5 w-3.5",
-															fallback: "⚙",
-														}),
-														jsx("span", { children: t("settingsButton") }),
-													],
-												}),
-											}),
-										],
-									}),
-						],
+								: [
+										jsx(IconButton, {
+											title: t("refreshTip"),
+											disabled: refresh.isPending,
+											onClick: () =>
+												activeTab === "quota"
+													? refresh.mutate()
+													: qc.invalidateQueries({ queryKey: MONITOR_QUERY_KEY }),
+											children: jsx(icons.RefreshCw, { className: cn("h-3.5 w-3.5", refresh.isPending && "animate-spin") }),
+										}, "refresh"),
+										jsx(IconButton, {
+											title: t("settingsTip"),
+											onClick: () => setView("settings"),
+											children: jsx(SdkIcon, { name: "Settings", className: "h-3.5 w-3.5", fallback: "⚙" }),
+										}, "settings"),
+									],
 					}),
 				],
 			}),
 			view !== "settings" && monitorOn
-				? jsx("div", { style: { flexShrink: 0, minWidth: 0 }, "data-monitor-tabs": true, children: jsx(MonitorTabs, {}) })
+				? jsx("div", { style: { ...column, flexShrink: 0, minWidth: 0 }, "data-monitor-tabs": true, children: jsx(MonitorTabs, {}) })
+				: null,
+			view !== "settings" && monitorOn && mon.snapshot
+				? jsx("div", { style: { ...column, flexShrink: 0 }, children: jsx(SummaryStrip, { snapshot: mon.snapshot, providers: data && data.providers }) })
 				: null,
 			jsx("div", {
 				className: "min-h-0 flex-1",
 				"data-quota-scroll": true,
-				style: { minHeight: 0, minWidth: 0, overflowY: "auto", overflowX: "hidden", flex: "1 1 0%" },
-				children: jsxs("div", { children: [body, jsx(UpdateBanner, { update }), versionSkew] }),
+				style: { minHeight: 0, minWidth: 0, overflowY: "auto", overflowX: "hidden", flex: "1 1 0%", paddingTop: 2 },
+				children: jsxs("div", { style: column, children: [body, jsx(UpdateBanner, { update }), versionSkew] }),
 			}),
-			view !== "settings" && activeTab !== "quota"
-				? mon.snapshot && finiteNumber(mon.snapshot.generated_at) != null
-					? jsx("div", {
-							className: "pt-2 text-[0.6875rem] text-(--ui-text-quaternary)",
-							"data-quota-checked": true,
-							style: { flexShrink: 0, minWidth: 0, overflowWrap: "anywhere" },
-							children: t(
-								"monitorUpdated",
-								checkedDateTime(new Date(Number(mon.snapshot.generated_at) * 1000).toISOString()),
-								pollSeconds,
-							),
-						})
-					: null
-				: data && data.fetched_at
+			footerText
 				? jsx("div", {
-						className: "pt-2 text-[0.6875rem] text-(--ui-text-quaternary)",
 						"data-quota-checked": true,
-						style: { flexShrink: 0, minWidth: 0, overflowWrap: "anywhere" },
-						title: data.fetched_at,
-						children:
-							t(
-								"fetched",
-								checkedDateTime(data.fetched_at) || data.fetched_at,
-							) +
-							(ageSeconds == null
-								? ""
-								: ` · ${t("fetchedAge", formatAgeSeconds(ageSeconds), pollSeconds)}`),
+						title: footerText.title,
+						style: { ...column, ...UI.faint, flexShrink: 0, minWidth: 0, overflowWrap: "anywhere", paddingTop: 6, borderTop: "1px solid var(--ui-stroke-tertiary)" },
+						children: footerText.text,
 					})
 				: null,
 		],
@@ -2763,24 +3037,24 @@ async function openMonitorTarget(scope, target, snapshot) {
 
 // ---- small UI pieces ----
 
+// Agent Bar's state colours: working green, your turn accent, approval orange
+// (it needs you now), stalled amber. Same semantic tokens core uses.
 const STATE_STYLE = {
 	working: "var(--ui-green)",
 	waiting: "var(--ui-accent)",
-	needs_approval: "var(--ui-red)",
+	needs_approval: "var(--ui-orange)",
 	stalled: "var(--ui-yellow)",
-	long_tool: "var(--ui-orange)",
+	long_tool: "var(--ui-cyan)",
 	ended: "var(--ui-stroke-tertiary)",
 };
 
 function StateBadge({ state }) {
 	const t = usePluginI18n(ID);
-	return jsxs("span", {
-		className: "inline-flex shrink-0 items-center gap-1 text-[0.6875rem] font-medium text-(--ui-text-secondary)",
+	return jsx(Pill, {
 		"data-state": state,
-		children: [
-			jsx("span", { className: "inline-block h-1.5 w-1.5 rounded-full", style: { background: STATE_STYLE[state] || STATE_STYLE.ended } }),
-			t(`state_${state}`),
-		],
+		color: state === "ended" ? "var(--ui-text-tertiary)" : STATE_STYLE[state] || STATE_STYLE.ended,
+		dot: true,
+		children: t(`state_${state}`),
 	});
 }
 
@@ -2814,42 +3088,25 @@ function Sparkline({ values, points, height = 22, color = "var(--ui-accent)", ma
 		"data-sparkline": true,
 		style: { display: "block", overflow: "visible" },
 		children: [
-			jsx("path", { d: `${line} L100 ${height} L0 ${height} Z`, fill: color, fillOpacity: 0.12, stroke: "none" }, "a"),
+			jsx("path", { d: `${line} L100 ${height} L0 ${height} Z`, fill: color, fillOpacity: 0.18, stroke: "none" }, "a"),
 			jsx("path", { d: line, fill: "none", stroke: color, strokeWidth: 1.5, vectorEffect: "non-scaling-stroke", strokeLinejoin: "round" }, "l"),
 		],
 	});
 }
 
-function MiniBars({ values, height = 28, color = "var(--ui-accent)", label }) {
-	const list = asList(values).map((v) => Math.max(0, Number(v) || 0));
-	if (!list.length) return null;
-	const top = Math.max(...list) || 1;
-	const w = 100 / list.length;
-	return jsx("svg", {
-		viewBox: `0 0 100 ${height}`,
-		preserveAspectRatio: "none",
-		width: "100%",
-		height,
-		role: "img",
-		"aria-label": label || "",
-		style: { display: "block" },
-		children: list.map((v, i) => {
-			const h = Math.max(v > 0 ? 1 : 0, (v / top) * (height - 1));
-			return jsx("rect", { x: i * w + w * 0.15, y: height - h, width: w * 0.7, height: h, fill: color, rx: 0.6 }, i);
-		}),
-	});
-}
-
+/** Small uppercase header (Agent Bar's "TOKENS / MINUTE"), a sub on the right. */
 function Section({ title, sub, children }) {
 	return jsxs("div", {
-		className: "flex flex-col gap-1.5",
-		style: { minWidth: 0 },
+		style: { ...UI.col, gap: 6 },
 		children: [
 			jsxs("div", {
-				className: "flex items-baseline justify-between gap-2",
+				style: { display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 8, minWidth: 0 },
 				children: [
-					jsx("span", { className: "text-xs font-semibold text-(--ui-text-primary)", children: title }),
-					sub ? jsx("span", { className: "text-[0.6875rem] text-(--ui-text-quaternary)", style: { overflowWrap: "anywhere" }, children: sub }) : null,
+					jsx("span", {
+						style: { fontSize: "0.625rem", fontWeight: 650, letterSpacing: "0.06em", textTransform: "uppercase", color: "var(--ui-text-tertiary)", ...UI.ellipsis },
+						children: title,
+					}),
+					sub ? jsx("span", { style: { ...UI.faint, ...UI.num, textAlign: "right", overflowWrap: "anywhere" }, children: sub }) : null,
 				],
 			}),
 			children,
@@ -2857,43 +3114,66 @@ function Section({ title, sub, children }) {
 	});
 }
 
-function Card({ children, onClick, title, tone }) {
-	const props = {
-		className: cn(
-			"flex w-full flex-col gap-1 rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-elevated) px-2.5 py-2 text-left",
-			onClick && "cursor-pointer hover:bg-(--chrome-action-hover) transition-colors",
+/** A card holding compact rows separated by hairlines. */
+function List({ children }) {
+	const rows = asList(Array.isArray(children) ? children : [children]).filter(Boolean);
+	return jsx("div", {
+		style: { ...UI.card, padding: "2px 0", overflow: "hidden" },
+		children: rows.map((row, i) =>
+			jsx("div", { style: { borderTop: i ? "1px solid var(--ui-stroke-tertiary)" : undefined, minWidth: 0 }, children: row }, row && row.key != null ? row.key : i),
 		),
-		style: { minWidth: 0, overflowWrap: "anywhere", borderLeft: tone ? `2px solid ${tone}` : undefined },
-		title,
-		children,
-	};
-	// jsxs: `children` is a static slot list, not a keyed collection.
-	return onClick ? jsxs("button", { ...props, type: "button", onClick }) : jsxs("div", props);
+	});
 }
 
-function Kpi({ label, value, sub }) {
+/** One compact row: optional click target, optional tone stripe. */
+function Row({ children, onClick, title, tone }) {
+	const style = {
+		...UI.col,
+		gap: 2,
+		width: "100%",
+		padding: "7px 10px",
+		textAlign: "left",
+		boxSizing: "border-box",
+		overflowWrap: "anywhere",
+		background: tone ? `linear-gradient(90deg, ${tint(tone, 10)}, transparent 55%)` : "transparent",
+		boxShadow: tone ? `inset 2px 0 0 ${tone}` : undefined,
+		border: 0,
+		color: "inherit",
+	};
+	// jsxs wants a static array; a single child is wrapped.
+	const kids = Array.isArray(children) ? children : [children];
+	return onClick
+		? jsxs("button", { type: "button", className: "cursor-pointer hover:bg-(--chrome-action-hover) transition-colors", style, title, onClick, children: kids })
+		: jsxs("div", { style, title, children: kids });
+}
+
+/** Agent Bar's KPI tile: small label, big number, one sub line. */
+function Kpi({ label, value, sub, tone }) {
 	return jsxs("div", {
-		className: "flex flex-col rounded-lg border border-(--ui-stroke-secondary) px-2 py-1.5",
-		style: { minWidth: "5.5rem", flex: "1 1 5.5rem" },
+		style: { ...UI.card, ...UI.col, gap: 1, padding: "7px 9px" },
 		children: [
-			jsx("span", { className: "text-[0.625rem] text-(--ui-text-tertiary)", children: label }),
-			jsx("span", { className: "tabular-nums text-sm font-semibold text-(--ui-text-primary)", children: value }),
-			sub ? jsx("span", { className: "text-[0.625rem] text-(--ui-text-quaternary)", children: sub }) : null,
+			jsx("span", { style: { ...UI.meta, lineHeight: 1.25 }, children: label }),
+			jsx("span", { style: { ...UI.num, fontSize: "1rem", fontWeight: 650, lineHeight: 1.3, color: tone || "var(--ui-text-primary)", overflowWrap: "anywhere" }, children: value }),
+			sub ? jsx("span", { style: { ...UI.tiny, lineHeight: 1.35 }, children: sub }) : null,
 		],
 	});
+}
+
+function KpiGrid({ children, min = 84 }) {
+	return jsx("div", { style: { display: "grid", gridTemplateColumns: `repeat(auto-fit, minmax(${min}px, 1fr))`, gap: 6 }, children });
 }
 
 function MetaLine({ parts }) {
 	const shown = parts.filter((p) => p != null && p !== "" && p !== false);
 	if (!shown.length) return null;
 	return jsx("div", {
-		className: "flex flex-wrap gap-x-2 text-[0.6875rem] text-(--ui-text-tertiary)",
-		children: shown.map((p, i) => jsx("span", { className: "tabular-nums", children: p }, i)),
+		style: { display: "flex", flexWrap: "wrap", columnGap: 6, ...UI.meta, minWidth: 0 },
+		children: shown.map((p, i) => jsx("span", { style: UI.num, children: i ? `· ${p}` : p }, i)),
 	});
 }
 
 function Empty({ children }) {
-	return jsx("div", { className: "text-[0.6875rem] text-(--ui-text-quaternary)", children });
+	return jsx("div", { style: { ...UI.faint, padding: "2px 0" }, children });
 }
 
 function MonitorNotice({ mon }) {
@@ -2906,7 +3186,8 @@ function MonitorNotice({ mon }) {
 				? t("monitorError")
 				: t("loading");
 	return jsx("div", {
-		className: "rounded-lg border border-dashed border-(--ui-stroke-secondary) px-3 py-2 text-[0.6875rem] text-(--ui-text-tertiary)",
+		className: "rounded-lg border border-dashed px-3 py-2",
+		style: { ...UI.meta, borderColor: "var(--ui-stroke-secondary)" },
 		"data-monitor-notice": mon.unsupported ? "unsupported" : mon.enabled ? "pending" : "off",
 		children: text,
 	});
@@ -2916,6 +3197,10 @@ function SectionError({ snapshot, section }) {
 	const t = usePluginI18n(ID);
 	const err = asObject(snapshot && snapshot.errors)[section];
 	return err ? jsx(Empty, { children: t("sectionError", section) }) : null;
+}
+
+function ViewStack({ name, children }) {
+	return jsxs("div", { "data-monitor-view": name, style: { ...UI.col, gap: 14 }, children });
 }
 
 // ---- Live view ----
@@ -2930,39 +3215,66 @@ function LiveRow({ row, children, scope, snapshot, nowSec }) {
 	const badge = state !== "ended" && row.long_tool_call ? "long_tool" : state;
 	const activity = row.long_tool_call ? t("longToolCall", row.long_tool_call) : row.activity;
 	const hermes = row.open ? row.open.kind === "hermes-session" : !row.kind || row.kind === "hermes";
+	const color = STATE_STYLE[state] || STATE_STYLE.ended;
 	return jsxs("div", {
-		className: "flex flex-col gap-1",
-		style: { minWidth: 0 },
+		style: UI.col,
 		children: [
-			jsx(Card, {
+			jsxs(Row, {
 				tone: badge === "needs_approval" ? STATE_STYLE.needs_approval : undefined,
 				title: hermes ? t("openSessionTip") : row.open && row.open.command ? t("copyCommandTip", row.open.command) : undefined,
 				onClick: () => void openMonitorTarget(scope, { open: row.open, row, sessionId: row.id, profile: row.profile }, snapshot),
 				children: [
 					jsxs("div", {
-						className: "flex items-center gap-2",
-						style: { minWidth: 0 },
+						style: { display: "flex", alignItems: "flex-start", gap: 8, minWidth: 0 },
 						children: [
-							jsx(StateBadge, { state: badge }),
-							jsx("span", { className: "min-w-0 flex-1 truncate text-xs font-medium text-(--ui-text-primary)", children: row.title || t("untitled") }),
-							row.subagent ? jsx("span", { className: "text-[0.625rem] text-(--ui-text-quaternary)", children: t("subagent") }) : null,
+							jsx("span", { style: { paddingTop: 5, flexShrink: 0, display: "inline-flex" }, children: jsx(Dot, { color, size: 7, halo: state === "working" }) }),
+							jsxs("div", {
+								style: { ...UI.col, gap: 2, flex: "1 1 auto" },
+								children: [
+									jsxs("div", {
+										style: { ...UI.row, gap: 6 },
+										children: [
+											jsx("span", { style: { ...UI.text, fontWeight: 500, ...UI.ellipsis, flex: "1 1 auto" }, children: row.title || t("untitled") }),
+											row.tokens != null
+												? jsx("span", { style: { ...UI.meta, ...UI.num, flexShrink: 0, color: "var(--ui-text-secondary)", fontWeight: 600 }, children: t("tokensN", fmtTokens(row.tokens)) })
+												: null,
+										],
+									}),
+									jsxs("div", {
+										style: { display: "flex", alignItems: "baseline", gap: 6, minWidth: 0 },
+										children: [
+											jsx("div", {
+												style: { flex: "1 1 auto", minWidth: 0 },
+												children: jsx(MetaLine, {
+													parts: [
+														row.subagent ? t("subagent") : null,
+														row.model,
+														row.cost != null ? fmtUsd(row.cost) : null,
+														row.context_tokens != null ? t("contextN", fmtTokens(row.context_tokens)) : null,
+														row.account ? `@${row.account}` : null,
+													],
+												}),
+											}),
+											row.last ? jsx("span", { style: { ...UI.tiny, ...UI.num, flexShrink: 0 }, children: t("ago", fmtSpan(nowSec - Number(row.last))) }) : null,
+										],
+									}),
+									badge !== "working" || activity
+										? jsxs("div", {
+												style: { ...UI.row, gap: 6 },
+												children: [
+													badge !== "working" ? jsx(StateBadge, { state: badge }) : null,
+													activity ? jsx("span", { style: { ...UI.faint, ...UI.ellipsis }, title: activity, children: activity }) : null,
+												],
+											})
+										: null,
+								],
+							}),
 						],
 					}),
-					jsx(MetaLine, {
-						parts: [
-							row.model,
-							row.tokens != null ? t("tokensN", fmtTokens(row.tokens)) : null,
-							row.cost != null ? fmtUsd(row.cost) : null,
-							row.context_tokens != null ? t("contextN", fmtTokens(row.context_tokens)) : null,
-							row.last ? t("ago", fmtSpan(nowSec - Number(row.last))) : null,
-							row.account ? `@${row.account}` : null,
-						],
-					}),
-					activity ? jsx("div", { className: "truncate text-[0.6875rem] text-(--ui-text-quaternary)", title: activity, children: `↳ ${activity}` }) : null,
 				],
 			}),
 			children && children.length
-				? jsx("div", { className: "flex flex-col gap-1 pl-3", children })
+				? jsx("div", { style: { ...UI.col, marginLeft: 13, paddingLeft: 6, borderLeft: "1px solid var(--ui-stroke-secondary)" }, children })
 				: null,
 		],
 	});
@@ -2997,7 +3309,20 @@ function LiveView({ mon }) {
 		}
 		groups.get(key).rows.push(r);
 	}
-	const tokenSeries = asList(live.tokens).map(tokenTotal);
+	const minutes = asList(live.tokens);
+	const tokenSeries = minutes.map(tokenTotal);
+	const sourceKeys = [];
+	for (const m of minutes) for (const k of Object.keys(asObject(m && m.by))) if (!sourceKeys.includes(k)) sourceKeys.push(k);
+	const palette = seriesPalette(sourceKeys);
+	const columns = minutes.map((m) =>
+		Object.entries(asObject(m && m.by)).map(([k, v]) => [k, finiteNumber(v && typeof v === "object" ? v.tokens : v) || 0]),
+	);
+	const clock = (sec) => {
+		const d = new Date(Number(sec) * 1000);
+		return Number.isFinite(d.getTime()) ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
+	};
+	const tickLabels = minutes.length > 4 ? [0, 1, 2, 3].map((q) => clock(minutes[Math.round((q / 3) * (minutes.length - 1))].t)) : [];
+	const messages = asList(live.activity).map((a) => (Number(a && a.assistant) || 0) + (Number(a && a.tool) || 0) + (Number(a && a.user) || 0));
 	const attention = asList(live.attention).filter((a) => a && a.kind);
 	const countText = [
 		t("countWorking", counts.working || 0),
@@ -3006,38 +3331,59 @@ function LiveView({ mon }) {
 		counts.stalled ? t("countStalled", counts.stalled) : null,
 	].filter(Boolean).join(" · ");
 	const cost60 = finiteNumber(live.cost_60m);
-	return jsxs("div", {
-		className: "flex flex-col gap-3",
-		"data-monitor-view": "live",
+	const attentionTone = (kind) =>
+		kind === "approval" ? STATE_STYLE.needs_approval : kind === "your_turn" ? STATE_STYLE.waiting : kind === "big_context" ? "var(--ui-purple)" : STATE_STYLE.stalled;
+	return jsxs(ViewStack, {
+		name: "live",
 		children: [
-			jsxs("div", {
-				className: "flex flex-wrap gap-1.5",
+			jsxs(KpiGrid, {
 				children: [
-					jsx(Kpi, { label: t("last1m"), value: fmtTokens(live.last_1m), sub: t("tokensPerMin") }),
-					jsx(Kpi, { label: t("last60m"), value: fmtTokens(live.last_60m), sub: cost60 != null ? t("costPerMin", fmtUsd(cost60 / 60)) : null }),
-					jsx(Kpi, { label: t("openSessions"), value: String(counts.open || 0), sub: countText }),
+					jsx(Kpi, { label: t("openSessions"), value: String(counts.open || 0), sub: counts.subagents ? t("subagentsN", counts.subagents) : countText }, "open"),
+					jsx(Kpi, { label: t("last1m"), value: fmtTokens(live.last_1m), sub: t("tokensPerMin") }, "1m"),
+					jsx(Kpi, { label: t("last60m"), value: fmtTokens(live.last_60m), sub: cost60 != null ? t("costPerMin", fmtUsd(cost60 / 60)) : null }, "60m"),
 				],
 			}),
 			tokenSeries.some((v) => v > 0)
 				? jsx(Section, {
 						title: t("tokensChart"),
 						sub: cost60 != null ? t("cost60m", fmtUsd(cost60)) : null,
-						children: jsx(Sparkline, { values: tokenSeries, height: 28, label: t("tokensChart") }),
+						children: jsxs("div", {
+							style: { ...UI.col, gap: 5 },
+							children: [
+								sourceKeys.length > 1 || (sourceKeys.length === 1 && SOURCE_NAMES[sourceKeys[0]])
+									? jsx(Legend, { items: sourceKeys.map((k) => ({ label: sourceLabel(k), color: palette.get(k) })) })
+									: null,
+								jsx(StackedBars, { columns, colors: palette, height: 52, label: t("tokensChart"), marker: true, xLabels: tickLabels }),
+							],
+						}),
 					})
+				: null,
+			messages.some((v) => v > 0)
+				? jsx(Section, { title: t("messagesChart"), children: jsx(Sparkline, { values: messages, height: 30, color: "var(--ui-purple)", label: t("messagesChart") }) })
 				: null,
 			attention.length
 				? jsx(Section, {
 						title: t("attentionTitle", attention.length),
-						children: jsx("div", {
-							className: "flex flex-col gap-1",
+						children: jsx(List, {
 							children: attention.map((a) =>
-								jsx(Card, {
-									tone: a.kind === "approval" ? STATE_STYLE.needs_approval : a.kind === "your_turn" ? STATE_STYLE.waiting : STATE_STYLE.stalled,
+								jsxs(Row, {
+									tone: attentionTone(a.kind),
 									title: t("openSessionTip"),
 									onClick: () => void openMonitorTarget(mon.scope, { sessionId: a.session_id, profile: a.profile, source: a.source }, snapshot),
 									children: [
-										jsx("span", { className: "text-xs font-medium text-(--ui-text-primary)", children: tr(`attention_${a.kind}`, a.profile || tr("agent")) }),
-										jsx(MetaLine, { parts: [a.title || t("untitled"), a.detail, a.since ? t("ago", fmtSpan(nowSec - Number(a.since))) : null] }),
+										jsxs("div", {
+											style: { ...UI.row, gap: 6 },
+											children: [
+												jsx(Dot, { color: attentionTone(a.kind), size: 6 }),
+												jsx("span", { style: { ...UI.text, fontWeight: 500, ...UI.ellipsis, flex: "1 1 auto" }, children: tr(`attention_${a.kind}`, a.profile || tr("agent")) }),
+												a.since ? jsx("span", { style: { ...UI.tiny, ...UI.num, flexShrink: 0 }, children: t("ago", fmtSpan(nowSec - Number(a.since))) }) : null,
+											],
+										}),
+										jsx("div", {
+											style: { ...UI.meta, ...UI.ellipsis, paddingLeft: 12 },
+											title: a.title || undefined,
+											children: [a.title || t("untitled"), a.detail && a.detail !== "finished" ? a.detail : null].filter(Boolean).join(" · "),
+										}),
 									],
 								}, a.id || `${a.session_id}-${a.kind}`),
 							),
@@ -3049,8 +3395,7 @@ function LiveView({ mon }) {
 						jsx(Section, {
 							title: g.label,
 							sub: `${g.sub} · ${g.rows.length}`,
-							children: jsx("div", {
-								className: "flex flex-col gap-1.5",
+							children: jsx(List, {
 								children: g.rows.map((r) =>
 									jsx(LiveRow, {
 										row: r,
@@ -3082,6 +3427,10 @@ function modelTone(status) {
 	return "muted";
 }
 
+function toneText(tone) {
+	return tone === "muted" ? "var(--ui-text-tertiary)" : toneColor(tone);
+}
+
 function HealthView({ mon }) {
 	const t = usePluginI18n(ID);
 	const nowMs = useNow(30_000);
@@ -3104,36 +3453,49 @@ function HealthView({ mon }) {
 	const notSetUp = allAccounts.filter((a) => !accounts.includes(a)).map((a) => providerMeta(a.provider).name);
 	const chains = asList(health.chains).filter(Boolean);
 	const speed = asList(health.speed).filter(Boolean);
-	return jsxs("div", {
-		className: "flex flex-col gap-3",
-		"data-monitor-view": "health",
+	const counts = { bad: 0, warn: 0, good: 0 };
+	for (const m of models) {
+		const tone = modelTone(m.status);
+		if (tone in counts) counts[tone] += 1;
+	}
+	return jsxs(ViewStack, {
+		name: "health",
 		children: [
+			models.length
+				? jsxs(KpiGrid, {
+						children: [
+							jsx(Kpi, { label: t("modelStatus_ok"), value: String(counts.good), tone: counts.good ? toneColor("good") : undefined }, "ok"),
+							jsx(Kpi, { label: t("modelStatus_degraded"), value: String(counts.warn), tone: counts.warn ? toneColor("warn") : undefined }, "warn"),
+							jsx(Kpi, { label: t("modelStatus_failing"), value: String(counts.bad), tone: counts.bad ? toneColor("bad") : undefined }, "bad"),
+						],
+					})
+				: null,
 			jsx(Section, {
 				title: t("healthAccounts"),
 				children: accounts.length
-					? jsx("div", {
-							className: "flex flex-col gap-1.5",
+					? jsx(List, {
 							children: accounts.map((a, i) =>
-								jsx(Card, {
+								jsxs(Row, {
 									children: [
 										jsxs("div", {
-											className: "flex items-center gap-2 text-xs font-medium text-(--ui-text-primary)",
+											style: { ...UI.row, gap: 6 },
 											children: [
 												jsx(ProviderBadge, { pid: a.provider }),
-												providerMeta(a.provider).name,
-												a.unavailable ? jsx("span", { className: "text-[0.6875rem] font-normal text-(--ui-text-tertiary)", children: t("unavailable", a.unavailable_code || a.unavailable) }) : null,
+												jsx("span", { style: { ...UI.text, fontWeight: 600, flex: "1 1 auto", ...UI.ellipsis }, children: providerMeta(a.provider).name }),
+												a.unavailable ? jsx(Pill, { color: "var(--ui-text-tertiary)", children: t("unavailable", a.unavailable_code || a.unavailable) }) : null,
 											],
 										}),
 										...asList(a.credentials).filter(Boolean).map((c, j) => {
 											const until = isoToSeconds(c.exhausted_until);
 											const locked = Boolean(c.locked) || c.status === "exhausted";
+											const tone = locked ? "bad" : c.status === "ok" ? "good" : "muted";
 											return jsxs("div", {
-												className: "flex flex-wrap items-center gap-x-2 pl-7 text-[0.6875rem] text-(--ui-text-secondary)",
+												style: { ...UI.row, gap: 6, paddingLeft: 26 },
 												children: [
-													jsx("span", { className: "inline-block h-1.5 w-1.5 rounded-full", style: { background: toneColor(locked ? "bad" : c.status === "ok" ? "good" : "muted") } }),
-													jsx("span", { children: c.label || c.account_key || t("credentialN", j + 1) }),
-													jsx("span", { className: "text-(--ui-text-tertiary)", children: locked ? t("credLocked") : c.status || "—" }),
-													until && until > nowSec ? jsx("span", { className: "text-(--ui-text-quaternary)", children: t("unlocksIn", fmtSpan(until - nowSec)) }) : null,
+													jsx(Dot, { color: toneColor(tone), size: 6 }),
+													jsx("span", { style: { ...UI.secondary, flex: "1 1 auto", ...UI.ellipsis }, children: c.label || c.account_key || t("credentialN", j + 1) }),
+													until && until > nowSec ? jsx("span", { style: { ...UI.tiny, flexShrink: 0 }, children: t("unlocksIn", fmtSpan(until - nowSec)) }) : null,
+													jsx(Pill, { color: toneText(tone), children: locked ? t("credLocked") : c.status || "—" }),
 												],
 											}, `${i}-${j}`);
 										}),
@@ -3148,35 +3510,37 @@ function HealthView({ mon }) {
 				title: t("healthModels"),
 				sub: t("last24h"),
 				children: models.length
-					? jsx("div", {
-							className: "flex flex-col gap-1",
+					? jsx(List, {
 							children: models.map((m, i) => {
 								const rate = finiteNumber(m.error_rate);
 								const cooldown = isoToSeconds(m.cooldown_until);
-								return jsx(Card, {
-									tone: modelTone(m.status) === "bad" ? toneColor("bad") : undefined,
+								const tone = modelTone(m.status);
+								return jsxs(Row, {
+									tone: tone === "bad" ? toneColor("bad") : undefined,
 									children: [
 										jsxs("div", {
-											className: "flex items-center gap-2",
-											style: { minWidth: 0 },
+											style: { ...UI.row, gap: 6 },
 											children: [
-												jsx("span", { className: "inline-block h-1.5 w-1.5 shrink-0 rounded-full", style: { background: toneColor(modelTone(m.status)) } }),
-												jsx("span", { className: "min-w-0 flex-1 truncate text-xs font-medium text-(--ui-text-primary)", children: m.model }),
-												jsx("span", { className: "text-[0.6875rem] text-(--ui-text-tertiary)", children: t(`modelStatus_${m.status || "idle"}`) }),
+												jsx(Dot, { color: toneColor(tone), size: 6 }),
+												jsx("span", { style: { ...UI.text, fontWeight: 500, flex: "1 1 auto", ...UI.ellipsis }, children: m.model }),
+												jsx(Pill, { color: toneText(tone), children: t(`modelStatus_${m.status || "idle"}`) }),
 											],
 										}),
-										jsx(MetaLine, {
-											parts: [
-												providerMeta(m.provider).name,
-												m.calls_24h != null ? t("callsN", m.calls_24h) : null,
-												rate != null ? t("errorRate", (rate * 100).toFixed(rate < 0.1 ? 1 : 0)) : null,
-												m.errors_24h ? t("errorsN", m.errors_24h) : null,
-												cooldown && cooldown > nowSec ? t("cooldownFor", fmtSpan(cooldown - nowSec)) : null,
-												m.recovered ? t("recovered") : null,
-											],
+										jsx("div", {
+											style: { paddingLeft: 12 },
+											children: jsx(MetaLine, {
+												parts: [
+													providerMeta(m.provider).name,
+													m.calls_24h != null ? t("callsN", m.calls_24h) : null,
+													rate != null ? t("errorRate", (rate * 100).toFixed(rate < 0.1 ? 1 : 0)) : null,
+													m.errors_24h ? t("errorsN", m.errors_24h) : null,
+													cooldown && cooldown > nowSec ? t("cooldownFor", fmtSpan(cooldown - nowSec)) : null,
+													m.recovered ? t("recovered") : null,
+												],
+											}),
 										}),
-										m.last_error && m.last_error.summary && (m.errors_24h || modelTone(m.status) !== "good")
-											? jsx("div", { className: "truncate text-[0.6875rem] text-(--ui-text-quaternary)", title: m.last_error.summary, children: `↳ ${m.last_error.summary}` })
+										m.last_error && m.last_error.summary && (m.errors_24h || tone !== "good")
+											? jsx("div", { style: { ...UI.faint, ...UI.ellipsis, paddingLeft: 12 }, title: m.last_error.summary, children: `↳ ${m.last_error.summary}` })
 											: null,
 									],
 								}, `${m.provider}-${m.model}-${i}`);
@@ -3187,34 +3551,38 @@ function HealthView({ mon }) {
 			jsx(Section, {
 				title: t("healthChains"),
 				children: chains.length
-					? jsx("div", {
-							className: "flex flex-col gap-1",
+					? jsx(List, {
 							children: chains.map((c, i) =>
-								jsx(Card, {
+								jsxs(Row, {
 									children: [
 										jsxs("div", {
-											className: "flex flex-wrap items-center gap-x-2 text-xs",
+											style: { ...UI.row, gap: 6 },
 											children: [
-												jsx("span", { className: "font-medium text-(--ui-text-primary)", children: c.profile }),
-												jsx("span", { className: "inline-block h-1.5 w-1.5 rounded-full", style: { background: toneColor(modelTone(c.status)) } }),
-												jsx("span", { className: "text-(--ui-text-secondary)", children: c.model }),
+												jsx("span", { style: { ...UI.text, fontWeight: 600, flexShrink: 0 }, children: c.profile }),
+												jsx(Dot, { color: toneColor(modelTone(c.status)), size: 6 }),
+												jsx("span", { style: { ...UI.secondary, ...UI.ellipsis }, children: c.model }),
 											],
 										}),
 										asList(c.fallbacks).length
-											? asList(c.fallbacks).map((f, j) =>
-													jsx("div", {
-														className: "pl-3 text-[0.6875rem] text-(--ui-text-tertiary)",
-														style: { overflowWrap: "anywhere" },
-														children: `→ ${f.model} (${providerMeta(f.provider).name}) · ${
-															f.state === "skip"
-																? t("chainSkip", t(`skip_${f.reason}`))
-																: f.state === "risky"
-																	? t("chainRisky", ((finiteNumber(f.rate) || 0) * 100).toFixed(0))
-																	: t("chainOk")
-														}`,
-													}, j),
-												)
-											: jsx("div", { className: "pl-3 text-[0.6875rem] text-(--ui-text-quaternary)", children: t("noFallbacks") }),
+											? asList(c.fallbacks).map((f, j) => {
+													const tone = f.state === "skip" ? "muted" : f.state === "risky" ? "warn" : "good";
+													return jsxs("div", {
+														style: { display: "flex", flexWrap: "wrap", alignItems: "center", gap: "2px 6px", paddingLeft: 12, minWidth: 0 },
+														children: [
+															jsx("span", { style: { ...UI.meta, overflowWrap: "anywhere" }, children: `→ ${f.model} (${providerMeta(f.provider).name})` }),
+															jsx(Pill, {
+																color: toneText(tone),
+																children:
+																	f.state === "skip"
+																		? t("chainSkip", t(`skip_${f.reason}`))
+																		: f.state === "risky"
+																			? t("chainRisky", ((finiteNumber(f.rate) || 0) * 100).toFixed(0))
+																			: t("chainOk"),
+															}),
+														],
+													}, j);
+												})
+											: jsx("div", { style: { ...UI.faint, paddingLeft: 12 }, children: t("noFallbacks") }),
 									],
 								}, `${c.profile}-${i}`),
 							),
@@ -3224,15 +3592,16 @@ function HealthView({ mon }) {
 			speed.length
 				? jsx(Section, {
 						title: t("healthSpeed"),
-						children: jsx("div", {
-							className: "flex flex-col gap-0.5",
+						children: jsx(List, {
 							children: speed.map((s, i) =>
-								jsxs("div", {
-									className: "flex flex-wrap items-baseline justify-between gap-x-2 text-[0.6875rem]",
-									children: [
-										jsx("span", { className: "min-w-0 truncate text-(--ui-text-secondary)", children: `${s.model}${s.source && s.source !== "hermes" ? ` · ${s.source}` : ""}` }),
-										jsx("span", { className: "tabular-nums text-(--ui-text-tertiary)", children: t("speedLine", fmtSeconds(s.p50_s), fmtSeconds(s.p90_s), s.turns || 0) }),
-									],
+								jsx(Row, {
+									children: jsxs("div", {
+										style: { display: "flex", flexWrap: "wrap", alignItems: "baseline", justifyContent: "space-between", gap: "0 8px", minWidth: 0 },
+										children: [
+											jsx("span", { style: { ...UI.secondary, ...UI.ellipsis }, children: `${s.model}${s.source && s.source !== "hermes" ? ` · ${s.source}` : ""}` }),
+											jsx("span", { style: { ...UI.meta, ...UI.num }, children: t("speedLine", fmtSeconds(s.p50_s), fmtSeconds(s.p90_s), s.turns || 0) }),
+										],
+									}),
 								}, `${s.source}-${s.model}-${i}`),
 							),
 						}),
@@ -3251,21 +3620,20 @@ function BudgetBar({ label, spent, limit, projection }) {
 	const pct = (spent / limit) * 100;
 	const tone = pct >= 100 ? "bad" : pct >= 80 ? "warn" : "good";
 	return jsxs("div", {
-		className: "flex flex-col gap-1",
+		style: { ...UI.col, gap: 5 },
 		"data-budget": label,
 		children: [
 			jsxs("div", {
-				className: "flex items-center justify-between gap-2 text-xs",
+				style: { display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 8, flexWrap: "wrap" },
 				children: [
-					jsx("span", { className: "text-(--ui-text-secondary)", children: label }),
-					jsx("span", { className: "tabular-nums font-medium", style: { color: toneColor(tone) }, children: `${fmtUsd(spent)} / ${fmtUsd(limit)} · ${Math.round(pct)}%` }),
+					jsx("span", { style: UI.text, children: label }),
+					jsx("span", { style: { ...UI.num, fontSize: "0.75rem", fontWeight: 600, color: tone === "good" ? "var(--ui-text-primary)" : toneColor(tone) }, children: `${fmtUsd(spent)} / ${fmtUsd(limit)} · ${Math.round(pct)}%` }),
 				],
 			}),
 			jsx(QuotaBar, { value: pct, tone }),
 			projection != null
 				? jsx("div", {
-						className: "text-[0.6875rem]",
-						style: { color: projection > limit ? toneColor("warn") : "var(--ui-text-quaternary)" },
+						style: { fontSize: "0.6875rem", color: projection > limit ? toneColor("warn") : "var(--ui-text-quaternary)" },
 						children: t(projection > limit ? "projectionOver" : "projection", fmtUsd(projection)),
 					})
 				: null,
@@ -3273,30 +3641,32 @@ function BudgetBar({ label, spent, limit, projection }) {
 	});
 }
 
-function TopList({ title, rows, onPick }) {
+function TopList({ title, rows, onPick, color = "var(--ui-accent)" }) {
 	const list = rows.filter((r) => r && r.label);
 	if (!list.length) return null;
 	const top = Math.max(...list.map((r) => Number(r.cost) || 0)) || 1;
 	return jsx(Section, {
 		title,
 		children: jsx("div", {
-			className: "flex flex-col gap-1",
+			style: { ...UI.col, gap: 7 },
 			children: list.map((r, i) =>
 				jsxs(onPick && r.pick ? "button" : "div", {
 					type: onPick && r.pick ? "button" : undefined,
-					className: cn("flex flex-col gap-0.5 text-left", onPick && r.pick && "cursor-pointer rounded hover:bg-(--chrome-action-hover)"),
+					className: onPick && r.pick ? "cursor-pointer rounded hover:bg-(--chrome-action-hover)" : undefined,
+					style: { ...UI.col, gap: 3, textAlign: "left", border: 0, padding: 0, background: "transparent", color: "inherit", width: "100%" },
 					onClick: onPick && r.pick ? () => onPick(r.pick) : undefined,
 					children: [
 						jsxs("div", {
-							className: "flex items-baseline justify-between gap-2 text-[0.6875rem]",
+							style: { display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 8, minWidth: 0 },
 							children: [
-								jsx("span", { className: "min-w-0 truncate text-(--ui-text-secondary)", title: r.label, children: r.label }),
-								jsx("span", { className: "shrink-0 tabular-nums text-(--ui-text-tertiary)", children: r.sub ? `${fmtUsd(r.cost)} · ${r.sub}` : fmtUsd(r.cost) }),
+								jsx("span", { style: { ...UI.secondary, ...UI.ellipsis }, title: r.label, children: r.label }),
+								jsx("span", { style: { ...UI.meta, ...UI.num, flexShrink: 0 }, children: r.sub ? `${fmtUsd(r.cost)} · ${r.sub}` : fmtUsd(r.cost) }),
 							],
 						}),
 						jsx("div", {
-							className: "h-1 w-full overflow-hidden rounded-full bg-(--ui-stroke-secondary)",
-							children: jsx("div", { className: "h-full rounded-full", style: { width: `${Math.max(2, ((Number(r.cost) || 0) / top) * 100)}%`, background: "var(--ui-accent)" } }),
+							className: "w-full overflow-hidden rounded-full",
+							style: { height: 4, background: "var(--ui-stroke-tertiary)" },
+							children: jsx("div", { className: "h-full rounded-full", style: { width: `${Math.max(2, ((Number(r.cost) || 0) / top) * 100)}%`, background: color } }),
 						}),
 					],
 				}, i),
@@ -3327,47 +3697,64 @@ function UsageView({ mon }) {
 			pick: { sessionId: s.id, profile: s.profile, row: { id: s.id, profile: s.profile, kind: !s.source || s.source === "hermes" ? "hermes" : s.source } },
 		}));
 	const weekTotal = u.last7.reduce((sum, d) => sum + d.cost, 0);
-	return jsxs("div", {
-		className: "flex flex-col gap-3",
-		"data-monitor-view": "usage",
+	// Per-provider split of each day, where the backend has it; today's split
+	// comes from the `today` block (the month block may lag a poll behind).
+	const split = new Map(asList(month.daily).filter((d) => d && typeof d.day === "string").map((d) => [d.day, asObject(d.by)]));
+	for (const d of asList(asObject(usage.today).daily)) if (d && typeof d.day === "string") split.set(d.day, asObject(d.by));
+	const columns = u.last7.map((d) => {
+		const parts = Object.entries(split.get(d.day) || {}).map(([k, v]) => [k, finiteNumber(v && typeof v === "object" ? v.cost : v) || 0]);
+		const sum = parts.reduce((s, [, v]) => s + v, 0);
+		return parts.length && Math.abs(sum - d.cost) < 0.01 + d.cost * 0.02 ? parts : [["total", d.cost]];
+	});
+	const keys = [];
+	for (const parts of columns) for (const [k] of parts) if (!keys.includes(k)) keys.push(k);
+	const palette = seriesPalette(keys);
+	const weekday = (day) => {
+		const d = new Date(`${day}T12:00:00`);
+		return Number.isFinite(d.getTime()) ? d.toLocaleDateString([], { weekday: "short" }) : day.slice(5);
+	};
+	const avg = weekTotal / 7;
+	return jsxs(ViewStack, {
+		name: "usage",
 		children: [
-			jsxs("div", {
-				className: "flex flex-wrap gap-1.5",
-				children: [
-					jsx(Kpi, { label: t("costToday"), value: fmtUsd(u.today), sub: u.todayTokens != null ? t("tokensN", fmtTokens(u.todayTokens)) : null }),
-					jsx(Kpi, { label: t("costMonth"), value: fmtUsd(u.mtd), sub: t("projection", fmtUsd(u.projection)) }),
-				],
-			}),
 			daily > 0 || monthly > 0
-				? jsx(Section, {
-						title: t("budgetTitle"),
-						children: jsxs("div", {
-							className: "flex flex-col gap-2",
-							children: [
-								jsx(BudgetBar, { label: t("budgetDaily"), spent: u.today, limit: daily }),
-								jsx(BudgetBar, { label: t("budgetMonthly"), spent: u.mtd, limit: monthly, projection: u.projection }),
-							],
+				? jsx("div", {
+						style: { ...UI.card, padding: "10px 12px" },
+						children: jsx(Section, {
+							title: t("budgetTitle"),
+							sub: t("budgetSub"),
+							children: jsxs("div", {
+								style: { ...UI.col, gap: 10 },
+								children: [
+									jsx(BudgetBar, { label: t("budgetDaily"), spent: u.today, limit: daily }),
+									jsx(BudgetBar, { label: t("budgetMonthly"), spent: u.mtd, limit: monthly, projection: u.projection }),
+								],
+							}),
 						}),
 					})
 				: jsx(Empty, { children: t("budgetHint") }),
+			jsxs(KpiGrid, {
+				children: [
+					jsx(Kpi, { label: t("costToday"), value: fmtUsd(u.today), sub: u.todayTokens != null ? t("tokensN", fmtTokens(u.todayTokens)) : null }, "today"),
+					jsx(Kpi, { label: t("costMonth"), value: fmtUsd(u.mtd), sub: t("projection", fmtUsd(u.projection)) }, "month"),
+					jsx(Kpi, { label: t("last7Days"), value: fmtUsd(weekTotal), sub: t("dailyAvg", fmtUsd(avg)) }, "week"),
+				],
+			}),
 			jsx(Section, {
-				title: t("last7Days"),
+				title: t("dailyChart"),
 				sub: fmtUsd(weekTotal),
 				children: jsxs("div", {
-					className: "flex flex-col gap-0.5",
+					style: { ...UI.col, gap: 5 },
 					children: [
-						jsx(MiniBars, { values: u.last7.map((d) => d.cost), label: t("last7Days") }),
-						jsxs("div", {
-							className: "flex justify-between text-[0.625rem] text-(--ui-text-quaternary)",
-							children: [jsx("span", { children: u.last7[0].day.slice(5) }), jsx("span", { children: u.last7[6].day.slice(5) })],
-						}),
+						keys.length > 1 ? jsx(Legend, { items: keys.map((k) => ({ label: sourceLabel(k), color: palette.get(k) })) }) : null,
+						jsx(StackedBars, { columns, colors: palette, height: 64, label: t("last7Days"), xLabels: u.last7.map((d) => weekday(d.day)) }),
 					],
 				}),
 			}),
 			jsx(TopList, { title: t("topModels"), rows: models }),
-			jsx(TopList, { title: t("topProfiles"), rows: profiles }),
-			jsx(TopList, { title: t("topSessions"), rows: sessions, onPick: (pick) => void openMonitorTarget(mon.scope, pick, snapshot) }),
-			jsx("div", { className: "text-[0.625rem] text-(--ui-text-quaternary)", children: t("costEstimateNote") }),
+			jsx(TopList, { title: t("topProfiles"), rows: profiles, color: "var(--ui-purple)" }),
+			jsx(TopList, { title: t("topSessions"), rows: sessions, color: "var(--ui-cyan)", onPick: (pick) => void openMonitorTarget(mon.scope, pick, snapshot) }),
+			jsx("div", { style: UI.tiny, children: t("costEstimateNote") }),
 			jsx(SectionError, { snapshot, section: "usage" }),
 		],
 	});
@@ -3376,6 +3763,7 @@ function UsageView({ mon }) {
 // ---- Kanban view ----
 
 const KANBAN_GROUPS = ["running", "blocked", "review", "failing"];
+const KANBAN_COLORS = { running: "var(--ui-green)", blocked: "var(--ui-red)", review: "var(--ui-purple)", failing: "var(--ui-orange)" };
 
 function kanbanGroup(card) {
 	if (!card) return null;
@@ -3390,9 +3778,8 @@ function KanbanView({ mon }) {
 	const t = usePluginI18n(ID);
 	const snapshot = mon.snapshot;
 	const boards = asList(asObject(snapshot.kanban).boards).filter(Boolean);
-	return jsxs("div", {
-		className: "flex flex-col gap-3",
-		"data-monitor-view": "kanban",
+	return jsxs(ViewStack, {
+		name: "kanban",
 		children: [
 			boards.length
 				? boards.map((board, bi) => {
@@ -3412,34 +3799,36 @@ function KanbanView({ mon }) {
 							sub: countLine,
 							children: any
 								? jsx("div", {
-										className: "flex flex-col gap-2",
+										style: { ...UI.col, gap: 10 },
 										children: KANBAN_GROUPS.filter((g) => grouped[g].length).map((g) =>
 											jsxs("div", {
-												className: "flex flex-col gap-1",
+												style: { ...UI.col, gap: 5 },
 												"data-kanban-group": g,
 												children: [
-													jsx("span", { className: "text-[0.6875rem] font-medium text-(--ui-text-tertiary)", children: `${t(`kanbanGroup_${g}`)} · ${grouped[g].length}` }),
-													...grouped[g].map((card) =>
-														jsx(Card, {
-															tone: g === "failing" ? toneColor("bad") : g === "blocked" ? toneColor("warn") : undefined,
-															title: card.open && card.open.command ? t("copyCommandTip", card.open.command) : undefined,
-															onClick: card.open && card.open.command ? () => void copyCommand(card.open.command) : undefined,
-															children: [
-																jsx("span", { className: "text-xs font-medium text-(--ui-text-primary)", children: card.title || card.id }),
-																jsx(MetaLine, {
-																	parts: [
-																		card.assignee || t("unassigned"),
-																		card.block_kind === "needs_input" ? t("cardWhat_input") : null,
-																		finiteNumber(card.consecutive_failures) ? t("failuresN", card.consecutive_failures) : null,
-																		card.id,
-																	],
-																}),
-																card.last_failure_error && g === "failing"
-																	? jsx("div", { className: "truncate text-[0.6875rem] text-(--ui-text-quaternary)", title: card.last_failure_error, children: `↳ ${card.last_failure_error}` })
-																	: null,
-															],
-														}, card.id),
-													),
+													jsx("div", { children: jsx(Pill, { color: KANBAN_COLORS[g], dot: true, children: `${t(`kanbanGroup_${g}`)} · ${grouped[g].length}` }) }),
+													jsx(List, {
+														children: grouped[g].map((card) =>
+															jsxs(Row, {
+																tone: g === "failing" || g === "blocked" ? KANBAN_COLORS[g] : undefined,
+																title: card.open && card.open.command ? t("copyCommandTip", card.open.command) : undefined,
+																onClick: card.open && card.open.command ? () => void copyCommand(card.open.command) : undefined,
+																children: [
+																	jsx("span", { style: { ...UI.text, fontWeight: 500, lineHeight: 1.35 }, children: card.title || card.id }),
+																	jsx(MetaLine, {
+																		parts: [
+																			card.assignee || t("unassigned"),
+																			card.block_kind === "needs_input" ? t("cardWhat_input") : null,
+																			finiteNumber(card.consecutive_failures) ? t("failuresN", card.consecutive_failures) : null,
+																			card.id,
+																		],
+																	}),
+																	card.last_failure_error && g === "failing"
+																		? jsx("div", { style: { ...UI.faint, ...UI.ellipsis }, title: card.last_failure_error, children: `↳ ${card.last_failure_error}` })
+																		: null,
+																],
+															}, card.id),
+														),
+													}),
 												],
 											}, g),
 										),
@@ -3461,13 +3850,13 @@ function ForecastLine({ forecast }) {
 	const rate = forecast.perHour;
 	const rateText = t("burnRate", `${rate >= 0 ? "+" : ""}${rate.toFixed(Math.abs(rate) < 10 ? 1 : 0)}`);
 	let text;
-	let color = "var(--ui-text-quaternary)";
+	let color = "var(--ui-text-tertiary)";
 	if (rate <= 0) text = t("burnFlat");
 	else if (forecast.fills) {
 		text = `${rateText} · ${t("fillsIn", fmtSpan(forecast.inSeconds))}${forecast.marginSeconds != null ? ` · ${t("beforeReset", fmtSpan(forecast.marginSeconds))}` : ""}`;
 		color = forecast.soon ? toneColor("bad") : toneColor("warn");
 	} else text = `${rateText} · ${t("noFillBeforeReset")}`;
-	return jsx("div", { className: "text-[0.6875rem]", style: { color }, "data-forecast": forecast.fills ? "fills" : "ok", children: text });
+	return jsx("div", { style: { fontSize: "0.6875rem", color, ...UI.num }, "data-forecast": forecast.fills ? "fills" : "ok", children: text });
 }
 
 function AccountHints({ providers }) {
@@ -3475,12 +3864,15 @@ function AccountHints({ providers }) {
 	const hints = accountRoomHints(providers);
 	if (!hints.length) return null;
 	return jsx("div", {
-		className: "flex flex-col gap-1",
+		style: { ...UI.col, gap: 4 },
 		children: hints.slice(0, 3).map((h) =>
-			jsx("div", {
-				className: "rounded-lg border border-dashed border-(--ui-stroke-secondary) px-3 py-1.5 text-[0.6875rem] text-(--ui-text-secondary)",
+			jsxs("div", {
 				"data-account-hint": true,
-				children: `${t("accountHint", h.full, h.used, h.room)} — ${t("accountHintBody", h.window, h.left, h.room)}`,
+				style: { ...UI.card, ...UI.row, alignItems: "flex-start", gap: 7, padding: "7px 10px", borderColor: tint("var(--ui-yellow)", 45), background: `color-mix(in srgb, var(--ui-yellow) 7%, var(--ui-bg-elevated))` },
+				children: [
+					jsx("span", { style: { paddingTop: 4, display: "inline-flex" }, children: jsx(Dot, { color: "var(--ui-yellow)", size: 6 }) }),
+					jsx("span", { style: { ...UI.secondary, fontSize: "0.6875rem", lineHeight: 1.4 }, children: `${t("accountHint", h.full, h.used, h.room)} — ${t("accountHintBody", h.window, h.left, h.room)}` }),
+				],
 			}, h.key),
 		),
 	});
@@ -3504,6 +3896,7 @@ function MonitorStatus() {
 		counts.your_turn ? t("chipYourTurn", counts.your_turn) : null,
 		approval ? t("chipApproval", approval) : null,
 	].filter(Boolean).join(" · ");
+	const color = approval ? STATE_STYLE.needs_approval : counts.working ? STATE_STYLE.working : STATE_STYLE.waiting;
 	return jsx(QuotaTip, {
 		label: `${t("openSessions")}: ${counts.open}\n${label}\n${t("chipOpenLive")}`,
 		children: jsxs("button", {
@@ -3519,58 +3912,49 @@ function MonitorStatus() {
 				if (typeof host.navigate === "function") host.navigate("/quota");
 			},
 			children: [
-				jsx("span", {
-					className: "inline-block h-1.5 w-1.5 rounded-full",
-					style: { background: approval ? STATE_STYLE.needs_approval : counts.working ? STATE_STYLE.working : STATE_STYLE.waiting },
-				}),
-				jsx("span", { className: "tabular-nums", children: label }),
+				jsx(Dot, { color, size: 6, halo: Boolean(counts.working) && !approval }),
+				jsx("span", { className: "tabular-nums", style: approval ? { color: STATE_STYLE.needs_approval, fontWeight: 600 } : undefined, children: label }),
 			],
 		}),
 	});
 }
 
-// ---- settings ----
+// ---- settings: agent monitor, budget, notifications ----
 
 function SettingSwitch({ label, hint, checked, onChange }) {
-	return jsxs("div", {
-		className: "flex flex-col gap-1",
-		children: [
-			jsxs("div", {
-				className: "flex items-center justify-between gap-2",
-				children: [
-					jsx("span", { className: "text-xs text-(--ui-text-secondary)", children: label }),
-					jsx(Switch, { checked, onCheckedChange: onChange }),
-				],
-			}),
-			hint ? jsx("div", { className: "text-[0.625rem] text-(--ui-text-quaternary)", children: hint }) : null,
-		],
-	});
+	return jsx(SettingRow, { label, hint, children: jsx(Switch, { checked, onCheckedChange: onChange }) });
+}
+
+function AgentsChipControl() {
+	const t = usePluginI18n(ID);
+	const chip = useValue(agentsChipAtom);
+	return jsx(SettingSwitch, { label: t("agentsChipLabel"), checked: chip, onChange: (v) => setStored(AGENTS_CHIP_KEY, !!v, agentsChipAtom) });
+}
+
+function NavBadgeControl() {
+	const t = usePluginI18n(ID);
+	const navBadgeOn = useValue(navBadgeAtom);
+	return jsx(SettingSwitch, { label: t("navBadgeLabel"), hint: t("navBadgeHint"), checked: navBadgeOn, onChange: (v) => setStored(NAV_BADGE_KEY, !!v, navBadgeAtom) });
 }
 
 function BudgetInput({ label, kind }) {
 	const t = usePluginI18n(ID);
 	const value = useValue(kind === "monthly" ? budgetMonthlyAtom : budgetDailyAtom);
-	return jsxs("div", {
-		className: "flex items-center justify-between gap-2",
+	return jsx(SettingRow, {
+		label,
 		children: [
-			jsx("span", { className: "text-xs text-(--ui-text-secondary)", children: label }),
-			jsxs("div", {
-				className: "flex items-center gap-1",
-				children: [
-					jsx("span", { className: "text-[0.6875rem] text-(--ui-text-quaternary)", children: "$" }),
-					jsx(Input, {
-						type: "number",
-						min: 0,
-						step: 1,
-						value: value || "",
-						placeholder: t("budgetOff"),
-						"data-budget-input": kind,
-						onChange: (e) => setBudget(kind, e && e.target ? e.target.value : e),
-						onBlur: () => void syncBudgetToBackend(),
-						className: "h-6 w-20 text-right text-xs",
-					}),
-				],
-			}),
+			jsx("span", { style: UI.faint, children: "$" }, "cur"),
+			jsx(Input, {
+				type: "number",
+				min: 0,
+				step: 1,
+				value: value || "",
+				placeholder: t("budgetOff"),
+				"data-budget-input": kind,
+				onChange: (e) => setBudget(kind, e && e.target ? e.target.value : e),
+				onBlur: () => void syncBudgetToBackend(),
+				className: "h-6 w-20 text-right text-xs",
+			}, "input"),
 		],
 	});
 }
@@ -3578,75 +3962,108 @@ function BudgetInput({ label, kind }) {
 function MonitorSettings() {
 	const t = usePluginI18n(ID);
 	const enabled = useValue(monitorEnabledAtom);
-	const chip = useValue(agentsChipAtom);
 	const forecast = useValue(quotaForecastAtom);
 	const days = useValue(historyDaysAtom);
 	const liveEvery = useValue(liveIntervalAtom);
-	const navBadgeOn = useValue(navBadgeAtom);
 	const notify = {};
 	for (const kind of NOTIFY_KINDS) notify[kind] = useValue(notifyAtoms[kind]);
 	return jsxs("div", {
-		className: "flex flex-col gap-3 border-t border-(--ui-stroke-secondary) pt-3",
 		"data-monitor-settings": true,
+		style: { ...UI.col, gap: 10 },
 		children: [
-			jsx("span", { className: "text-xs font-semibold text-(--ui-text-primary)", children: t("monitorSettingsTitle") }),
-			jsx(SettingSwitch, { label: t("monitorEnabledLabel"), hint: t("monitorEnabledHint"), checked: enabled, onChange: (v) => setStored(MONITOR_ENABLED_KEY, !!v, monitorEnabledAtom) }),
-			jsx(SettingSwitch, { label: t("agentsChipLabel"), checked: chip, onChange: (v) => setStored(AGENTS_CHIP_KEY, !!v, agentsChipAtom) }),
-			jsx(SettingSwitch, { label: t("navBadgeLabel"), hint: t("navBadgeHint"), checked: navBadgeOn, onChange: (v) => setStored(NAV_BADGE_KEY, !!v, navBadgeAtom) }),
-			jsx(SettingSwitch, { label: t("quotaForecastLabel"), hint: t("quotaForecastHint"), checked: forecast, onChange: (v) => setStored(QUOTA_FORECAST_KEY, !!v, quotaForecastAtom) }),
-			jsxs("div", {
-				className: "flex items-center justify-between gap-2",
+			jsxs(SettingsCard, {
+				icon: "Activity",
+				title: t("monitorSettingsTitle"),
 				children: [
-					jsx("span", { className: "text-xs text-(--ui-text-secondary)", children: t("historyRangeLabel") }),
-					jsx(SegmentedControl, {
-						value: String(days),
-						onChange: (v) => setStored(HISTORY_DAYS_KEY, Number(v) === 7 ? 7 : 1, historyDaysAtom),
-						options: [
-							{ id: "1", label: t("historyDay") },
-							{ id: "7", label: t("historyWeek") },
-						],
-					}),
+					jsx(SettingSwitch, { label: t("monitorEnabledLabel"), hint: t("monitorEnabledHint"), checked: enabled, onChange: (v) => setStored(MONITOR_ENABLED_KEY, !!v, monitorEnabledAtom) }, "on"),
+					jsx(SettingSwitch, { label: t("quotaForecastLabel"), hint: t("quotaForecastHint"), checked: forecast, onChange: (v) => setStored(QUOTA_FORECAST_KEY, !!v, quotaForecastAtom) }, "forecast"),
+					jsx(SettingRow, {
+						label: t("historyRangeLabel"),
+						children: jsx(SegmentedControl, {
+							value: String(days),
+							onChange: (v) => setStored(HISTORY_DAYS_KEY, Number(v) === 7 ? 7 : 1, historyDaysAtom),
+							options: [
+								{ id: "1", label: t("historyDay") },
+								{ id: "7", label: t("historyWeek") },
+							],
+						}),
+					}, "history"),
+					jsx(SettingRow, {
+						label: t("liveIntervalLabel"),
+						children: jsx(SegmentedControl, {
+							value: String(liveEvery),
+							onChange: (v) => {
+								const n = Number(v);
+								setStored(LIVE_INTERVAL_KEY, LIVE_INTERVAL_OPTIONS.includes(n) ? n : LIVE_INTERVAL_DEFAULT, liveIntervalAtom);
+							},
+							options: LIVE_INTERVAL_OPTIONS.map((n) => ({ id: String(n), label: n < 60 ? `${n}s` : `${n / 60}m` })),
+						}),
+					}, "live"),
 				],
 			}),
-			jsxs("div", {
-				className: "flex items-center justify-between gap-2",
+			jsxs(SettingsCard, {
+				icon: "BarChart3",
+				title: t("budgetTitle"),
+				footer: t("budgetSettingsHint"),
 				children: [
-					jsx("span", { className: "text-xs text-(--ui-text-secondary)", children: t("liveIntervalLabel") }),
-					jsx(SegmentedControl, {
-						value: String(liveEvery),
-						onChange: (v) => {
-							const n = Number(v);
-							setStored(LIVE_INTERVAL_KEY, LIVE_INTERVAL_OPTIONS.includes(n) ? n : LIVE_INTERVAL_DEFAULT, liveIntervalAtom);
-						},
-						options: LIVE_INTERVAL_OPTIONS.map((n) => ({ id: String(n), label: n < 60 ? `${n}s` : `${n / 60}m` })),
-					}),
+					jsx(BudgetInput, { label: t("budgetDaily"), kind: "daily" }, "daily"),
+					jsx(BudgetInput, { label: t("budgetMonthly"), kind: "monthly" }, "monthly"),
 				],
 			}),
-			jsx("span", { className: "text-xs font-semibold text-(--ui-text-primary)", children: t("budgetTitle") }),
-			jsx(BudgetInput, { label: t("budgetDaily"), kind: "daily" }),
-			jsx(BudgetInput, { label: t("budgetMonthly"), kind: "monthly" }),
-			jsx("div", { className: "text-[0.625rem] text-(--ui-text-quaternary)", children: t("budgetSettingsHint") }),
-			jsx("span", { className: "text-xs font-semibold text-(--ui-text-primary)", children: t("notificationsTitle") }),
-			...NOTIFY_KINDS.map((kind) =>
-				jsx(SettingSwitch, {
-					label: t(`notify_${kind}`),
-					checked: notify[kind],
-					onChange: (v) => setStored(notifyKey(kind), !!v, notifyAtoms[kind]),
-				}, kind),
-			),
-			jsx("div", { className: "text-[0.625rem] text-(--ui-text-quaternary)", children: t("notificationsHint") }),
+			jsx(SettingsCard, {
+				icon: "Bell",
+				title: t("notificationsTitle"),
+				footer: t("notificationsHint"),
+				children: NOTIFY_KINDS.map((kind) =>
+					jsx(SettingSwitch, {
+						label: t(`notify_${kind}`),
+						checked: notify[kind],
+						onChange: (v) => setStored(notifyKey(kind), !!v, notifyAtoms[kind]),
+					}, kind),
+				),
+			}),
 		],
 	});
 }
 
+// Agent Bar's view switcher: equal-width segments, the active one filled with
+// the accent. Own markup (not SegmentedControl) because five labels in a 300px
+// pane need tighter padding than core's control has.
 function MonitorTabs() {
 	const t = usePluginI18n(ID);
 	const view = useValue(paneViewAtom);
-	return jsx(SegmentedControl, {
-		value: view,
-		onChange: (v) => setPaneView(v),
-		className: "w-full",
-		options: MONITOR_VIEWS.map((id) => ({ id, label: t(`tab_${id}`) })),
+	return jsx("div", {
+		role: "tablist",
+		"data-tabs": MONITOR_VIEWS.join(","),
+		style: { display: "flex", gap: 2, padding: 2, borderRadius: 7, background: "var(--ui-bg-tertiary)", minWidth: 0 },
+		children: MONITOR_VIEWS.map((id) => {
+			const active = id === view;
+			return jsx("button", {
+				type: "button",
+				role: "tab",
+				"aria-selected": active,
+				"data-tab": id,
+				className: active ? undefined : "hover:text-foreground transition-colors",
+				onClick: () => setPaneView(id),
+				style: {
+					flex: "1 1 0",
+					minWidth: 0,
+					height: 22,
+					padding: "0 4px",
+					border: 0,
+					borderRadius: 5,
+					fontSize: "0.6875rem",
+					fontWeight: active ? 600 : 500,
+					overflow: "hidden",
+					textOverflow: "ellipsis",
+					whiteSpace: "nowrap",
+					cursor: "pointer",
+					background: active ? "var(--ui-accent)" : "transparent",
+					color: active ? "var(--dt-midground-foreground, var(--ui-bg-editor))" : "var(--ui-text-secondary)",
+				},
+				children: t(`tab_${id}`),
+			}, id);
+		}),
 	});
 }
 
@@ -3695,7 +4112,7 @@ const I18N_EN = {
 	statusbarModeWorst: "Worst only",
 	paneDetailLabel: "Pane detail",
 	paneDetailClean: "Clean",
-	paneDetailCleanHint: "Just the percentage bars",
+	paneDetailCleanHint: "Just the rings",
 	paneDetailDense: "Dense",
 	paneDetailDenseHint: "Windows, resets and detail lines",
 	showStatusBarLabel: "Show status bar indicator",
@@ -3751,7 +4168,7 @@ const I18N_EN = {
 	countApproval: (n) => `${n} awaiting approval`,
 	countYourTurn: (n) => `${n} your turn`,
 	countStalled: (n) => `${n} stalled?`,
-	tokensChart: "Tokens / minute · last 60 min",
+	tokensChart: "Tokens / minute",
 	attentionTitle: (n) => `Needs attention (${n})`,
 	noOpenSessions: "No open sessions.",
 	attention_approval: (who) => `${who} needs approval`,
@@ -3869,6 +4286,18 @@ const I18N_EN = {
 	notify_health: "Failing models and locked accounts",
 	notify_agents: "Agents needing approval, stuck, looping or with a large context",
 	notify_turns: "Agent finished — your turn",
+	// ---- Agent Bar layout ----
+	left: "left",
+	historyCaption: "Used % history",
+	summaryLowest: (pct) => `lowest ${pct}% left`,
+	summaryToday: (cost) => `${cost} today`,
+	messagesChart: "Messages / minute",
+	dailyChart: "Daily cost",
+	dailyAvg: (cost) => `≈ ${cost} / day`,
+	budgetSub: "estimated API cost",
+	settingsGroupStatusBar: "Status bar & sidebar",
+	settingsGroupQuota: "Quota view",
+	subagentsN: (n) => `${n} subagents running`,
 };
 
 const I18N_TR = {
@@ -3903,7 +4332,7 @@ const I18N_TR = {
 	statusbarModeWorst: "Yalnız en düşük",
 	paneDetailLabel: "Panel ayrıntısı",
 	paneDetailClean: "Sade",
-	paneDetailCleanHint: "Yalnızca yüzde çubukları",
+	paneDetailCleanHint: "Yalnızca halkalar",
 	paneDetailDense: "Ayrıntılı",
 	paneDetailDenseHint: "Pencereler, sıfırlanmalar ve ayrıntı satırları",
 	showStatusBarLabel: "Durum çubuğu göstergesini göster",
@@ -3958,7 +4387,7 @@ const I18N_TR = {
 	countApproval: (n) => `${n} onay bekliyor`,
 	countYourTurn: (n) => `${n} sıra sende`,
 	countStalled: (n) => `${n} takıldı mı?`,
-	tokensChart: "Token / dakika · son 60 dk",
+	tokensChart: "Token / dakika",
 	attentionTitle: (n) => `İlgi bekliyor (${n})`,
 	noOpenSessions: "Açık oturum yok.",
 	attention_approval: (who) => `${who} onay bekliyor`,
@@ -4076,6 +4505,18 @@ const I18N_TR = {
 	notify_health: "Hata veren modeller ve kilitlenen hesaplar",
 	notify_agents: "Onay bekleyen, takılan, döngüye giren ya da bağlamı büyüyen ajanlar",
 	notify_turns: "Ajan bitirdi — sıra sende",
+	// ---- Agent Bar layout ----
+	left: "kaldı",
+	historyCaption: "Kullanım % geçmişi",
+	summaryLowest: (pct) => `en düşük %${pct} kaldı`,
+	summaryToday: (cost) => `bugün ${cost}`,
+	messagesChart: "Mesaj / dakika",
+	dailyChart: "Günlük maliyet",
+	dailyAvg: (cost) => `≈ ${cost} / gün`,
+	budgetSub: "tahmini API maliyeti",
+	settingsGroupStatusBar: "Durum çubuğu ve kenar çubuğu",
+	settingsGroupQuota: "Kota görünümü",
+	subagentsN: (n) => `${n} alt ajan çalışıyor`,
 };
 
 // ---- registration ---------------------------------------------------------
@@ -4105,7 +4546,7 @@ function registerDockedPane() {
 				dock: { pane: "workspace", pos: "right" },
 				width: "300px",
 			},
-			render: () => jsx(QuotaPane, {}),
+			render: () => jsx(QuotaPane, { page: false }),
 		});
 	} catch {
 		_paneDisposer = null;
@@ -4280,7 +4721,7 @@ export default {
 			id: "page",
 			area: ROUTES_AREA,
 			data: { path: "/quota" },
-			render: () => jsx(QuotaPane, {}),
+			render: () => jsx(QuotaPane, { page: true }),
 		});
 
 		// Sidebar nav row, with live counts in its label (see startNavBadge).
