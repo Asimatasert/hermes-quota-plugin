@@ -10,6 +10,8 @@ See provider quotas, reset times and account balances in Hermes Desktop and the 
 - Model-specific quota windows and reset times when the vendor supplies them.
 - Separate, configurable Claude account cards; no summed or invented allowances.
 - Honest unavailable states and opt-in access to sensitive credential sources.
+- Optional Ink TUI quota chip with an interactive account picker and theme colors.
+- Codex special-reset announcements, separate from account renewals, with data from [Codex Resets](https://codex-resets.com/).
 
 ## Install
 
@@ -27,6 +29,21 @@ hermes quota refresh
 hermes quota status
 ```
 
+## Optional terminal panel
+
+After installing the backend, copy the optional widget into one profile:
+
+```bash
+mkdir -p "${HERMES_HOME:-$HOME/.hermes}/tui-widgets"
+cp tui/quota-panel.mjs "${HERMES_HOME:-$HOME/.hermes}/tui-widgets/quota-panel.mjs"
+hermes --tui
+```
+
+Run `/quota-select` to choose a provider/account; `/quota-panel` hides or reopens
+the right-aligned, theme-colored quota chip. Requires Hermes' Ink user-widget SDK;
+the classic CLI continues to use `/quota`. The main installer does not enable this
+widget automatically. [TUI setup, commands and limitations](docs/tui-panel.md).
+
 ## Multiple Claude accounts
 
 Additional accounts are explicitly configured by directory and display label. Labels such as **Work**, **Personal** or **Account 2** are user-configurable—not hardcoded. Linux is verified; additional platform limitations are documented.
@@ -43,6 +60,7 @@ Extra Claude accounts are opt-in and read-only: no refresh-token exchange, crede
 - [Usage, settings and commands](docs/usage.md)
 - [Providers and their limitations](docs/providers.md)
 - [Claude accounts and friendly names](docs/claude-accounts.md)
+- [Codex special-reset announcements and source limitations](docs/codex-special-reset.md)
 - [Troubleshooting—including remote names/icons](docs/troubleshooting.md)
 - [Development and tests](docs/development.md) · [Add a provider](docs/add-provider.md)
 - [Acknowledgements](docs/contributors.md)

@@ -21,6 +21,8 @@ from widget_harness import nodes, text  # noqa: E402
 
 
 def run(**options):
+    # Freeze the renderer's clock at NOW: every payload is relative to it.
+    options.setdefault('now', NOW * 1000)
     p = subprocess.run(
         ['node', str(HARNESS)], input=json.dumps(options), text=True,
         capture_output=True, timeout=30,

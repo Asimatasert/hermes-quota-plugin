@@ -8,7 +8,7 @@
 // recorded host.composer.submit answering `submitResult`, default true).
 //
 // stdin: JSON options; stdout: JSON {tree?, value?, notified, clipboard,
-// opened, toasts, cli, storage, queries}.
+// opened, toasts, cli, storage, queries}. `now` (ms) freezes Date / Date.now.
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
@@ -85,6 +85,16 @@ async function run(options = {}) {
     notify: (toast) => { record.toasts.push(toast); },
     navigate: (path) => { record.navigated.push(path); },
   };
+  // `now` (ms) freezes the clock: payloads are built relative to the test's
+  // NOW, so a long suite must not drift countdowns past their expectations.
+  let DateImpl = Date;
+  if (options.now != null && Number.isFinite(Number(options.now))) {
+    const fixed = Number(options.now);
+    DateImpl = class extends Date {
+      constructor(...args) { if (args.length) super(...args); else super(fixed); }
+      static now() { return fixed; }
+    };
+  }
   const context = {
     atom, jsx, jsxs: jsx, cn: (...args) => args.filter(Boolean).join(' '),
     useValue: a => a.get(), useEffect: (fn) => { if (options.runEffects) fn(); }, useMemo: f => f(),
@@ -101,7 +111,7 @@ async function run(options = {}) {
     host,
     PANES_AREA: 'panes', ROUTES_AREA: 'routes', SIDEBAR_NAV_AREA: 'nav', STATUSBAR_AREAS: {right: 'statusbar.right'},
     fmtDayTime: new Intl.DateTimeFormat('en-US'), console,
-    Date, Intl, setTimeout, clearTimeout, setInterval, clearInterval,
+    Date: DateImpl, Intl, setTimeout, clearTimeout, setInterval, clearInterval,
   };
   const file = options.source || path.join(__dirname, '../desktop/plugin.js');
   const source = fs.readFileSync(file, 'utf8')

@@ -985,7 +985,7 @@ class CliRenderTests(unittest.TestCase):
 
     def test_cli_status_shows_accounts_and_invalid_reason(self):
         _, rendered, _, _ = self._render(self._cache())
-        self.assertIn("anthropic · Work", rendered)
+        self.assertIn("Anthropic · Work", rendered)
         self.assertIn("config-invalid", rendered)
 
     def test_cli_shows_the_actionable_detail_for_an_unavailable_account(self):
@@ -1000,8 +1000,8 @@ class CliRenderTests(unittest.TestCase):
 
     def test_cli_filter_by_base_provider_lists_primary_and_accounts(self):
         _, _, _, by_provider = self._render(self._cache())
-        self.assertIn("anthropic · Work", by_provider)
-        self.assertIn("**anthropic**", by_provider)  # the primary row matches too
+        self.assertIn("Anthropic · Work", by_provider)
+        self.assertIn("**Anthropic**", by_provider)  # the primary row matches too
 
 
 if __name__ == "__main__":

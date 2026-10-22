@@ -56,7 +56,7 @@ const ID = "quota";
 // gateway, so the two halves can really be different builds. `tests/test_widget_version.py`
 // fails when they drift; a mismatch found at runtime is surfaced in the pane
 // instead of looking like a broken feature.
-const WIDGET_VERSION = "2.10.1";
+const WIDGET_VERSION = "2.11.0";
 
 // Module-level ctx handle (set in register). The data hook below needs it.
 let CTX = null;
@@ -151,16 +151,47 @@ function arrowFwd() {
 	return isRtl() ? "←" : "→";
 }
 
+// Hermes' configured IANA timezone (`timezone` on the quota payload; "" =
+// the host zone). The app LANGUAGE picks the date format; this picks the
+// wall clock, so every timestamp matches the CLI and TUI.
+let _dataTimeZone = "";
+
+function validTimeZone(zone) {
+	if (typeof zone !== "string" || !zone.trim()) return "";
+	try {
+		new Intl.DateTimeFormat("en-US", { timeZone: zone.trim() });
+		return zone.trim();
+	} catch {
+		return "";
+	}
+}
+
+function noteDataTimeZone(data) {
+	if (data && typeof data === "object" && !Array.isArray(data) && "timezone" in data) {
+		_dataTimeZone = validTimeZone(data.timezone);
+	}
+}
+
 const _intlCache = new Map();
 function intl(kind, options = {}) {
 	const tag = intlTag();
-	const key = `${kind}|${tag}|${JSON.stringify(options)}`;
+	// An explicit `timeZone` (even "UTC" for calendar-day labels) wins.
+	const opts = kind === "DateTimeFormat" && options.timeZone === undefined && _dataTimeZone
+		? { ...options, timeZone: _dataTimeZone }
+		: options;
+	const key = `${kind}|${tag}|${JSON.stringify(opts)}`;
 	let f = _intlCache.get(key);
 	if (!f) {
 		try {
-			f = new Intl[kind](tag, options);
+			f = new Intl[kind](tag, opts);
 		} catch {
-			f = new Intl[kind]("en-US", options);
+			try {
+				f = new Intl[kind]("en-US", opts);
+			} catch {
+				// Unknown zone: the app language still applies, host clock.
+				const { timeZone: _ignored, ...rest } = opts;
+				f = new Intl[kind](tag, rest);
+			}
 		}
 		_intlCache.set(key, f);
 	}
@@ -756,11 +787,11 @@ function absoluteReset(resetIso) {
 	try {
 		const dt = new Date(resetIso);
 		if (isNaN(dt.getTime())) return "";
-		const now = new Date();
-		const sameDay = dt.toDateString() === now.toDateString();
-		const tomorrow = new Date(now);
-		tomorrow.setDate(now.getDate() + 1);
-		const isTomorrow = dt.toDateString() === tomorrow.toDateString();
+		// Calendar days in the configured zone, not the host's.
+		const day = intl("DateTimeFormat", { year: "numeric", month: "2-digit", day: "2-digit" });
+		const now = Date.now();
+		const sameDay = day.format(dt) === day.format(now);
+		const isTomorrow = day.format(dt) === day.format(now + 86_400_000);
 		const time = intl("DateTimeFormat", { hour: "2-digit", minute: "2-digit" }).format(dt);
 		if (sameDay) return tr("resetToday", time);
 		if (isTomorrow) return tr("resetTomorrow", time);
@@ -793,6 +824,168 @@ function formatReset(resetIso, format) {
 	const relative = relativeCountdown(resetIso);
 	const absolute = absoluteReset(resetIso);
 	return absolute ? `${relative} (${absolute})` : relative;
+}
+
+// ---- Codex special-reset announcement -------------------------------------
+// Provider-level metadata from the cache root (`codex_special_reset`). It is a
+// third-party announcement record, never an account entitlement, and it is
+// shown once beside Codex rather than repeated per account. Anything malformed
+// is hidden so quota rendering keeps working.
+
+const SPECIAL_RESET_CREDIT = "https://codex-resets.com/";
+const SPECIAL_RESET_SOURCE = /^https:\/\/x\.com\/thsottiaux\/status\/\d+$/;
+// Status → i18n key.
+const SPECIAL_RESET_STATUS = {
+	scheduled: "specialResetStatusScheduled",
+	recorded: "specialResetStatusRecorded",
+};
+
+// App-language date, wall clock in the payload's timezone (invalid or empty
+// zone → host clock, see intl()).
+function announcedDate(iso, timeZone) {
+	if (!iso) return "";
+	const dt = new Date(iso);
+	if (!Number.isFinite(dt.getTime())) return "";
+	const zone = validTimeZone(timeZone);
+	return intl("DateTimeFormat", {
+		year: "numeric", month: "short", day: "2-digit",
+		hour: "2-digit", minute: "2-digit",
+		...(zone ? { timeZone: zone } : {}),
+	}).format(dt);
+}
+
+function codexSpecial(data) {
+	try {
+		const root = data && typeof data === "object" ? data.codex_special_reset : null;
+		if (!root || typeof root !== "object" || Array.isArray(root)) return null;
+		const value = root.announcement;
+		if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+		if (typeof value.id !== "string" || !value.id) return null;
+		const status = Object.prototype.hasOwnProperty.call(SPECIAL_RESET_STATUS, value.status)
+			? value.status : null;
+		const resetType = value.reset_type === "regular" || value.reset_type === "banked"
+			? value.reset_type : null;
+		if (!status || !resetType) return null;
+		// Only an explicitly zoned ISO timestamp is accepted; no local guess.
+		if (typeof value.announced_at !== "string" || !/(?:Z|[+-]\d{2}:\d{2})$/.test(value.announced_at)) return null;
+		const zone = typeof data.timezone === "string" ? data.timezone : "";
+		noteDataTimeZone(data);
+		const announced = announcedDate(value.announced_at, zone);
+		if (!announced) return null;
+		const scheduled = typeof value.scheduled_for === "string"
+			? announcedDate(value.scheduled_for, zone) : "";
+		if (typeof value.source_url !== "string" || !SPECIAL_RESET_SOURCE.test(value.source_url)) return null;
+		const checked = typeof root.fetched_at === "string" ? checkedDateTime(root.fetched_at) : "";
+		const fetched = typeof root.fetched_at === "string" ? Date.parse(root.fetched_at) : NaN;
+		return {
+			status,
+			statusLabel: tr(SPECIAL_RESET_STATUS[status]),
+			banked: resetType === "banked",
+			typeLabel: tr(resetType === "banked" ? "specialResetTypeBanked" : "specialResetTypeRegular"),
+			announced: tr("specialResetAnnounced", announced),
+			scheduled: scheduled ? tr("specialResetScheduledFor", scheduled) : "",
+			sourceUrl: value.source_url,
+			credit: SPECIAL_RESET_CREDIT,
+			// Missing boolean or malformed success timestamp is not freshness.
+			stale: root.stale !== false || !Number.isFinite(fetched),
+			checked,
+		};
+	} catch {
+		return null;
+	}
+}
+
+function openSpecialLink(url) {
+	if (url !== SPECIAL_RESET_CREDIT && !SPECIAL_RESET_SOURCE.test(url)) return;
+	try {
+		host.openExternal?.(url);
+	} catch {
+		/* opening a link must never break quota rendering */
+	}
+}
+
+function specialTipLines(special) {
+	const lines = [
+		`${tr("specialResetTitle")} · ${special.announced}`,
+		`${special.typeLabel} · ${special.statusLabel}`,
+	];
+	if (special.scheduled) lines.push(special.scheduled);
+	if (special.stale) lines.push(special.checked ? tr("specialResetTipStaleChecked", special.checked) : tr("specialResetTipStale"));
+	lines.push(tr("specialResetData", special.credit));
+	if (special.sourceUrl) lines.push(tr("specialResetSourceLine", special.sourceUrl));
+	return lines;
+}
+
+function SpecialResetNotice({ special }) {
+	const t = useQT();
+	const linkClass = "text-(--ui-text-quaternary) underline decoration-dotted underline-offset-2 hover:text-(--ui-text-secondary) transition-colors";
+	return jsxs("div", {
+		"data-quota-special-reset": true,
+		className: "flex flex-col gap-1 rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-elevated) px-3 py-2 text-[0.6875rem]",
+		style: { flexShrink: 0, minWidth: 0, overflowWrap: "anywhere" },
+		children: [
+			jsxs("div", {
+				className: "flex items-center justify-between gap-2",
+				children: [
+					jsx("span", {
+						className: "font-medium text-(--ui-text-secondary)",
+						children: t("specialResetTitle"),
+					}),
+					special.banked
+						? jsx("span", {
+								className: "rounded bg-(--ui-control-hover-background) px-1.5 py-0.5 text-[0.625rem] text-(--ui-text-tertiary)",
+								children: special.typeLabel,
+							})
+						: null,
+				],
+			}),
+			jsx("div", {
+				className: "text-(--ui-text-tertiary)",
+				children: `${special.announced} · ${special.statusLabel}`,
+			}),
+			special.scheduled
+				? jsx("div", {
+						className: "font-medium text-(--ui-text-secondary)",
+						children: special.scheduled,
+					})
+				: null,
+			special.stale
+				? jsx("div", {
+						className: "text-(--ui-text-quaternary)",
+						children: special.checked ? t("specialResetStaleChecked", special.checked) : t("specialResetStale"),
+					})
+				: null,
+			jsxs("div", {
+				className: "flex flex-wrap items-center gap-x-3 gap-y-0.5",
+				children: [
+					jsx("a", {
+						href: special.credit,
+						target: "_blank",
+						rel: "noreferrer",
+						className: linkClass,
+						onClick: (event) => {
+							event.preventDefault();
+							openSpecialLink(special.credit);
+						},
+						children: special.credit,
+					}),
+					special.sourceUrl
+						? jsx("a", {
+								href: special.sourceUrl,
+								target: "_blank",
+								rel: "noreferrer",
+								className: linkClass,
+								onClick: (event) => {
+									event.preventDefault();
+									openSpecialLink(special.sourceUrl);
+								},
+								children: t("specialResetSource"),
+							})
+						: null,
+				],
+			}),
+		],
+	});
 }
 
 function isConfigured(provider) {
@@ -1262,10 +1455,14 @@ function QuotaTip({ label, children }) {
 
 function QuotaChipWithBar() {
 	const { data, isError, isPlaceholderData } = useQuota();
+	// Formatters follow the payload's configured timezone.
+	noteDataTimeZone(data);
 	const stale = useCodexStale(data, isError || isPlaceholderData);
 	const alerts = useQuotaChipAlerts();
 	const providers =
 		data && data.providers ? statusEntries(data.providers, stale) : [];
+	const special = data && data.providers && isProviderEnabled("openai-codex") && data.providers["openai-codex"]
+		? codexSpecial(data) : null;
 	let worst = null;
 	let worstLabel = "";
 	let worstProvider = null;
@@ -1283,16 +1480,16 @@ function QuotaChipWithBar() {
 		// Unknown Codex cannot be ranked. Keep it alongside the existing
 		// balance-only fallback; money has no meaningful worst percentage.
 		const fallback = providers.filter(([pid, p]) => isProviderEnabled(pid) && (p?.display_accounts || accountFacts(p).balances.length));
-		if (fallback.length === 1 && fallback[0][1]?.display_accounts) return jsx(ProviderChip, { pid: fallback[0][0], provider: fallback[0][1], alert: alerts(fallback[0][0], fallback[0][1]) });
+		if (fallback.length === 1 && fallback[0][1]?.display_accounts) return jsx(ProviderChip, { pid: fallback[0][0], provider: fallback[0][1], alert: alerts(fallback[0][0], fallback[0][1]), special: fallback[0][0] === "openai-codex" ? special : null });
 		return fallback.length
-			? jsx("span", { className: "inline-flex h-full items-center", children: fallback.map(([pid, p]) => jsx(ProviderChip, { pid, provider: p, alert: alerts(pid, p), key: pid })) })
+			? jsx("span", { className: "inline-flex h-full items-center", children: fallback.map(([pid, p]) => jsx(ProviderChip, { pid, provider: p, alert: alerts(pid, p), special: pid === "openai-codex" ? special : null, key: pid })) })
 			: jsx("span", { children: "Q:none" });
 	}
 	// Worst mode is one chip for every provider, so its alert is the most
 	// urgent one across all of them.
 	const alert = mergeChipAlerts(providers.filter(([pid]) => isProviderEnabled(pid)).map(([pid, p]) => alerts(pid, p)));
 	const tone = toneForRemaining(worst);
-	const tip = makeWorstTip(worstLabel, worst, data && data.providers, stale);
+	const tip = makeWorstTip(worstLabel, worst, data && data.providers, stale, special);
 	const valueText = worstLabel + " " + (worstProvider?.display_accounts ? codexValue(worst) : fmtPct(worst));
 	const button = jsxs("button", {
 		type: "button",
@@ -1363,7 +1560,7 @@ function statusEntries(providers, stale = false) {
 	});
 }
 
-function codexAccountsTip(provider) {
+function codexAccountsTip(provider, special) {
 	const lines = [];
 	for (const [index, account] of provider.display_accounts.entries()) {
 		const remaining = codexRemaining(account);
@@ -1384,10 +1581,12 @@ function codexAccountsTip(provider) {
 			lines.push(`  ${w.label}${windows.length > 1 ? ` · ${value}` : ""}${reset ? ` · ${reset}` : ""}`);
 		}
 	}
+	// Provider-level announcement: appended once, never repeated per account.
+	if (special) lines.push("", ...specialTipLines(special));
 	return lines.join("\n");
 }
 
-function ProviderChip({ pid, provider, alert = null }) {
+function ProviderChip({ pid, provider, alert = null, special = null }) {
 	const cachedRemaining = provider?.display_stale ? provider.display_cached_remaining : provider?.display_remaining;
 	const r = provider && provider.unavailable_reason ? null : provider?.display_accounts ? cachedRemaining : worstWindow(provider);
 	const staleValue = Boolean(provider?.display_accounts && provider.display_stale && r != null);
@@ -1396,7 +1595,7 @@ function ProviderChip({ pid, provider, alert = null }) {
 	const tone = provider?.display_accounts ? (provider.display_stale ? "muted" : toneForRemaining(r)) : providerTone(provider);
 	const dot = toneColor(tone);
 	const label = providerDisplayName(pid, provider);
-	const tip = makeProviderTip(pid, provider);
+	const tip = makeProviderTip(pid, provider, special);
 	const button = jsxs(
 		"button",
 		{
@@ -1423,7 +1622,7 @@ function ProviderChip({ pid, provider, alert = null }) {
 }
 
 // Keep other providers' window details; Codex uses its compact account summary.
-function makeWorstTip(worstLabel, worst, providersObj, stale = false) {
+function makeWorstTip(worstLabel, worst, providersObj, stale = false, special = null) {
 	if (!providersObj) return tr("chipTip", worst, worstLabel, "");
 	const blocks = [];
 	let hasCodex = false;
@@ -1434,15 +1633,16 @@ function makeWorstTip(worstLabel, worst, providersObj, stale = false) {
 		if (lines.length) blocks.push(lines.join("\n"));
 	}
 	if (blocks.length === 0) return tr("chipTip", worst, worstLabel, "");
-	if (hasCodex && blocks.length === 1) return blocks[0];
+	const suffix = hasCodex && special ? `\n\n${specialTipLines(special).join("\n")}` : "";
+	if (hasCodex && blocks.length === 1) return blocks[0] + suffix;
 
-	return `${tr("quotaBreakdown")}\n${blocks.join("\n")}${hasCodex ? "" : `\n${tr("chipQuotaOpen")}`}`;
+	return `${tr("quotaBreakdown")}\n${blocks.join("\n")}${hasCodex ? "" : `\n${tr("chipQuotaOpen")}`}${suffix}`;
 }
 
 // Build a rich multiline tip for a single provider: lists ALL its windows
 // plus plan and detail lines (credits, banked resets).
-function makeProviderTip(pid, provider) {
-	if (provider?.display_accounts) return codexAccountsTip(provider);
+function makeProviderTip(pid, provider, special) {
+	if (provider?.display_accounts) return codexAccountsTip(provider, pid === "openai-codex" ? special : null);
 	const name = providerDisplayName(pid, provider);
 	if (!provider) return tr("providerUnavailable", name);
 	const details = asList(provider && provider.details);
@@ -1482,6 +1682,8 @@ function StatusBar() {
 	const showStatusBar = useValue(showStatusBarAtom);
 	const mode = useValue(statusbarModeAtom);
 	const { data, isError, isPlaceholderData } = useQuota();
+	// Formatters follow the payload's configured timezone.
+	noteDataTimeZone(data);
 	const stale = useCodexStale(data, isError || isPlaceholderData);
 	const alerts = useQuotaChipAlerts();
 	if (!showStatusBar) return null;
@@ -1494,10 +1696,12 @@ function StatusBar() {
 		.filter(([pid]) => (!isError || pid === "openai-codex") && isProviderEnabled(pid))
 		.filter(([, p]) => p?.display_accounts || isConfigured(p));
 	if (entries.length === 0) return jsx(StatusDot, { tone: "muted" });
+	// Provider-level Codex announcement, surfaced once in the hover tip.
+	const special = codexSpecial(data);
 	return jsx("span", {
 		className: "inline-flex h-full items-center",
 		children: entries.map(([pid, p]) =>
-			jsx(ProviderChip, { pid, provider: p, alert: alerts(pid, p), key: pid }),
+			jsx(ProviderChip, { pid, provider: p, alert: alerts(pid, p), special: pid === "openai-codex" ? special : null, key: pid }),
 		),
 	});
 }
@@ -2100,6 +2304,8 @@ function StatusbarModeControl() {
 function DisabledProvidersControl() {
 	const t = useQT();
 	const { data } = useQuota();
+	// Formatters follow the payload's configured timezone.
+	noteDataTimeZone(data);
 	const disabled = useValue(disabledProvidersAtom);
 	const allProviders =
 		data && data.providers ? Object.entries(data.providers) : [];
@@ -2265,6 +2471,8 @@ function QuotaPane({ page = false } = {}) {
 	const qc = useQueryClient();
 	const [view, setView] = useState("list"); // 'list' | 'settings'
 	const { data, isError, isLoading } = useQuota();
+	// Formatters follow the payload's configured timezone.
+	noteDataTimeZone(data);
 	const update = useUpdateCheck(data && data.installed_sha);
 	// Agent monitor tabs. Every hook runs unconditionally; the views only read
 	// the shared snapshot query (one spawn per poll, deduped with the chip).
@@ -2355,9 +2563,17 @@ function QuotaPane({ page = false } = {}) {
 		const monitorExtras = showForecast
 			? { burnMap: monitorBurnMap(mon.snapshot, history), history, nowSec: Date.now() / 1000 }
 			: null;
+		// The announcement belongs to the Codex provider as a whole, so it is
+		// rendered once here instead of prefixing every account card.
+		const special =
+			!disabled.includes("openai-codex") &&
+			Object.prototype.hasOwnProperty.call(data.providers, "openai-codex")
+				? codexSpecial(data)
+				: null;
 		body = jsxs("div", {
 			style: { ...UI.col, gap: 8 },
 			children: [
+				special ? jsx(SpecialResetNotice, { special, key: "codex-special-reset" }) : null,
 				mon.snapshot ? jsx(AccountHints, { providers: data.providers }, "account-hints") : null,
 				...withData.map(([id, p], index) =>
 					jsx(ProviderRow, { id, provider: p, monitor: monitorExtras, page, key: id === "openai-codex" ? `${id}-${index}` : id }),
@@ -3962,8 +4178,9 @@ function UsageView({ mon }) {
 	for (const parts of columns) for (const [k] of parts) if (!keys.includes(k)) keys.push(k);
 	const palette = seriesPalette(keys);
 	const weekday = (day) => {
-		const d = new Date(`${day}T12:00:00`);
-		return Number.isFinite(d.getTime()) ? intl("DateTimeFormat", { weekday: "short" }).format(d) : day.slice(5);
+		// A calendar day, not an instant: pin UTC so no zone shifts it.
+		const d = new Date(`${day}T12:00:00Z`);
+		return Number.isFinite(d.getTime()) ? intl("DateTimeFormat", { weekday: "short", timeZone: "UTC" }).format(d) : day.slice(5);
 	};
 	const avg = weekTotal / 7;
 	return jsxs(ViewStack, {
@@ -4548,6 +4765,8 @@ function MonitorStatus() {
 	const showBar = useValue(showStatusBarAtom);
 	const spark = useValue(chipSparkAtom);
 	const { data } = useQuota();
+	// Formatters follow the payload's configured timezone.
+	noteDataTimeZone(data);
 	const mon = useMonitor();
 	useMonitorNotifier(mon.scope, data, mon.snapshot);
 	const flash = useAttentionFlash(mon.scope, mon.snapshot);
@@ -5016,6 +5235,8 @@ function QuotaCardWindow({ w, nowMs }) {
 function QuotaCard({ close }) {
 	const t = useQT();
 	const { data } = useQuota();
+	// Formatters follow the payload's configured timezone.
+	noteDataTimeZone(data);
 	const mon = useMonitor();
 	const forecastOn = useValue(quotaForecastAtom);
 	const nowMs = useNow(30_000);
@@ -7087,6 +7308,20 @@ const I18N_EN = {
 	windowFallback: "window",
 	resetsAt: (when) => `resets ${when}`,
 	seriesTotal: "total",
+	specialResetTitle: "✨ Special reset announcement",
+	specialResetSource: "View source announcement",
+	specialResetStale: "Stale announcement data",
+	specialResetStaleChecked: (checked) => `Stale announcement data · checked ${checked}`,
+	specialResetStatusScheduled: "Scheduled · waiting for execution",
+	specialResetStatusRecorded: "Recorded",
+	specialResetTypeBanked: "Banked reset",
+	specialResetTypeRegular: "Special reset",
+	specialResetAnnounced: (when) => `Announced ${when}`,
+	specialResetScheduledFor: (when) => `Scheduled for ${when}`,
+	specialResetTipStale: "Stale",
+	specialResetTipStaleChecked: (checked) => `Stale · checked ${checked}`,
+	specialResetData: (url) => `Data: ${url}`,
+	specialResetSourceLine: (url) => `Source: ${url}`,
 };
 
 const I18N_TR = {
@@ -7502,6 +7737,20 @@ const I18N_TR = {
 	windowFallback: "pencere",
 	resetsAt: (when) => `sıfırlanma ${when}`,
 	seriesTotal: "toplam",
+	specialResetTitle: "✨ Özel sıfırlama duyurusu",
+	specialResetSource: "Kaynak duyuruyu görüntüle",
+	specialResetStale: "Duyuru verisi eski",
+	specialResetStaleChecked: (checked) => `Duyuru verisi eski · ${checked} tarihinde kontrol edildi`,
+	specialResetStatusScheduled: "Planlandı · uygulanması bekleniyor",
+	specialResetStatusRecorded: "Kaydedildi",
+	specialResetTypeBanked: "Biriktirilmiş sıfırlama",
+	specialResetTypeRegular: "Özel sıfırlama",
+	specialResetAnnounced: (when) => `Duyuru: ${when}`,
+	specialResetScheduledFor: (when) => `Planlanan: ${when}`,
+	specialResetTipStale: "Eski",
+	specialResetTipStaleChecked: (checked) => `Eski · ${checked} tarihinde kontrol edildi`,
+	specialResetData: (url) => `Veri: ${url}`,
+	specialResetSourceLine: (url) => `Kaynak: ${url}`,
 };
 
 /** Plural pick for bundle functions: `forms` keyed by Intl.PluralRules category. */
@@ -7939,6 +8188,20 @@ const I18N_DE = {
 	windowFallback: "Fenster",
 	resetsAt: (when) => `Reset ${when}`,
 	seriesTotal: "gesamt",
+	specialResetTitle: "✨ Ankündigung eines Sonder-Resets",
+	specialResetSource: "Quell-Ankündigung ansehen",
+	specialResetStale: "Ankündigungsdaten veraltet",
+	specialResetStaleChecked: (checked) => `Ankündigungsdaten veraltet · geprüft ${checked}`,
+	specialResetStatusScheduled: "Geplant · wartet auf Ausführung",
+	specialResetStatusRecorded: "Erfasst",
+	specialResetTypeBanked: "Angesparter Reset",
+	specialResetTypeRegular: "Sonder-Reset",
+	specialResetAnnounced: (when) => `Angekündigt ${when}`,
+	specialResetScheduledFor: (when) => `Geplant für ${when}`,
+	specialResetTipStale: "Veraltet",
+	specialResetTipStaleChecked: (checked) => `Veraltet · geprüft ${checked}`,
+	specialResetData: (url) => `Daten: ${url}`,
+	specialResetSourceLine: (url) => `Quelle: ${url}`,
 };
 
 const I18N_ES = {
@@ -8354,6 +8617,20 @@ const I18N_ES = {
 	windowFallback: "ventana",
 	resetsAt: (when) => `restablece ${when}`,
 	seriesTotal: "total",
+	specialResetTitle: "✨ Anuncio de reinicio especial",
+	specialResetSource: "Ver el anuncio original",
+	specialResetStale: "Datos del anuncio desactualizados",
+	specialResetStaleChecked: (checked) => `Datos del anuncio desactualizados · comprobado ${checked}`,
+	specialResetStatusScheduled: "Programado · pendiente de ejecución",
+	specialResetStatusRecorded: "Registrado",
+	specialResetTypeBanked: "Reinicio acumulado",
+	specialResetTypeRegular: "Reinicio especial",
+	specialResetAnnounced: (when) => `Anunciado ${when}`,
+	specialResetScheduledFor: (when) => `Programado para ${when}`,
+	specialResetTipStale: "Desactualizado",
+	specialResetTipStaleChecked: (checked) => `Desactualizado · comprobado ${checked}`,
+	specialResetData: (url) => `Datos: ${url}`,
+	specialResetSourceLine: (url) => `Fuente: ${url}`,
 };
 
 const I18N_FR = {
@@ -8769,6 +9046,20 @@ const I18N_FR = {
 	windowFallback: "fenêtre",
 	resetsAt: (when) => `réinitialisation ${when}`,
 	seriesTotal: "total",
+	specialResetTitle: "✨ Annonce de réinitialisation spéciale",
+	specialResetSource: "Voir l’annonce d’origine",
+	specialResetStale: "Données d’annonce périmées",
+	specialResetStaleChecked: (checked) => `Données d’annonce périmées · vérifié ${checked}`,
+	specialResetStatusScheduled: "Planifiée · en attente d’exécution",
+	specialResetStatusRecorded: "Enregistrée",
+	specialResetTypeBanked: "Réinitialisation cumulée",
+	specialResetTypeRegular: "Réinitialisation spéciale",
+	specialResetAnnounced: (when) => `Annoncée ${when}`,
+	specialResetScheduledFor: (when) => `Prévue pour ${when}`,
+	specialResetTipStale: "Périmé",
+	specialResetTipStaleChecked: (checked) => `Périmé · vérifié ${checked}`,
+	specialResetData: (url) => `Données : ${url}`,
+	specialResetSourceLine: (url) => `Source : ${url}`,
 };
 
 const I18N_RU = {
@@ -9184,6 +9475,20 @@ const I18N_RU = {
 	windowFallback: "окно",
 	resetsAt: (when) => `сброс ${when}`,
 	seriesTotal: "всего",
+	specialResetTitle: "✨ Объявление о специальном сбросе",
+	specialResetSource: "Открыть исходное объявление",
+	specialResetStale: "Данные объявления устарели",
+	specialResetStaleChecked: (checked) => `Данные объявления устарели · проверено ${checked}`,
+	specialResetStatusScheduled: "Запланирован · ожидает выполнения",
+	specialResetStatusRecorded: "Зафиксирован",
+	specialResetTypeBanked: "Накопленный сброс",
+	specialResetTypeRegular: "Специальный сброс",
+	specialResetAnnounced: (when) => `Объявлено ${when}`,
+	specialResetScheduledFor: (when) => `Запланирован на ${when}`,
+	specialResetTipStale: "Устарело",
+	specialResetTipStaleChecked: (checked) => `Устарело · проверено ${checked}`,
+	specialResetData: (url) => `Данные: ${url}`,
+	specialResetSourceLine: (url) => `Источник: ${url}`,
 };
 
 const I18N_JA = {
@@ -9599,6 +9904,20 @@ const I18N_JA = {
 	windowFallback: "ウィンドウ",
 	resetsAt: (when) => `リセット ${when}`,
 	seriesTotal: "合計",
+	specialResetTitle: "✨ 特別リセットのお知らせ",
+	specialResetSource: "元の告知を表示",
+	specialResetStale: "告知データが古くなっています",
+	specialResetStaleChecked: (checked) => `告知データが古くなっています · ${checked} に確認`,
+	specialResetStatusScheduled: "予定 · 実行待ち",
+	specialResetStatusRecorded: "記録済み",
+	specialResetTypeBanked: "繰り越しリセット",
+	specialResetTypeRegular: "特別リセット",
+	specialResetAnnounced: (when) => `告知 ${when}`,
+	specialResetScheduledFor: (when) => `予定日時 ${when}`,
+	specialResetTipStale: "古いデータ",
+	specialResetTipStaleChecked: (checked) => `古いデータ · ${checked} に確認`,
+	specialResetData: (url) => `データ: ${url}`,
+	specialResetSourceLine: (url) => `出典: ${url}`,
 };
 
 const I18N_ZH = {
@@ -10014,6 +10333,20 @@ const I18N_ZH = {
 	windowFallback: "窗口",
 	resetsAt: (when) => `重置 ${when}`,
 	seriesTotal: "合计",
+	specialResetTitle: "✨ 特别重置公告",
+	specialResetSource: "查看原始公告",
+	specialResetStale: "公告数据已过期",
+	specialResetStaleChecked: (checked) => `公告数据已过期 · 检查于 ${checked}`,
+	specialResetStatusScheduled: "已计划 · 等待执行",
+	specialResetStatusRecorded: "已记录",
+	specialResetTypeBanked: "累积重置",
+	specialResetTypeRegular: "特别重置",
+	specialResetAnnounced: (when) => `公告于 ${when}`,
+	specialResetScheduledFor: (when) => `计划于 ${when}`,
+	specialResetTipStale: "已过期",
+	specialResetTipStaleChecked: (checked) => `已过期 · 检查于 ${checked}`,
+	specialResetData: (url) => `数据：${url}`,
+	specialResetSourceLine: (url) => `来源：${url}`,
 };
 
 const I18N_ZH_HANT = {
@@ -10429,6 +10762,20 @@ const I18N_ZH_HANT = {
 	windowFallback: "視窗",
 	resetsAt: (when) => `重設 ${when}`,
 	seriesTotal: "合計",
+	specialResetTitle: "✨ 特別重設公告",
+	specialResetSource: "檢視原始公告",
+	specialResetStale: "公告資料已過期",
+	specialResetStaleChecked: (checked) => `公告資料已過期 · 檢查於 ${checked}`,
+	specialResetStatusScheduled: "已排程 · 等待執行",
+	specialResetStatusRecorded: "已記錄",
+	specialResetTypeBanked: "累積重設",
+	specialResetTypeRegular: "特別重設",
+	specialResetAnnounced: (when) => `公告於 ${when}`,
+	specialResetScheduledFor: (when) => `排定於 ${when}`,
+	specialResetTipStale: "已過期",
+	specialResetTipStaleChecked: (checked) => `已過期 · 檢查於 ${checked}`,
+	specialResetData: (url) => `資料：${url}`,
+	specialResetSourceLine: (url) => `來源：${url}`,
 };
 
 const I18N_AR = {
@@ -10844,6 +11191,20 @@ const I18N_AR = {
 	windowFallback: "نافذة",
 	resetsAt: (when) => `الإعادة ${when}`,
 	seriesTotal: "الإجمالي",
+	specialResetTitle: "✨ إعلان إعادة تعيين خاصة",
+	specialResetSource: "عرض الإعلان الأصلي",
+	specialResetStale: "بيانات الإعلان قديمة",
+	specialResetStaleChecked: (checked) => `بيانات الإعلان قديمة · تم التحقق ${checked}`,
+	specialResetStatusScheduled: "مجدولة · بانتظار التنفيذ",
+	specialResetStatusRecorded: "مسجّلة",
+	specialResetTypeBanked: "إعادة تعيين مدّخرة",
+	specialResetTypeRegular: "إعادة تعيين خاصة",
+	specialResetAnnounced: (when) => `أُعلن في ${when}`,
+	specialResetScheduledFor: (when) => `مجدولة في ${when}`,
+	specialResetTipStale: "قديم",
+	specialResetTipStaleChecked: (checked) => `قديم · تم التحقق ${checked}`,
+	specialResetData: (url) => `البيانات: ${url}`,
+	specialResetSourceLine: (url) => `المصدر: ${url}`,
 };
 
 const I18N_BUNDLES = {
