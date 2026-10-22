@@ -43,7 +43,7 @@ async function run(options = {}) {
     return typeof v === 'function' ? v(...args) : v != null ? v : key;
   };
   const storage = new Map(Object.entries(options.storage || {}));
-  const record = {notified: [], clipboard: [], opened: [], toasts: [], cli: [], queries: [], submitted: []};
+  const record = {notified: [], clipboard: [], opened: [], toasts: [], cli: [], queries: [], submitted: [], navigated: []};
   const focus = options.focus || {};
   const ro = value => ({get: () => value, listen: () => () => {}, subscribe: () => () => {}});
   const scope = options.noScope ? null : {connectionId: 'local', profile: 'work'};
@@ -53,6 +53,9 @@ async function run(options = {}) {
     const key = opts.queryKey || [];
     record.queries.push({key, enabled: opts.enabled !== false});
     if (key[1] === 'monitor') {
+      if (key[2] === 'accounts') {
+        return {data: opts.enabled === false ? undefined : options.accounts, isError: false, isLoading: false, isFetching: false};
+      }
       if (key[2] === 'snapshot') {
         return {data: options.monitor, isError: !!options.monitorIsError, error: options.monitorIsError ? new Error('boom') : null, isLoading: false};
       }
@@ -74,11 +77,13 @@ async function run(options = {}) {
     profileRoutes: async () => routes,
     requestProfile: async (route, method, params) => {
       record.cli.push({route: route.profile, method, argv: params.argv});
+      const queue = options.cliResults;
+      if (Array.isArray(queue) && queue.length) return queue.shift();
       return options.cliResult || {code: 0, output: '{}'};
     },
     openSession: async (id, opts) => { record.opened.push({id, opts: opts || null}); },
     notify: (toast) => { record.toasts.push(toast); },
-    navigate: () => {},
+    navigate: (path) => { record.navigated.push(path); },
   };
   const context = {
     atom, jsx, jsxs: jsx, cn: (...args) => args.filter(Boolean).join(' '),
@@ -86,12 +91,13 @@ async function run(options = {}) {
     useRef: v => ({current: v}), useState: v => [typeof v === 'function' ? v() : v, () => {}],
     usePluginI18n: () => translate,
     useQuery: queryResult,
-    useQueryClient: () => ({invalidateQueries: () => {}}), useMutation: () => ({}),
+    useQueryClient: () => ({invalidateQueries: () => {}, setQueryData: () => {}}), useMutation: () => ({}),
     Tip: props => ({type: 'Tip', props}),
     Popover: props => ({type: 'Popover', props}), PopoverTrigger: props => props.children,
     PopoverContent: props => ({type: 'PopoverContent', props}),
     StatusDot: ({tone}) => jsx('span', {'data-tone': tone}),
     Input: 'input', Switch: 'input', SegmentedControl: 'segmented', icons: {},
+    ConfirmDialog: props => ({type: 'ConfirmDialog', props}),
     host,
     PANES_AREA: 'panes', ROUTES_AREA: 'routes', SIDEBAR_NAV_AREA: 'nav', STATUSBAR_AREAS: {right: 'statusbar.right'},
     fmtDayTime: new Intl.DateTimeFormat('en-US'), console,

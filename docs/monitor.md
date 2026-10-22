@@ -186,6 +186,44 @@ daily_budget, daily_used_pct, monthly_budget, monthly_used_pct}` — Hermes plus
 agent-CLI spend at API prices. `set-budget` stores the widget's values and
 answers `{budget: {daily, monthly}}` (`null` = not set).
 
+## `accounts` / `set-priority` / `set-strategy`
+
+`accounts` (read-only) answers which credential each profile uses:
+
+- `pools[]` — one entry per credential pool: `{provider, owner, shared, used_by[], strategies{profile: s},
+  explicit_strategy{}, rows[], quota, writable}`. A named profile with no rows of its own for a provider
+  borrows the root (`default`) pool (Hermes' `read_credential_pool` fallback), so `owner` is `default` and
+  `used_by` lists every borrower; a profile with its own rows gets its own pool. Rows carry
+  `{id (short pool id), label, auth_type, source, priority, position, status: active|cooldown|exhausted,
+  status_until, cooldown_models[], last_error_code, requests, tried_first, windows[], quota_match}` — never a
+  token, key, refresh token or base URL. `windows` are attached only when a quota-cache account label
+  matches the row (`quota_match: "label"`) or the pool has a single row (`"sole"`); otherwise the
+  provider-level reading stays in `pool.quota`.
+- `profiles[]` — `{profile, is_root, model{provider, model}, fallbacks[{provider, model, custom_route}],
+  fallback_editable: false, fallback_command, strategies{}, pools{provider: own|shared}}`.
+- `unavailable[]` — quota-cache providers without data: `{provider, base, reason, kind:
+  signin|reauth|optin|rate_limited|error, retry_at, settings_path, command, external_tool, optin_key}`.
+  `command` is a copyable terminal line (`hermes auth add <id>`, or the external tool's login such as
+  `gh auth login`); `settings_path` is the desktop Settings route (`/settings?tab=providers&pview=accounts`
+  or `…&pview=keys`).
+- `capabilities` — `set_priority`, `set_strategy` true; `reorder_fallbacks` and
+  `assign_account_to_profile` false (Hermes has neither non-interactively).
+
+Writes validate against the current state, then run Hermes' own CLI in a child process, re-read the
+result and log it in `quota_monitor.db` (`account_audit`):
+
+- `set-priority --provider P --target <pool id> --priority N [--profile <owner>]` →
+  `hermes --profile <owner> auth priority P <id> N` (N is zero-based, 0 = tried first under `fill_first`).
+  Refused with `error_code: borrowed-pool` when the profile only borrows the pool (reorder the owner's pool
+  instead — it applies to every sharing profile); a borrower never gets a copy of the rows.
+- `set-strategy --provider P --strategy S [--profile p]` →
+  `hermes --profile p config set credential_pool_strategies.P S` (one profile only).
+
+Both answer `{action, changed, before, after, affected_profiles, command, cli_output, state}` or
+`{error, error_code}` (`bad-provider`, `bad-profile`, `unknown-profile`, `no-pool`, `borrowed-pool`,
+`unknown-target`, `bad-priority`, `bad-strategy`, `cli-failed`, `not-applied`). `--profile` defaults to
+the process profile (`hermes -p X quota monitor …` selects X).
+
 ## Agent tools
 
 When Hermes supports `register_tool`, the plugin registers read-only tools in

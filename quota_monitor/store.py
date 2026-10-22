@@ -4,7 +4,9 @@ Agent Monitor kept this state in a long-running server's memory; a CLI call is o
 
 * ``quota_history`` — one reading per provider window, appended from the plugin's quota cache;
 * ``rate_samples`` — cumulative token/cost totals, one sample per snapshot (the token rate is the delta);
-* ``kv`` — small cached blobs (model speed, last recorded cache stamp).
+* ``kv`` — small cached blobs (model speed, last recorded cache stamp);
+* ``account_audit`` — one row per Accounts-tab write (credential order / pool strategy) the plugin delegated to
+  the Hermes CLI: what was asked, what changed. Never a token.
 
 Nothing else on disk is ever written by this package.
 """
@@ -32,7 +34,9 @@ _SCHEMA = (
     "CREATE INDEX IF NOT EXISTS quota_history_pw ON quota_history(provider, window, ts)",
     "CREATE TABLE IF NOT EXISTS rate_samples (ts REAL PRIMARY KEY, data TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, at REAL, value TEXT)",
+    "CREATE TABLE IF NOT EXISTS account_audit (ts REAL, action TEXT, profile TEXT, provider TEXT, detail TEXT)",
 )
+AUDIT_KEEP = 500
 
 
 def db_path() -> Path:
@@ -78,6 +82,33 @@ def kv_set(key: str, value: Any, db: Optional[Path] = None) -> None:
     with rw(db) as c:
         c.execute("INSERT OR REPLACE INTO kv (key, at, value) VALUES (?, ?, ?)",
                   (key, time.time(), json.dumps(value, default=str)))
+
+
+# ---------- account audit ----------
+
+def audit(action: str, profile: str, provider: str, detail: Dict[str, Any], db: Optional[Path] = None) -> None:
+    with rw(db) as c:
+        c.execute("INSERT INTO account_audit VALUES (?,?,?,?,?)",
+                  (time.time(), action, profile, provider, json.dumps(detail, default=str)))
+        c.execute("DELETE FROM account_audit WHERE rowid NOT IN "
+                  "(SELECT rowid FROM account_audit ORDER BY ts DESC LIMIT ?)", (AUDIT_KEEP,))
+
+
+def audit_rows(limit: int = 20, db: Optional[Path] = None) -> List[Dict[str, Any]]:
+    try:
+        with rw(db) as c:
+            rows = c.execute("SELECT ts, action, profile, provider, detail FROM account_audit "
+                             "ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
+    except sqlite3.Error:
+        return []
+    out = []
+    for ts, action, profile, provider, detail in rows:
+        try:
+            d = json.loads(detail)
+        except (TypeError, ValueError):
+            d = {}
+        out.append({"ts": ts, "action": action, "profile": profile, "provider": provider, "detail": d})
+    return out
 
 
 # ---------- quota history ----------

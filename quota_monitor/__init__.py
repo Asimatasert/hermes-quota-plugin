@@ -5,9 +5,11 @@ Entry points (each returns one JSON-able dict carrying ``monitor_version`` and `
 * ``snapshot()``  — ``hermes quota monitor snapshot --json`` (one call per widget poll);
 * ``history_payload(days)`` — ``hermes quota monitor history --json``;
 * ``recommend_payload(...)`` — ``hermes quota monitor recommend --json``;
-* ``set_budget(daily, monthly)`` / ``budget_payload()`` — the budget the widget keeps in sync.
+* ``set_budget(daily, monthly)`` / ``budget_payload()`` — the budget the widget keeps in sync;
+* ``accounts_view()`` — ``hermes quota monitor accounts --json`` (credential pools, strategies, fallbacks,
+  sign-in gaps); ``set_priority(...)`` / ``set_strategy(...)`` delegate their write to Hermes' own CLI.
 
-All Hermes data is read-only; network is never touched here (quota numbers come from the plugin's
+All Hermes data is read-only (the two account writes run Hermes' own CLI, never a direct file edit); network is never touched here (quota numbers come from the plugin's
 ``quota_cache.json``). See docs/monitor.md for the full contract.
 """
 
@@ -172,3 +174,37 @@ def budget_payload() -> Dict[str, Any]:
     except Exception:
         cli_daily = []
     return _stamp(advice.spend_summary(month, cli_daily, read_budget(), today))
+
+
+def accounts_view() -> Dict[str, Any]:
+    from . import accounts, store
+    out = accounts.accounts_payload()
+    try:
+        out["recent_changes"] = store.audit_rows(10)
+    except Exception:
+        out["recent_changes"] = []
+    return _stamp(out)
+
+
+def _write_result(fn: Callable[[], Dict[str, Any]]) -> Dict[str, Any]:
+    from . import accounts
+    try:
+        res = fn()
+    except accounts.AccountsError as e:
+        out = {"error": str(e)[:400], "error_code": e.code}
+        out.update({k: v for k, v in e.extra.items() if k in ("owner", "used_by", "command")})
+        return _stamp(out)
+    state = res.pop("state", None)
+    if isinstance(state, dict):
+        res["state"] = _stamp(state)
+    return _stamp(res)
+
+
+def set_priority(provider: str, target: str, priority: Any, profile: Optional[str] = None) -> Dict[str, Any]:
+    from . import accounts
+    return _write_result(lambda: accounts.set_priority(provider, target, priority, profile))
+
+
+def set_strategy(provider: str, strategy: str, profile: Optional[str] = None) -> Dict[str, Any]:
+    from . import accounts
+    return _write_result(lambda: accounts.set_strategy(provider, strategy, profile))

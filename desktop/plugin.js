@@ -23,6 +23,7 @@
 import {
 	atom,
 	cn,
+	ConfirmDialog,
 	fmtDayTime,
 	host,
 	Input,
@@ -2156,7 +2157,8 @@ function QuotaPane({ page = false } = {}) {
 	const monitorOn = useValue(monitorEnabledAtom);
 	const forecastOn = useValue(quotaForecastAtom);
 	const mon = useMonitor();
-	const activeTab = monitorOn && MONITOR_VIEWS.includes(tab) ? tab : "quota";
+	const accountsOn = useValue(accountsTabAtom);
+	const activeTab = monitorOn && MONITOR_VIEWS.includes(tab) && (tab !== "accounts" || accountsOn) ? tab : "quota";
 	const showForecast = Boolean(forecastOn && view !== "settings" && activeTab === "quota" && mon.snapshot);
 	const history = useMonitorHistory(mon.scope, showForecast);
 	useMonitorNotifier(mon.scope, data, mon.snapshot);
@@ -2359,7 +2361,7 @@ function QuotaPane({ page = false } = {}) {
 // shown as a quiet "update backend" notice, never as a broken pane, and the
 // quota chip/pane keep working exactly as before.
 
-const MONITOR_VIEWS = ["quota", "live", "health", "usage", "kanban"];
+const MONITOR_VIEWS = ["quota", "live", "health", "usage", "kanban", "accounts"];
 const PANE_VIEW_KEY = "paneView";
 const paneViewAtom = atom("quota");
 const MONITOR_ENABLED_KEY = "monitorEnabled";
@@ -2416,6 +2418,7 @@ function cleanBudget(value) {
 function applyStoredMonitor() {
 	applyStored(PANE_VIEW_KEY, paneViewAtom, MONITOR_VIEWS, "quota");
 	applyStoredBoolean(MONITOR_ENABLED_KEY, monitorEnabledAtom, true);
+	applyStoredBoolean(ACCOUNTS_TAB_KEY, accountsTabAtom, true);
 	applyStoredBoolean(AGENTS_CHIP_KEY, agentsChipAtom, true);
 	applyStoredBoolean(CONTEXT_CHIP_KEY, contextChipAtom, true);
 	try {
@@ -5129,6 +5132,7 @@ function BudgetInput({ label, kind }) {
 function MonitorSettings() {
 	const t = usePluginI18n(ID);
 	const enabled = useValue(monitorEnabledAtom);
+	const accountsTab = useValue(accountsTabAtom);
 	const forecast = useValue(quotaForecastAtom);
 	const days = useValue(historyDaysAtom);
 	const liveEvery = useValue(liveIntervalAtom);
@@ -5143,6 +5147,7 @@ function MonitorSettings() {
 				title: t("monitorSettingsTitle"),
 				children: [
 					jsx(SettingSwitch, { label: t("monitorEnabledLabel"), hint: t("monitorEnabledHint"), checked: enabled, onChange: (v) => setStored(MONITOR_ENABLED_KEY, !!v, monitorEnabledAtom) }, "on"),
+					jsx(SettingSwitch, { label: t("accountsTabLabel"), hint: t("accountsTabHint"), checked: accountsTab, onChange: (v) => setStored(ACCOUNTS_TAB_KEY, !!v, accountsTabAtom) }, "accounts"),
 					jsx(SettingSwitch, { label: t("quotaForecastLabel"), hint: t("quotaForecastHint"), checked: forecast, onChange: (v) => setStored(QUOTA_FORECAST_KEY, !!v, quotaForecastAtom) }, "forecast"),
 					jsx(SettingRow, {
 						label: t("historyRangeLabel"),
@@ -5193,17 +5198,19 @@ function MonitorSettings() {
 	});
 }
 
-// Agent Bar's view switcher: equal-width segments, the active one filled with
-// the accent. Own markup (not SegmentedControl) because five labels in a 300px
-// pane need tighter padding than core's control has.
+// Agent Bar's view switcher: segments sized by their label (six fit a 300px
+// pane untruncated), the active one filled with the accent. Own markup (not
+// SegmentedControl) because the labels need tighter padding than core's control.
 function MonitorTabs() {
 	const t = usePluginI18n(ID);
 	const view = useValue(paneViewAtom);
+	const accountsOn = useValue(accountsTabAtom);
+	const views = MONITOR_VIEWS.filter((id) => id !== "accounts" || accountsOn);
 	return jsx("div", {
 		role: "tablist",
-		"data-tabs": MONITOR_VIEWS.join(","),
+		"data-tabs": views.join(","),
 		style: { display: "flex", gap: 2, padding: 2, borderRadius: 7, background: "var(--ui-bg-tertiary)", minWidth: 0 },
-		children: MONITOR_VIEWS.map((id) => {
+		children: views.map((id) => {
 			const active = id === view;
 			return jsx("button", {
 				type: "button",
@@ -5213,10 +5220,10 @@ function MonitorTabs() {
 				className: active ? undefined : "hover:text-foreground transition-colors",
 				onClick: () => setPaneView(id),
 				style: {
-					flex: "1 1 0",
+					flex: "1 1 auto",
 					minWidth: 0,
 					height: 22,
-					padding: "0 4px",
+					padding: "0 3px",
 					border: 0,
 					borderRadius: 5,
 					fontSize: "0.6875rem",
@@ -5234,13 +5241,977 @@ function MonitorTabs() {
 	});
 }
 
-function MonitorBody({ mon, view }) {
+function MonitorBody({ mon, view, page = false }) {
+	// Accounts has its own query (`monitor accounts`), independent of the snapshot.
+	if (view === "accounts") return mon.enabled ? jsx(AccountsView, { page }) : jsx(MonitorNotice, { mon });
 	if (!mon.snapshot) return jsx(MonitorNotice, { mon });
 	if (view === "live") return jsx(LiveView, { mon });
 	if (view === "health") return jsx(HealthView, { mon });
 	if (view === "usage") return jsx(UsageView, { mon });
 	if (view === "kanban") return jsx(KanbanView, { mon });
 	return null;
+}
+
+// ---- Accounts view (`hermes quota monitor accounts|set-priority|set-strategy`) ----
+//
+// Which credential each profile uses: Hermes' credential pools (shared root pool
+// vs a profile's own rows), the per-profile selection strategy, each profile's
+// model + fallback chain, and providers that are not signed in. Two writes,
+// both delegated by the backend to Hermes' own CLI after validation:
+//   order    -> `hermes --profile <pool owner> auth priority <provider> <id> <n>`
+//   strategy -> `hermes --profile <profile> config set credential_pool_strategies.<provider> <s>`
+// Every write is confirmed in a dialog that names exactly what changes and for
+// which profiles; the UI is optimistic and rolls back when the write fails.
+
+const ACCOUNTS_TAB_KEY = "accountsTab";
+const accountsTabAtom = atom(true);
+const ACCOUNTS_STALE_S = 600; // older data than this pauses writes until a refetch
+const STRATEGY_IDS = ["fill_first", "round_robin", "least_used", "random"];
+const ACCOUNTS_SIGNIN_VISIBLE = 6;
+
+function poolKey(pool) {
+	return `${pool && pool.provider}@${pool && pool.owner}`;
+}
+
+function reorderIds(ids, from, to) {
+	const next = ids.slice();
+	if (from < 0 || from >= next.length) return next;
+	const [moved] = next.splice(from, 1);
+	next.splice(Math.max(0, Math.min(to, next.length)), 0, moved);
+	return next;
+}
+
+/** Drop slot (0..n, "before row i") -> final index of the dragged row. */
+function dropTarget(from, slot) {
+	return slot > from ? slot - 1 : slot;
+}
+
+function mostUsedWindow(windows) {
+	let best = null;
+	for (const w of asList(windows)) {
+		const used = finiteNumber(w && w.used);
+		if (used == null) continue;
+		if (!best || used > best.used) best = { label: w.label, used, reset: finiteNumber(w.reset) };
+	}
+	return best;
+}
+
+function accountsPriorityArgv(pool, id, to) {
+	return [
+		"quota", "monitor", "set-priority",
+		"--provider", String(pool.provider),
+		"--target", String(id),
+		"--priority", String(to),
+		"--profile", String(pool.owner),
+		"--json",
+	];
+}
+
+function accountsStrategyArgv(provider, profile, strategy) {
+	return [
+		"quota", "monitor", "set-strategy",
+		"--provider", String(provider),
+		"--strategy", String(strategy),
+		"--profile", String(profile),
+		"--json",
+	];
+}
+
+/** The `hermes ...` line the backend will run, shown verbatim in the confirm dialog. */
+function accountsOfficialCommand(change) {
+	if (!change) return "";
+	if (change.kind === "priority") {
+		return `hermes --profile ${change.owner} auth priority ${change.provider} ${change.id} ${change.to}`;
+	}
+	const key = `credential_pool_strategies.${String(change.provider).replace(/\./g, "\\.")}`;
+	return `hermes --profile ${change.profile} config set ${key} ${change.to}`;
+}
+
+/** One write through the focused profile's gateway; the backend answers one JSON object. */
+async function runAccountsWrite(scope, argv) {
+	let output;
+	try {
+		const result = await quotaCli(scope, argv, MONITOR_TIMEOUT_MS, { spawnPriority: "foreground" });
+		output = result.output || "";
+	} catch (error) {
+		// Non-zero exit: the payload still carries {error, error_code}.
+		let payload = null;
+		try {
+			payload = parseJsonOutput(String((error && error.message) || ""), "monitor_version");
+		} catch {
+			payload = null;
+		}
+		if (payload && payload.error) {
+			const err = new Error(String(payload.error));
+			err.code = payload.error_code || null;
+			throw err;
+		}
+		if (isMonitorUnsupportedError(error)) {
+			const err = new Error(tr("accountsWriteUnsupported"));
+			err.code = "unsupported";
+			throw err;
+		}
+		throw error;
+	}
+	const payload = parseJsonOutput(output, "monitor_version");
+	if (payload.error) {
+		const err = new Error(String(payload.error));
+		err.code = payload.error_code || null;
+		throw err;
+	}
+	return payload;
+}
+
+function accountsQueryKey(scope) {
+	return monitorQueryKey(scope, "accounts");
+}
+
+function useAccounts(active) {
+	const owner = useValue(host.state.focusedSessionOwner);
+	const scope = normalizeQuotaScope(owner);
+	const query = useQuery({
+		queryKey: accountsQueryKey(scope),
+		queryFn: () => fetchMonitor(scope, ["quota", "monitor", "accounts", "--json"]),
+		enabled: Boolean(scope) && Boolean(active),
+		refetchInterval: 120_000,
+		refetchIntervalInBackground: false,
+		staleTime: 20_000,
+		retry: 1,
+	});
+	const raw = query.data;
+	const payload = asMonitorPayload(raw);
+	const data = payload && !payload.error && Array.isArray(payload.pools) ? payload : null;
+	return {
+		scope,
+		data,
+		unsupported: Boolean(raw && raw.unsupported),
+		isError: Boolean(!data && (query.isError || (payload && payload.error))),
+		isLoading: Boolean(!data && !query.isError && !(raw && raw.unsupported) && !(payload && payload.error)),
+		isFetching: Boolean(query.isFetching),
+	};
+}
+
+/** Why writes are paused right now, or null when they may run. */
+function accountsWriteBlock(data, flags, nowSec = Date.now() / 1000) {
+	if (!data) return "loading";
+	if (flags && (flags.isFetching || flags.isLoading)) return "loading";
+	if (flags && flags.busy) return "busy";
+	const at = finiteNumber(data.generated_at);
+	if (at == null || nowSec - at > ACCOUNTS_STALE_S) return "stale";
+	return null;
+}
+
+/**
+ * The tab's state machine, plain JS so the drag / keyboard / confirm flow is
+ * testable without React. `bind()` refreshes its inputs every render.
+ */
+function createAccountsController(initial) {
+	const ctl = {
+		state: { orders: {}, strategies: {}, drag: null, confirm: null, busy: false, error: null, ...(initial || {}) },
+		env: { data: null, flags: {}, scope: null, onChange: () => {}, onSaved: () => {}, write: runAccountsWrite, now: () => Date.now() / 1000 },
+		bind(env) {
+			Object.assign(ctl.env, env);
+			return ctl;
+		},
+		set(patch) {
+			ctl.state = { ...ctl.state, ...patch };
+			ctl.env.onChange(ctl.state);
+		},
+		pools() {
+			return asList(ctl.env.data && ctl.env.data.pools);
+		},
+		pool(key) {
+			return ctl.pools().find((p) => poolKey(p) === key) || null;
+		},
+		ids(key) {
+			const pool = ctl.pool(key);
+			const base = asList(pool && pool.rows).map((r) => r.id);
+			const over = ctl.state.orders[key];
+			return Array.isArray(over) && over.length === base.length ? over : base;
+		},
+		rows(key) {
+			const pool = ctl.pool(key);
+			const byId = new Map(asList(pool && pool.rows).map((r) => [r.id, r]));
+			return ctl.ids(key).map((id) => byId.get(id)).filter(Boolean);
+		},
+		blocked() {
+			const block = accountsWriteBlock(ctl.env.data, { ...ctl.env.flags, busy: ctl.state.busy }, ctl.env.now());
+			return block || (ctl.state.confirm ? "confirm" : null);
+		},
+		canReorder(key) {
+			const pool = ctl.pool(key);
+			return Boolean(pool && pool.writable && !ctl.blocked() && ctl.env.data.capabilities && ctl.env.data.capabilities.set_priority);
+		},
+		dragStart(key, id) {
+			if (!ctl.canReorder(key)) return false;
+			ctl.set({ drag: { key, id, slot: null } });
+			return true;
+		},
+		/** `index` = row under the pointer, `after` = pointer in its lower half. */
+		dragOver(key, index, after) {
+			const d = ctl.state.drag;
+			if (!d || d.key !== key) return false;
+			const slot = index + (after ? 1 : 0);
+			if (d.slot !== slot) ctl.set({ drag: { ...d, slot } });
+			return true;
+		},
+		drop(key) {
+			const d = ctl.state.drag;
+			ctl.set({ drag: null });
+			if (!d || d.key !== key || d.slot == null) return null;
+			const from = ctl.ids(key).indexOf(d.id);
+			return ctl.propose(key, d.id, dropTarget(from, d.slot));
+		},
+		dragEnd() {
+			if (ctl.state.drag) ctl.set({ drag: null });
+		},
+		move(key, id, delta) {
+			const ids = ctl.ids(key);
+			const from = ids.indexOf(id);
+			const to = from + delta;
+			if (from < 0 || to < 0 || to >= ids.length) return null;
+			return ctl.propose(key, id, to);
+		},
+		propose(key, id, to) {
+			const pool = ctl.pool(key);
+			if (!pool || !ctl.canReorder(key)) return null;
+			const prev = ctl.ids(key);
+			const from = prev.indexOf(id);
+			if (from < 0 || to === from) return null;
+			const next = reorderIds(prev, from, to);
+			const change = {
+				kind: "priority", key, provider: pool.provider, owner: pool.owner, id, from, to,
+				prevIds: prev, ids: next, affected: asList(pool.used_by), shared: Boolean(pool.shared),
+				argv: accountsPriorityArgv(pool, id, to),
+			};
+			ctl.set({ orders: { ...ctl.state.orders, [key]: next }, confirm: change, error: null });
+			return change;
+		},
+		strategyFor(pool, profile) {
+			const k = `${profile}:${pool.provider}`;
+			return ctl.state.strategies[k] || (pool.strategies && pool.strategies[profile]) || "fill_first";
+		},
+		proposeStrategy(pool, profile, strategy) {
+			if (!pool || ctl.blocked() || !(ctl.env.data.capabilities && ctl.env.data.capabilities.set_strategy)) return null;
+			const supported = asList(ctl.env.data.strategies);
+			if (!supported.includes(strategy)) return null;
+			const from = ctl.strategyFor(pool, profile);
+			if (from === strategy) return null;
+			const k = `${profile}:${pool.provider}`;
+			const change = {
+				kind: "strategy", key: k, provider: pool.provider, profile, from, to: strategy,
+				affected: [profile], argv: accountsStrategyArgv(pool.provider, profile, strategy),
+			};
+			ctl.set({ strategies: { ...ctl.state.strategies, [k]: strategy }, confirm: change, error: null });
+			return change;
+		},
+		rollback(change) {
+			if (!change) return;
+			if (change.kind === "priority") {
+				const orders = { ...ctl.state.orders };
+				delete orders[change.key];
+				ctl.set({ orders });
+			} else {
+				const strategies = { ...ctl.state.strategies };
+				delete strategies[change.key];
+				ctl.set({ strategies });
+			}
+		},
+		cancel() {
+			const change = ctl.state.confirm;
+			if (!change || ctl.state.busy) return;
+			ctl.rollback(change);
+			ctl.set({ confirm: null, error: null });
+		},
+		async confirm() {
+			const change = ctl.state.confirm;
+			if (!change || ctl.state.busy) return null;
+			// a retry after a failed attempt re-applies the optimistic value first
+			if (change.kind === "priority") ctl.set({ orders: { ...ctl.state.orders, [change.key]: change.ids } });
+			else ctl.set({ strategies: { ...ctl.state.strategies, [change.key]: change.to } });
+			ctl.set({ busy: true, error: null });
+			try {
+				const res = await ctl.env.write(ctl.env.scope, change.argv);
+				ctl.set({ busy: false });
+				ctl.rollback(change); // the server's state replaces the optimistic value
+				ctl.set({ confirm: null });
+				ctl.env.onSaved(res, change);
+				return res;
+			} catch (error) {
+				ctl.rollback(change);
+				ctl.set({ busy: false, error: String((error && error.message) || error) });
+				throw error;
+			}
+		},
+	};
+	return ctl;
+}
+
+// ---- Accounts view (React) ----
+
+function AccountRing({ windows, size = 30 }) {
+	const t = usePluginI18n(ID);
+	const w = mostUsedWindow(windows);
+	const left = w ? Math.max(0, Math.min(100, Math.round(100 - w.used))) : null;
+	return jsx(Ring, {
+		value: left,
+		tone: toneForRemaining(left),
+		size,
+		stroke: 3,
+		label: w ? t("accountsRingLabel", w.label, left) : t("accountsRingNone"),
+		children: jsx("span", { style: { ...UI.num, fontSize: "0.5625rem", fontWeight: 650, color: left == null ? "var(--ui-text-quaternary)" : "var(--ui-text-primary)" }, children: left == null ? "—" : `${left}` }),
+	});
+}
+
+const ACCOUNT_STATUS_COLOR = { active: "var(--ui-green)", cooldown: "var(--ui-yellow)", exhausted: "var(--ui-red)" };
+
+function AccountStatus({ row, nowSec }) {
+	const t = usePluginI18n(ID);
+	const until = finiteNumber(row.status_until);
+	const left = until != null && until > nowSec ? fmtSpan(until - nowSec) : "";
+	const title = row.status === "cooldown" && asList(row.cooldown_models).length
+		? t("accountsCooldownModels", asList(row.cooldown_models).join(", "))
+		: row.last_error_code ? `HTTP ${row.last_error_code}` : undefined;
+	return jsx(Pill, {
+		"data-account-status": row.status,
+		color: ACCOUNT_STATUS_COLOR[row.status] || "var(--ui-text-tertiary)",
+		dot: true,
+		title,
+		children: left ? t("accountsStatusUntil", t(`accountsStatus_${row.status}`), left) : t(`accountsStatus_${row.status}`),
+	});
+}
+
+function MoveButton({ label, glyph, disabled, onClick }) {
+	return jsx("button", {
+		type: "button",
+		"aria-label": label,
+		title: label,
+		disabled,
+		onClick,
+		className: disabled ? undefined : "hover:bg-(--chrome-action-hover) hover:text-foreground transition-colors",
+		style: {
+			width: 18, height: 16, padding: 0, border: 0, borderRadius: 3, lineHeight: "16px", fontSize: "0.625rem",
+			background: "transparent", color: disabled ? "var(--ui-text-quaternary)" : "var(--ui-text-tertiary)",
+			cursor: disabled ? "default" : "pointer", opacity: disabled ? 0.45 : 1,
+		},
+		children: glyph,
+	});
+}
+
+function AccountRow({ ctl, pool, row, index, count, firstActive, nowSec, page }) {
+	const t = usePluginI18n(ID);
+	const key = poolKey(pool);
+	const can = ctl.canReorder(key);
+	const drag = ctl.state.drag && ctl.state.drag.key === key ? ctl.state.drag : null;
+	const dragging = drag && drag.id === row.id;
+	const lineTop = drag && drag.slot === index;
+	const lineBottom = drag && index === count - 1 && drag.slot === count;
+	const shadows = [];
+	if (lineTop) shadows.push("inset 0 2px 0 var(--ui-accent)");
+	if (lineBottom) shadows.push("inset 0 -2px 0 var(--ui-accent)");
+	const typeLabel = row.auth_type === "api_key" ? t("accountsTypeKey") : row.auth_type === "oauth" ? t("accountsTypeOauth") : row.auth_type || t("accountsTypeOther");
+	return jsxs("div", {
+		role: "listitem",
+		tabIndex: can ? 0 : -1,
+		"aria-label": t("accountsRowAria", index + 1, row.label),
+		"aria-grabbed": dragging ? true : undefined,
+		"data-account-row": row.id || row.label,
+		"data-drop-line": lineTop ? "before" : lineBottom ? "after" : undefined,
+		draggable: can,
+		onDragStart: (e) => {
+			if (!ctl.dragStart(key, row.id)) return;
+			try {
+				e.dataTransfer.effectAllowed = "move";
+				e.dataTransfer.setData("text/plain", row.id);
+			} catch {
+				/* noop */
+			}
+		},
+		onDragOver: (e) => {
+			if (!ctl.state.drag || ctl.state.drag.key !== key) return;
+			e.preventDefault();
+			try {
+				e.dataTransfer.dropEffect = "move";
+			} catch {
+				/* noop */
+			}
+			const r = e.currentTarget.getBoundingClientRect();
+			ctl.dragOver(key, index, e.clientY > r.top + r.height / 2);
+		},
+		onDrop: (e) => {
+			e.preventDefault();
+			ctl.drop(key);
+		},
+		onDragEnd: () => ctl.dragEnd(),
+		onKeyDown: (e) => {
+			if (!can || !e.altKey) return;
+			if (e.key === "ArrowUp") {
+				e.preventDefault();
+				ctl.move(key, row.id, -1);
+			} else if (e.key === "ArrowDown") {
+				e.preventDefault();
+				ctl.move(key, row.id, 1);
+			}
+		},
+		style: {
+			...UI.row,
+			gap: 8,
+			padding: page ? "7px 10px" : "6px 8px",
+			opacity: dragging ? 0.45 : 1,
+			boxShadow: shadows.join(", ") || undefined,
+			background: dragging ? tint("var(--ui-accent)", 8) : undefined,
+			cursor: can ? "grab" : "default",
+			outlineOffset: -2,
+		},
+		children: [
+			jsx("span", {
+				"aria-hidden": true,
+				style: { ...UI.tiny, width: 8, flexShrink: 0, letterSpacing: "-2px", color: can ? "var(--ui-text-tertiary)" : "var(--ui-text-quaternary)", userSelect: "none" },
+				children: "⋮⋮",
+			}, "grip"),
+			jsx("span", { style: { ...UI.tiny, ...UI.num, width: 12, flexShrink: 0, textAlign: "right" }, children: String(index + 1) }, "n"),
+			jsx(AccountRing, { windows: row.windows, size: page ? 32 : 28 }, "ring"),
+			jsxs("div", {
+				style: { ...UI.col, gap: 3, flex: "1 1 auto" },
+				children: [
+					jsxs("div", {
+						style: { ...UI.row, gap: 6, flexWrap: "wrap" },
+						children: [
+							jsx("span", { style: { ...UI.text, fontWeight: 600, ...UI.ellipsis, maxWidth: page ? 260 : 120 }, title: row.label, children: row.label }, "l"),
+							firstActive ? jsx(Pill, { color: "var(--ui-accent)", "data-tried-first": true, title: t("accountsTriedFirstTip"), children: t("accountsTriedFirst") }, "f") : null,
+						],
+					}, "top"),
+					jsxs("div", {
+						style: { ...UI.row, gap: 4, flexWrap: "wrap" },
+						children: [
+							jsx(Pill, { color: "var(--ui-text-secondary)", children: typeLabel }, "type"),
+							jsx(AccountStatus, { row, nowSec }, "status"),
+							page && row.source ? jsx("span", { style: { ...UI.tiny, ...UI.ellipsis }, title: t("accountsSourceTip"), children: row.source }, "src") : null,
+							page && row.id ? jsx("span", { style: { ...UI.tiny, fontFamily: "var(--dt-font-mono)" }, children: row.id }, "id") : null,
+						],
+					}, "meta"),
+				],
+			}, "body"),
+			jsxs("div", {
+				style: { display: "flex", flexDirection: "column", gap: 1, flexShrink: 0 },
+				children: [
+					jsx(MoveButton, { label: t("accountsMoveUp", row.label), glyph: "▲", disabled: !can || index === 0, onClick: () => ctl.move(key, row.id, -1) }, "up"),
+					jsx(MoveButton, { label: t("accountsMoveDown", row.label), glyph: "▼", disabled: !can || index === count - 1, onClick: () => ctl.move(key, row.id, 1) }, "down"),
+				],
+			}, "move"),
+		],
+	});
+}
+
+function StrategyControl({ ctl, pool, profile, page }) {
+	const t = usePluginI18n(ID);
+	const value = ctl.strategyFor(pool, profile);
+	const supported = asList(ctl.env.data && ctl.env.data.strategies).filter((s) => STRATEGY_IDS.includes(s));
+	const blocked = Boolean(ctl.blocked());
+	return jsxs("div", {
+		"data-strategy-profile": profile,
+		title: t(`strategyHint_${value}`),
+		style: { ...UI.row, gap: 8, justifyContent: "space-between", padding: "3px 0", opacity: blocked ? 0.7 : 1 },
+		children: [
+			jsx("span", { style: { ...UI.secondary, fontWeight: 600, ...UI.ellipsis, flex: "1 1 auto" }, children: profile }, "p"),
+			jsx("div", {
+				"aria-disabled": blocked || undefined,
+				style: { pointerEvents: blocked ? "none" : undefined, flexShrink: 0 },
+				children: jsx(SegmentedControl, {
+					value,
+					onChange: (v) => ctl.proposeStrategy(pool, profile, String(v)),
+					options: supported.map((s) => ({ id: s, label: page ? t(`strategy_${s}`) : t(`strategyShort_${s}`) })),
+				}),
+			}, "seg"),
+		],
+	});
+}
+
+function StrategyLegend({ ids, page }) {
+	const t = usePluginI18n(ID);
+	return jsx("div", {
+		"data-strategy-legend": true,
+		style: { display: "grid", gridTemplateColumns: page ? "repeat(2, minmax(0, 1fr))" : "1fr", gap: "2px 12px", paddingTop: 4 },
+		children: ids.map((s) =>
+			jsxs("span", {
+				style: { ...UI.tiny, lineHeight: 1.4 },
+				children: [jsx("b", { style: { fontWeight: 600, color: "var(--ui-text-tertiary)" }, children: `${t(`strategy_${s}`)}: ` }, "n"), t(`strategyHint_${s}`)],
+			}, s),
+		),
+	});
+}
+
+function StrategySection({ ctl, pool, page }) {
+	const t = usePluginI18n(ID);
+	const users = asList(pool.used_by);
+	const values = users.map((u) => ctl.strategyFor(pool, u));
+	const counts = {};
+	for (const v of values) counts[v] = (counts[v] || 0) + 1;
+	const summary = Object.entries(counts).map(([s, n]) => `${t(`strategy_${s}`)} ×${n}`).join(" · ");
+	const supported = asList(ctl.env.data && ctl.env.data.strategies).filter((s) => STRATEGY_IDS.includes(s));
+	const rows = jsx("div", { style: { ...UI.col }, children: users.map((u) => jsx(StrategyControl, { ctl, pool, profile: u, page }, u)) }, "list");
+	const header = jsxs("span", {
+		style: { display: "inline-flex", alignItems: "baseline", gap: 6, flexWrap: "wrap" },
+		children: [
+			jsx("span", { style: { fontSize: "0.625rem", fontWeight: 650, letterSpacing: "0.06em", textTransform: "uppercase", color: "var(--ui-text-tertiary)" }, children: t("accountsStrategyTitle") }, "t"),
+			jsx("span", { style: UI.faint, children: summary }, "s"),
+		],
+	});
+	// Many profiles: folded by default (the summary says what they use); a few: open.
+	return jsxs("details", {
+		"data-strategy-section": poolKey(pool),
+		open: users.length <= 3 || Boolean(ctl.state.confirm && ctl.state.confirm.kind === "strategy" && ctl.state.confirm.provider === pool.provider),
+		children: [
+			jsx("summary", { className: "cursor-pointer select-none", style: { padding: "2px 0" }, children: header }, "s"),
+			rows,
+			jsx(StrategyLegend, { ids: supported, page }, "legend"),
+		],
+	});
+}
+
+function PoolCard({ ctl, pool, nowSec, page }) {
+	const t = usePluginI18n(ID);
+	const key = poolKey(pool);
+	const rows = ctl.rows(key);
+	const firstActive = rows.find((r) => r.status === "active");
+	const users = asList(pool.used_by);
+	const others = users.filter((u) => u !== pool.owner);
+	const quota = asObject(pool.quota);
+	const providerWin = mostUsedWindow(quota.windows);
+	const anyRowQuota = rows.some((r) => asList(r.windows).length);
+	const block = ctl.blocked();
+	return jsxs("section", {
+		"data-pool": key,
+		style: { ...UI.card, overflow: "hidden" },
+		children: [
+			jsxs("div", {
+				style: { ...UI.row, gap: 8, padding: page ? "9px 10px 6px" : "8px 8px 5px", flexWrap: "wrap" },
+				children: [
+					jsx(ProviderBadge, { pid: pool.provider }, "b"),
+					jsx("span", { style: { ...UI.title, ...UI.ellipsis }, children: providerMeta(pool.provider).name }, "n"),
+					pool.shared
+						? jsx(Pill, { color: "var(--ui-purple)", "data-pool-kind": "shared", title: t("accountsSharedTip", users.join(", ")), children: t("accountsSharedPool", users.length) }, "k")
+						: jsx(Pill, { color: "var(--ui-cyan)", "data-pool-kind": "own", children: t("accountsOwnPool", pool.owner) }, "k"),
+					page ? jsx("span", { style: { ...UI.faint, marginLeft: "auto" }, children: t("accountsCount", rows.length) }, "c") : null,
+				],
+			}, "head"),
+			providerWin && !anyRowQuota
+				? jsx("div", { style: { ...UI.tiny, padding: page ? "0 10px 4px" : "0 8px 4px" }, children: t("accountsProviderQuota", providerWin.label, Math.round(providerWin.used)) }, "pq")
+				: null,
+			jsx("div", {
+				role: "list",
+				"aria-label": t("accountsListAria", providerMeta(pool.provider).name),
+				"data-pool-rows": key,
+				onDragOver: (e) => {
+					// over the gap below the last row: keep the "after last" slot
+					if (ctl.state.drag && ctl.state.drag.key === key) e.preventDefault();
+				},
+				onDrop: (e) => {
+					e.preventDefault();
+					ctl.drop(key);
+				},
+				style: { borderTop: "1px solid var(--ui-stroke-tertiary)" },
+				children: rows.map((row, i) =>
+					jsx("div", {
+						style: { borderTop: i ? "1px solid var(--ui-stroke-tertiary)" : undefined },
+						children: jsx(AccountRow, { ctl, pool, row, index: i, count: rows.length, firstActive: firstActive && firstActive.id === row.id, nowSec, page }),
+					}, row.id || row.label),
+				),
+			}, "rows"),
+			jsxs("div", {
+				style: { ...UI.col, gap: 3, padding: page ? "6px 10px 8px" : "6px 8px 7px", borderTop: "1px solid var(--ui-stroke-tertiary)", background: "var(--ui-bg-tertiary)" },
+				children: [
+					rows.length > 1
+						? jsx("span", { style: { ...UI.tiny, lineHeight: 1.4 }, children: pool.writable ? (block ? t(`accountsBlocked_${block}`) : t("accountsDragHint")) : t("accountsNotWritable") }, "hint")
+						: jsx("span", { style: { ...UI.tiny, lineHeight: 1.4 }, children: t("accountsSingle") }, "hint"),
+					pool.shared && rows.length > 1
+						? jsx("span", { "data-shared-warning": true, style: { ...UI.tiny, lineHeight: 1.4, color: "var(--ui-orange)" }, children: t("accountsSharedWarning", pool.owner, others.join(", ")) }, "warn")
+						: null,
+				],
+			}, "foot"),
+			jsx("div", {
+				style: { padding: page ? "5px 10px 7px" : "5px 8px 6px", borderTop: "1px solid var(--ui-stroke-tertiary)" },
+				children: jsx(StrategySection, { ctl, pool, page }),
+			}, "strategy"),
+		],
+	});
+}
+
+function ModelChip({ provider, model, tone, title }) {
+	return jsxs("span", {
+		title,
+		style: {
+			display: "inline-flex", alignItems: "center", gap: 4, maxWidth: "100%", minWidth: 0,
+			borderRadius: 5, padding: "1px 6px", fontSize: "0.6875rem",
+			border: `1px solid ${tone ? tint(tone, 45) : "var(--ui-stroke-tertiary)"}`,
+			background: tone ? tint(tone, 10) : "var(--ui-bg-tertiary)", color: "var(--ui-text-secondary)",
+		},
+		children: [
+			jsx("span", { style: { fontWeight: 600, color: "var(--ui-text-primary)", flexShrink: 0 }, children: providerMeta(provider || "?").name }, "p"),
+			jsx("span", { style: UI.ellipsis, children: model || "—" }, "m"),
+		],
+	});
+}
+
+function ProfileChain({ prof }) {
+	const t = usePluginI18n(ID);
+	const fbs = asList(prof.fallbacks);
+	const m = asObject(prof.model);
+	return jsxs("div", {
+		style: { display: "flex", flexWrap: "wrap", alignItems: "center", gap: 4, minWidth: 0 },
+		children: [
+			m.model ? jsx(ModelChip, { provider: m.provider, model: m.model, tone: "var(--ui-accent)", title: t("accountsPrimaryTip") }, "primary") : jsx("span", { style: UI.faint, children: t("accountsNoModel") }, "primary"),
+			...fbs.map((fb, i) =>
+				jsxs("span", {
+					style: { display: "inline-flex", alignItems: "center", gap: 4, minWidth: 0 },
+					children: [
+						jsx("span", { "aria-hidden": true, style: UI.faint, children: "→" }, "a"),
+						jsx(ModelChip, { provider: fb.provider, model: fb.model, title: t("accountsFallbackTip", i + 1) + (fb.custom_route ? ` · ${t("accountsCustomRoute")}` : "") }, "c"),
+					],
+				}, `fb${i}`),
+			),
+		],
+	});
+}
+
+function AccessCell({ access, strategy }) {
+	const t = usePluginI18n(ID);
+	if (!access) return jsx("span", { style: UI.faint, children: "—" });
+	return jsxs("span", {
+		style: { display: "inline-flex", flexWrap: "wrap", alignItems: "center", gap: 3 },
+		children: [
+			jsx(Pill, { color: access === "own" ? "var(--ui-cyan)" : "var(--ui-purple)", "data-access": access, children: t(`accountsAccess_${access}`) }, "a"),
+			jsx("span", { style: UI.tiny, children: t(`strategyShort_${strategy || "fill_first"}`) }, "s"),
+		],
+	});
+}
+
+function ProfileMatrix({ ctl, data, page }) {
+	const t = usePluginI18n(ID);
+	const providers = [...new Set(asList(data.pools).map((p) => p.provider))];
+	const profiles = asList(data.profiles);
+	const strategyOf = (prof, provider) => {
+		const pool = asList(data.pools).find((p) => p.provider === provider && asList(p.used_by).includes(prof.profile));
+		return pool ? ctl.strategyFor(pool, prof.profile) : "fill_first";
+	};
+	const copyFallback = (prof) => void copyCommand(prof.fallback_command || `hermes --profile ${prof.profile} fallback`);
+	const editRow = (prof) =>
+		jsx("button", {
+			type: "button",
+			"data-fallback-command": prof.fallback_command || `hermes --profile ${prof.profile} fallback`,
+			className: "hover:text-foreground transition-colors",
+			style: { ...UI.tiny, alignSelf: "flex-start", border: 0, background: "transparent", padding: 0, cursor: "pointer", textDecoration: "underline dotted" },
+			title: `${prof.fallback_command || `hermes --profile ${prof.profile} fallback`} — ${t("accountsFallbackCopyTip")}`,
+			onClick: () => copyFallback(prof),
+			children: t("accountsFallbackEdit"),
+		});
+	if (page) {
+		return jsx("div", {
+			style: { ...UI.card, overflowX: "auto" },
+			children: jsxs("table", {
+				"data-profile-matrix": true,
+				style: { width: "100%", borderCollapse: "collapse", fontSize: "0.75rem" },
+				children: [
+					jsx("thead", {
+						children: jsxs("tr", {
+							children: [
+								jsx("th", { style: { ...UI.tiny, textAlign: "left", padding: "7px 10px", fontWeight: 600 }, children: t("accountsProfileCol") }, "p"),
+								...providers.map((p) => jsx("th", { style: { ...UI.tiny, textAlign: "left", padding: "7px 8px", fontWeight: 600, whiteSpace: "nowrap" }, children: providerMeta(p).name }, p)),
+								jsx("th", { style: { ...UI.tiny, textAlign: "left", padding: "7px 10px", fontWeight: 600 }, children: t("accountsChainCol") }, "chain"),
+							],
+						}),
+					}, "h"),
+					jsx("tbody", {
+						children: profiles.map((prof) =>
+							jsxs("tr", {
+								"data-matrix-profile": prof.profile,
+								style: { borderTop: "1px solid var(--ui-stroke-tertiary)", verticalAlign: "top" },
+								children: [
+									jsx("td", { style: { padding: "7px 10px", fontWeight: 600, whiteSpace: "nowrap" }, children: prof.profile + (prof.is_root ? ` · ${t("accountsRootTag")}` : "") }, "p"),
+									...providers.map((p) => jsx("td", { style: { padding: "7px 8px" }, children: jsx(AccessCell, { access: asObject(prof.pools)[p], strategy: strategyOf(prof, p) }) }, p)),
+									jsx("td", { style: { padding: "7px 10px", minWidth: 220 }, children: jsxs("div", { style: { ...UI.col, gap: 4 }, children: [jsx(ProfileChain, { prof }, "c"), editRow(prof)] }) }, "chain"),
+								],
+							}, prof.profile),
+						),
+					}, "b"),
+				],
+			}),
+		});
+	}
+	return jsx(List, {
+		children: profiles.map((prof) =>
+			jsx(Row, {
+				children: [
+					jsxs("div", {
+						style: { ...UI.row, gap: 6, flexWrap: "wrap" },
+						children: [
+							jsx("span", { style: { ...UI.text, fontWeight: 600 }, children: prof.profile }, "n"),
+							prof.is_root ? jsx("span", { style: UI.tiny, children: t("accountsRootTag") }, "r") : null,
+						],
+					}, "h"),
+					jsx("div", {
+						style: { display: "flex", flexWrap: "wrap", gap: "3px 8px" },
+						children: providers.filter((p) => asObject(prof.pools)[p]).map((p) =>
+							jsxs("span", {
+								style: { display: "inline-flex", alignItems: "center", gap: 4 },
+								children: [
+									jsx("span", { style: { ...UI.tiny, fontWeight: 600 }, children: providerMeta(p).name }, "n"),
+									jsx(AccessCell, { access: asObject(prof.pools)[p], strategy: strategyOf(prof, p) }, "c"),
+								],
+							}, p),
+						),
+					}, "acc"),
+					jsx(ProfileChain, { prof }, "chain"),
+					editRow(prof),
+				],
+			}, prof.profile),
+		),
+	});
+}
+
+/** API-key providers are added on Settings ▸ Providers ▸ API keys (or Keys), not by an OAuth sign-in. */
+function isKeyRoute(item) {
+	return /[?&](pview|tab)=keys\b/.test(String((item && item.settings_path) || ""));
+}
+
+function signInLabel(t, item) {
+	if (item.kind === "optin") return t("accountsOptinAction");
+	if (isKeyRoute(item)) return t("accountsAddKeyAction");
+	if (item.kind === "reauth") return t("accountsReauthAction");
+	return t("accountsSigninAction");
+}
+
+function openHermesSettings(path) {
+	try {
+		if (path && typeof host.navigate === "function") {
+			host.navigate(path);
+			return "navigated";
+		}
+	} catch {
+		/* fall through */
+	}
+	try {
+		const res = CTX && typeof CTX.runAction === "function" ? CTX.runAction("nav.settings") : null;
+		if (res && res.ok) return "settings";
+	} catch {
+		/* noop */
+	}
+	return "none";
+}
+
+function UnavailableRow({ item, nowSec, used = false }) {
+	const t = usePluginI18n(ID);
+	const name = providerDisplayName(item.provider, { account_label: item.account_label });
+	const retry = finiteNumber(item.retry_at);
+	const reasonText = item.kind === "signin" && isKeyRoute(item)
+		? t("accountsReason_key", item.reason)
+		: t(`accountsReason_${item.kind}`, item.reason, item.external_tool || "");
+	const retryText = item.kind === "rate_limited"
+		? retry != null && retry > nowSec ? t("accountsRetryIn", fmtSpan(retry - nowSec)) : t("accountsRetrySoon")
+		: null;
+	const actions = [];
+	if ((item.kind === "signin" || item.kind === "reauth") && item.settings_path) {
+		actions.push(jsx("button", {
+			type: "button",
+			"data-signin": item.provider,
+			className: "hover:opacity-90 transition-opacity",
+			onClick: () => openHermesSettings(item.settings_path),
+			style: { border: 0, borderRadius: 5, padding: "2px 8px", fontSize: "0.6875rem", fontWeight: 600, cursor: "pointer", background: "var(--ui-accent)", color: "var(--dt-midground-foreground, var(--ui-bg-editor))" },
+			children: signInLabel(t, item),
+		}, "go"));
+	}
+	if (item.command) {
+		actions.push(jsx("button", {
+			type: "button",
+			"data-copy-command": item.command,
+			className: "hover:bg-(--chrome-action-hover) transition-colors",
+			title: t("accountsCopyTip"),
+			onClick: () => void copyCommand(item.command),
+			style: { border: "1px solid var(--ui-stroke-tertiary)", borderRadius: 5, padding: "1px 6px", fontSize: "0.6875rem", cursor: "pointer", background: "transparent", color: "var(--ui-text-secondary)", fontFamily: "var(--dt-font-mono)", maxWidth: "100%", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+			children: item.command,
+		}, "cmd"));
+	}
+	const color = item.kind === "rate_limited" ? "var(--ui-yellow)" : item.kind === "error" ? "var(--ui-text-tertiary)" : item.kind === "optin" ? "var(--ui-cyan)" : "var(--ui-orange)";
+	return jsx(Row, {
+		tone: item.kind === "signin" || item.kind === "reauth" ? "var(--ui-orange)" : undefined,
+		children: [
+			jsxs("div", {
+				style: { ...UI.row, gap: 7 },
+				children: [
+					jsx(ProviderBadge, { pid: item.provider }, "b"),
+					jsx("span", { style: { ...UI.text, fontWeight: 600, ...UI.ellipsis }, children: name }, "n"),
+					jsx(Pill, { color, "data-unavailable-kind": item.kind, children: t(`accountsKind_${item.kind}`) }, "k"),
+					used ? jsx("span", { style: { ...UI.tiny, marginLeft: "auto", flexShrink: 0 }, title: t("accountsUsedTip"), children: t("accountsUsed") }, "u") : null,
+				],
+			}, "h"),
+			jsx("span", { style: { ...UI.meta, lineHeight: 1.4 }, children: reasonText + (retryText ? ` · ${retryText}` : "") }, "r"),
+			actions.length ? jsx("div", { style: { display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center", marginTop: 2 }, children: actions }, "a") : null,
+		],
+	}, item.provider);
+}
+
+function AccountsConfirm({ ctl }) {
+	const t = usePluginI18n(ID);
+	const c = ctl.state.confirm;
+	let title = "";
+	let description = "";
+	let body = null;
+	if (c && c.kind === "priority") {
+		const pool = ctl.pool(c.key);
+		const byId = new Map(asList(pool && pool.rows).map((r) => [r.id, r]));
+		const label = (id) => (byId.get(id) || {}).label || id;
+		const firstNow = label(c.ids[0]);
+		title = t("accountsConfirmOrderTitle", providerMeta(c.provider).name);
+		description = c.shared
+			? t("accountsConfirmOrderShared", c.owner, c.affected.length)
+			: t("accountsConfirmOrderOwn", c.owner);
+		body = jsxs("div", {
+			"data-confirm": "priority",
+			style: { ...UI.col, gap: 8, fontSize: "0.75rem" },
+			children: [
+				jsxs("div", {
+					style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 },
+					children: [
+						jsxs("div", { style: { ...UI.col, gap: 2 }, children: [jsx("span", { style: UI.tiny, children: t("accountsConfirmBefore") }, "h"), ...c.prevIds.map((id, i) => jsx("span", { style: { ...UI.secondary, ...UI.ellipsis }, children: `${i + 1}. ${label(id)}` }, id))] }, "b"),
+						jsxs("div", { style: { ...UI.col, gap: 2 }, children: [jsx("span", { style: UI.tiny, children: t("accountsConfirmAfter") }, "h"), ...c.ids.map((id, i) => jsx("span", { style: { ...UI.text, fontWeight: id === c.id ? 650 : 400, ...UI.ellipsis }, children: `${i + 1}. ${label(id)}` }, id))] }, "a"),
+					],
+				}, "lists"),
+				jsx("span", { style: UI.secondary, children: t("accountsConfirmFirst", firstNow) }, "first"),
+				jsx("span", { style: UI.secondary, children: t("accountsConfirmProfiles", c.affected.join(", ")) }, "who"),
+				jsx("code", { style: { ...UI.tiny, fontFamily: "var(--dt-font-mono)", overflowWrap: "anywhere", color: "var(--ui-text-secondary)" }, children: accountsOfficialCommand(c) }, "cmd"),
+			],
+		});
+	} else if (c && c.kind === "strategy") {
+		title = t("accountsConfirmStrategyTitle", c.profile, providerMeta(c.provider).name);
+		description = t("accountsConfirmStrategyDesc", c.profile);
+		body = jsxs("div", {
+			"data-confirm": "strategy",
+			style: { ...UI.col, gap: 8, fontSize: "0.75rem" },
+			children: [
+				jsx("span", { style: UI.text, children: `${t(`strategy_${c.from}`)} → ${t(`strategy_${c.to}`)}` }, "chg"),
+				jsx("span", { style: UI.secondary, children: t(`strategyHint_${c.to}`) }, "hint"),
+				jsx("code", { style: { ...UI.tiny, fontFamily: "var(--dt-font-mono)", overflowWrap: "anywhere", color: "var(--ui-text-secondary)" }, children: accountsOfficialCommand(c) }, "cmd"),
+			],
+		});
+	}
+	return jsx(ConfirmDialog, {
+		open: Boolean(c),
+		onClose: () => ctl.cancel(),
+		onConfirm: () => ctl.confirm(),
+		title,
+		description,
+		confirmLabel: t("accountsConfirmApply"),
+		busyLabel: t("accountsConfirmBusy"),
+		cancelLabel: t("accountsConfirmCancel"),
+		children: body,
+	});
+}
+
+function AccountsView({ page = false, initialState = null, accountsOverride = null }) {
+	const t = usePluginI18n(ID);
+	const qc = useQueryClient();
+	const live = useAccounts(!accountsOverride);
+	const acc = accountsOverride || live;
+	const [, setTick] = useState(0);
+	const ctlRef = useRef(null);
+	if (!ctlRef.current) ctlRef.current = createAccountsController(initialState);
+	const ctl = ctlRef.current.bind({
+		data: acc.data,
+		scope: acc.scope,
+		flags: { isFetching: acc.isFetching, isLoading: acc.isLoading },
+		onChange: () => setTick((n) => n + 1),
+		onSaved: (res, change) => {
+			try {
+				if (res && res.state && Array.isArray(res.state.pools)) qc.setQueryData?.(accountsQueryKey(acc.scope), res.state);
+				qc.invalidateQueries({ queryKey: accountsQueryKey(acc.scope) });
+				host.notify?.({ kind: "success", message: change.kind === "priority" ? tr("accountsSavedOrder", providerMeta(change.provider).name) : tr("accountsSavedStrategy", change.profile, tr(`strategy_${change.to}`)) });
+			} catch {
+				/* the next poll shows it anyway */
+			}
+		},
+	});
+	const nowSec = Date.now() / 1000;
+	if (acc.unsupported) return jsx(Empty, { children: t("accountsUnsupported") });
+	if (acc.isError) return jsx(Empty, { children: t("accountsError") });
+	if (!acc.data) return jsx(Empty, { children: t("loading") });
+	const data = acc.data;
+	const pools = asList(data.pools);
+	const unavailable = asList(data.unavailable);
+	const usedProviders = new Set();
+	for (const prof of asList(data.profiles)) {
+		const m = asObject(prof.model);
+		if (m.provider) usedProviders.add(String(m.provider));
+		for (const fb of asList(prof.fallbacks)) if (fb && fb.provider) usedProviders.add(String(fb.provider));
+	}
+	const isUsed = (u) => usedProviders.has(u.base) || usedProviders.has(String(u.command || "").split(" ").pop());
+	const needsAll = unavailable.filter((u) => u.kind !== "error");
+	const needsYou = [...needsAll.filter(isUsed), ...needsAll.filter((u) => !isUsed(u))];
+	const shown = needsYou.slice(0, ACCOUNTS_SIGNIN_VISIBLE);
+	const folded = needsYou.slice(ACCOUNTS_SIGNIN_VISIBLE);
+	const other = unavailable.filter((u) => u.kind === "error");
+	const block = ctl.blocked();
+	return jsxs(ViewStack, {
+		name: "accounts",
+		children: [
+			jsx("div", {
+				"data-accounts-explainer": true,
+				className: "rounded-lg border border-dashed px-3 py-2",
+				style: { ...UI.meta, lineHeight: 1.45, borderColor: "var(--ui-stroke-secondary)" },
+				children: t("accountsExplainer"),
+			}, "explain"),
+			block === "stale" || block === "loading"
+				? jsx("div", { "data-accounts-paused": block, style: { ...UI.meta, color: "var(--ui-yellow)" }, children: t(`accountsBlocked_${block}`) }, "paused")
+				: null,
+			jsxs(Section, {
+				title: t("accountsPoolsTitle"),
+				sub: t("accountsPoolsSub", pools.length),
+				children: [
+					pools.length
+						? jsx("div", { style: { ...UI.col, gap: 10 }, children: pools.map((pool) => jsx(PoolCard, { ctl, pool, nowSec, page }, poolKey(pool))) }, "pools")
+						: jsx(Empty, { children: t("accountsNoPools") }, "none"),
+				],
+			}, "pools"),
+			jsxs(Section, {
+				title: t("accountsProfilesTitle"),
+				sub: page ? t("accountsProfilesSub") : null,
+				children: [
+					jsx(ProfileMatrix, { ctl, data, page }, "m"),
+					jsx("span", { style: { ...UI.tiny, lineHeight: 1.45 }, children: t("accountsFallbackNote") }, "fb"),
+				],
+			}, "profiles"),
+			jsxs(Section, {
+				title: t("accountsSigninTitle"),
+				sub: needsYou.length ? t("accountsSigninSub", needsYou.length) : null,
+				children: [
+					needsYou.length
+						? jsx(List, { children: shown.map((item) => jsx(UnavailableRow, { item, nowSec, used: isUsed(item) }, item.provider)) }, "list")
+						: jsx(Empty, { children: t("accountsAllSignedIn") }, "none"),
+					folded.length
+						? jsxs("details", {
+								children: [
+									jsx("summary", { className: "cursor-pointer select-none", style: UI.faint, children: t("accountsMoreSignin", folded.length) }, "s"),
+									jsx("div", { style: { marginTop: 6 }, children: jsx(List, { children: folded.map((item) => jsx(UnavailableRow, { item, nowSec, used: isUsed(item) }, item.provider)) }) }, "l"),
+								],
+							}, "more")
+						: null,
+					other.length
+						? jsxs("details", {
+								children: [
+									jsx("summary", { className: "cursor-pointer select-none", style: UI.faint, children: t("accountsOtherUnavailable", other.length) }, "s"),
+									jsx("div", { style: { marginTop: 6 }, children: jsx(List, { children: other.map((item) => jsx(UnavailableRow, { item, nowSec }, item.provider)) }) }, "l"),
+								],
+							}, "other")
+						: null,
+				],
+			}, "signin"),
+			jsx("div", {
+				"data-accounts-limits": true,
+				style: { ...UI.tiny, lineHeight: 1.45 },
+				children: t("accountsLimits"),
+			}, "limits"),
+			jsx(AccountsConfirm, { ctl }, "confirm"),
+		],
+	});
 }
 
 // ---- locale bundles (en + tr) ---------------------------------------------
@@ -5301,6 +6272,113 @@ const I18N_EN = {
 	tab_health: "Health",
 	tab_usage: "Usage",
 	tab_kanban: "Kanban",
+	tab_accounts: "Accounts",
+	accountsTabLabel: "Accounts tab",
+	accountsTabHint: "Credential pools, account order, pool strategy, fallbacks and sign-in gaps. Hide it if you never change accounts.",
+	accountsExplainer: "Hermes picks a credential from a provider's pool. Profiles without their own login share the default profile's pool, so its order applies to all of them; the strategy is set per profile. Changes run Hermes' own CLI after you confirm.",
+	accountsPoolsTitle: "Credential pools",
+	accountsPoolsSub: (n) => `${n} pool${n === 1 ? "" : "s"}`,
+	accountsNoPools: "No pooled credentials yet. Sign in below or run `hermes auth add <provider>`.",
+	accountsSharedPool: (n) => `shared · ${n} profiles`,
+	accountsSharedTip: (list) => `Used by: ${list}`,
+	accountsOwnPool: (owner) => `own pool · ${owner}`,
+	accountsCount: (n) => `${n} account${n === 1 ? "" : "s"}`,
+	accountsProviderQuota: (label, used) => `Provider quota (the account in use): ${label} ${used}% used`,
+	accountsListAria: (name) => `${name} accounts, in the order Hermes tries them`,
+	accountsRowAria: (n, label) => `${n}. ${label}. Alt+Up / Alt+Down to move`,
+	accountsRingLabel: (label, left) => `${label}: ${left}% left`,
+	accountsRingNone: "No quota reading for this account",
+	accountsTriedFirst: "tried first",
+	accountsTriedFirstTip: "First available account in this order — fill_first uses it until it runs out.",
+	accountsTypeOauth: "OAuth",
+	accountsTypeKey: "API key",
+	accountsTypeOther: "other",
+	accountsSourceTip: "Where Hermes got this credential",
+	accountsStatus_active: "active",
+	accountsStatus_cooldown: "cooldown",
+	accountsStatus_exhausted: "exhausted",
+	accountsStatusUntil: (status, left) => `${status} · ${left}`,
+	accountsCooldownModels: (models) => `Cooling down: ${models}`,
+	accountsMoveUp: (label) => `Move ${label} up`,
+	accountsMoveDown: (label) => `Move ${label} down`,
+	accountsDragHint: "Drag a row, or use ▲▼ / Alt+↑↓, to change which account is tried first.",
+	accountsNotWritable: "This pool can't be reordered from here (a row has no pool id).",
+	accountsSingle: "One account — nothing to order. Add another with `hermes auth add <provider>`.",
+	accountsBlocked_loading: "Refreshing account data… changes are paused until it is current.",
+	accountsBlocked_stale: "Account data is out of date — refresh before changing anything.",
+	accountsBlocked_busy: "Applying a change…",
+	accountsBlocked_confirm: "Confirm or cancel the pending change first.",
+	accountsSharedWarning: (owner, others) => `Shared pool of “${owner}”: reordering also changes ${others || "no other profile"}.`,
+	accountsStrategyTitle: "Strategy per profile",
+	strategy_fill_first: "Fill first",
+	strategy_round_robin: "Round robin",
+	strategy_least_used: "Least used",
+	strategy_random: "Random",
+	strategyShort_fill_first: "Fill",
+	strategyShort_round_robin: "Rotate",
+	strategyShort_least_used: "Least",
+	strategyShort_random: "Random",
+	strategyHint_fill_first: "Use the first account until it is exhausted, then the next (order matters).",
+	strategyHint_round_robin: "Cycle through the accounts evenly (order only breaks ties).",
+	strategyHint_least_used: "Always pick the least-used account.",
+	strategyHint_random: "Pick an account at random.",
+	accountsProfilesTitle: "Profiles",
+	accountsProfilesSub: "pool access · strategy · model → fallbacks",
+	accountsProfileCol: "Profile",
+	accountsChainCol: "Model → fallbacks",
+	accountsRootTag: "root",
+	accountsAccess_own: "own",
+	accountsAccess_shared: "shared",
+	accountsPrimaryTip: "Primary model",
+	accountsFallbackTip: (n) => `Fallback #${n}`,
+	accountsCustomRoute: "custom endpoint",
+	accountsNoModel: "no model set",
+	accountsFallbackCopyTip: "Copy — Hermes edits the fallback chain only in its interactive picker (or Settings ▸ Model ▸ Fallbacks for the profile selected there).",
+	accountsFallbackEdit: "Copy fallback command",
+	accountsFallbackNote: "Fallback order is read-only here: Hermes has no non-interactive reorder. Copy the command and run it in a terminal.",
+	accountsSigninTitle: "Not signed in",
+	accountsSigninSub: (n) => `${n} need attention`,
+	accountsAllSignedIn: "Every provider the quota cache knows is signed in.",
+	accountsOtherUnavailable: (n) => `${n} temporarily unavailable`,
+	accountsMoreSignin: (n) => `${n} more without a login`,
+	accountsUsed: "in use",
+	accountsUsedTip: "A profile's model or fallback uses this provider",
+	accountsKind_signin: "not signed in",
+	accountsKind_reauth: "sign in again",
+	accountsKind_optin: "off",
+	accountsKind_rate_limited: "rate-limited",
+	accountsKind_error: "unavailable",
+	accountsReason_signin: (reason, tool) => tool ? `No login found (${reason}). Sign in with ${tool}.` : `No login found (${reason}).`,
+	accountsReason_reauth: (reason) => `The saved login no longer works (${reason}).`,
+	accountsReason_optin: (reason, tool) => `Turned off in the quota plugin (${reason}). Enable it to read ${tool || "this provider"}.`,
+	accountsReason_rate_limited: () => "The provider is rate-limiting quota reads. No sign-in needed.",
+	accountsReason_error: (reason) => `Last read failed (${reason}). It is retried on the next refresh.`,
+	accountsRetryIn: (left) => `retry in ${left}`,
+	accountsRetrySoon: "retry on the next refresh",
+	accountsSigninAction: "Sign in",
+	accountsAddKeyAction: "Add API key",
+	accountsReason_key: (reason) => `No API key found (${reason}).`,
+	accountsReauthAction: "Sign in again",
+	accountsOptinAction: "Enable",
+	accountsCopyTip: "Copy this command and run it in a terminal (sign-ins open a browser, so they can't run from here)",
+	accountsLimits: "Hermes has no per-profile account assignment: a profile uses the shared pool unless it has its own login (`hermes -p <profile> auth add <provider>`). Order belongs to the pool, strategy to the profile. Nothing here moves or copies credentials between profiles.",
+	accountsConfirmOrderTitle: (name) => `Change the ${name} account order?`,
+	accountsConfirmOrderShared: (owner, n) => `This is the shared pool owned by “${owner}”. The new order applies to all ${n} profiles that use it.`,
+	accountsConfirmOrderOwn: (owner) => `Only “${owner}” uses this pool.`,
+	accountsConfirmBefore: "Now",
+	accountsConfirmAfter: "After",
+	accountsConfirmFirst: (label) => `Tried first under fill_first: ${label}.`,
+	accountsConfirmProfiles: (list) => `Affects: ${list}`,
+	accountsConfirmStrategyTitle: (profile, name) => `Change ${profile}'s ${name} strategy?`,
+	accountsConfirmStrategyDesc: (profile) => `Only “${profile}” changes; other profiles keep their own strategy.`,
+	accountsConfirmApply: "Apply",
+	accountsConfirmBusy: "Applying…",
+	accountsConfirmCancel: "Cancel",
+	accountsSavedOrder: (name) => `${name} account order saved`,
+	accountsSavedStrategy: (profile, s) => `${profile}: strategy set to ${s}`,
+	accountsWriteUnsupported: "The gateway's quota plugin is older and can't change accounts yet — update it.",
+	accountsUnsupported: "This gateway's quota plugin predates the Accounts view — update the backend.",
+	accountsError: "Couldn't read the account data.",
 	monitorOff: "The agent monitor is off — turn it on in Settings.",
 	monitorUnsupported:
 		"This gateway's quota plugin has no agent monitor yet — update it (./install.sh) to see live sessions, health, usage and kanban.",
@@ -5580,6 +6658,113 @@ const I18N_TR = {
 	tab_health: "Sağlık",
 	tab_usage: "Kullanım",
 	tab_kanban: "Kanban",
+	tab_accounts: "Hesaplar",
+	accountsTabLabel: "Hesaplar sekmesi",
+	accountsTabHint: "Kimlik havuzları, hesap sırası, havuz stratejisi, yedekler ve giriş eksikleri. Hesap değiştirmiyorsan gizleyebilirsin.",
+	accountsExplainer: "Hermes bir sağlayıcının havuzundan bir kimlik seçer. Kendi girişi olmayan profiller default profilin havuzunu paylaşır; sıralama hepsine uygulanır, strateji ise profil başınadır. Değişiklikler sen onaylayınca Hermes'in kendi CLI'ı ile yapılır.",
+	accountsPoolsTitle: "Kimlik havuzları",
+	accountsPoolsSub: (n) => `${n} havuz`,
+	accountsNoPools: "Henüz havuzda kimlik yok. Aşağıdan giriş yap ya da `hermes auth add <sağlayıcı>` çalıştır.",
+	accountsSharedPool: (n) => `paylaşılan · ${n} profil`,
+	accountsSharedTip: (list) => `Kullananlar: ${list}`,
+	accountsOwnPool: (owner) => `kendi havuzu · ${owner}`,
+	accountsCount: (n) => `${n} hesap`,
+	accountsProviderQuota: (label, used) => `Sağlayıcı kotası (kullanılan hesap): ${label} %${used} kullanıldı`,
+	accountsListAria: (name) => `${name} hesapları, Hermes'in deneme sırasıyla`,
+	accountsRowAria: (n, label) => `${n}. ${label}. Taşımak için Alt+Yukarı / Alt+Aşağı`,
+	accountsRingLabel: (label, left) => `${label}: %${left} kaldı`,
+	accountsRingNone: "Bu hesap için kota okuması yok",
+	accountsTriedFirst: "ilk denenen",
+	accountsTriedFirstTip: "Bu sıradaki ilk kullanılabilir hesap — fill_first bitene kadar onu kullanır.",
+	accountsTypeOauth: "OAuth",
+	accountsTypeKey: "API anahtarı",
+	accountsTypeOther: "diğer",
+	accountsSourceTip: "Hermes'in bu kimliği nereden aldığı",
+	accountsStatus_active: "aktif",
+	accountsStatus_cooldown: "beklemede",
+	accountsStatus_exhausted: "tükendi",
+	accountsStatusUntil: (status, left) => `${status} · ${left}`,
+	accountsCooldownModels: (models) => `Beklemede: ${models}`,
+	accountsMoveUp: (label) => `${label} yukarı taşı`,
+	accountsMoveDown: (label) => `${label} aşağı taşı`,
+	accountsDragHint: "İlk denenecek hesabı değiştirmek için satırı sürükle ya da ▲▼ / Alt+↑↓ kullan.",
+	accountsNotWritable: "Bu havuz buradan sıralanamaz (bir satırın havuz kimliği yok).",
+	accountsSingle: "Tek hesap — sıralanacak bir şey yok. Bir tane daha eklemek için `hermes auth add <sağlayıcı>`.",
+	accountsBlocked_loading: "Hesap verisi yenileniyor… güncel olana kadar değişiklikler durduruldu.",
+	accountsBlocked_stale: "Hesap verisi eski — bir şey değiştirmeden önce yenile.",
+	accountsBlocked_busy: "Değişiklik uygulanıyor…",
+	accountsBlocked_confirm: "Önce bekleyen değişikliği onayla ya da vazgeç.",
+	accountsSharedWarning: (owner, others) => `“${owner}” profilinin paylaşılan havuzu: sıralama ${others || "başka hiçbir profili"} de değiştirir.`,
+	accountsStrategyTitle: "Profil başına strateji",
+	strategy_fill_first: "Önce doldur",
+	strategy_round_robin: "Sırayla",
+	strategy_least_used: "En az kullanılan",
+	strategy_random: "Rastgele",
+	strategyShort_fill_first: "Doldur",
+	strategyShort_round_robin: "Sırayla",
+	strategyShort_least_used: "En az",
+	strategyShort_random: "Rastgele",
+	strategyHint_fill_first: "İlk hesabı bitene kadar kullan, sonra sıradakine geç (sıra önemli).",
+	strategyHint_round_robin: "Hesaplar arasında eşit dönüşümlü kullan (sıra yalnızca eşitliği bozar).",
+	strategyHint_least_used: "Her zaman en az kullanılan hesabı seç.",
+	strategyHint_random: "Rastgele bir hesap seç.",
+	accountsProfilesTitle: "Profiller",
+	accountsProfilesSub: "havuz erişimi · strateji · model → yedekler",
+	accountsProfileCol: "Profil",
+	accountsChainCol: "Model → yedekler",
+	accountsRootTag: "kök",
+	accountsAccess_own: "kendi",
+	accountsAccess_shared: "paylaşılan",
+	accountsPrimaryTip: "Ana model",
+	accountsFallbackTip: (n) => `Yedek #${n}`,
+	accountsCustomRoute: "özel uç nokta",
+	accountsNoModel: "model ayarlı değil",
+	accountsFallbackCopyTip: "Kopyala — Hermes yedek zincirini yalnızca etkileşimli seçicide düzenler (ya da Ayarlar ▸ Model ▸ Yedekler'de, orada seçili profil için).",
+	accountsFallbackEdit: "Yedek komutunu kopyala",
+	accountsFallbackNote: "Yedek sırası burada salt okunur: Hermes'te etkileşimsiz yeniden sıralama yok. Komutu kopyalayıp terminalde çalıştır.",
+	accountsSigninTitle: "Giriş yapılmamış",
+	accountsSigninSub: (n) => `${n} ilgi bekliyor`,
+	accountsAllSignedIn: "Kota önbelleğinin bildiği her sağlayıcıda giriş yapılmış.",
+	accountsOtherUnavailable: (n) => `${n} geçici olarak kullanılamıyor`,
+	accountsMoreSignin: (n) => `girişi olmayan ${n} sağlayıcı daha`,
+	accountsUsed: "kullanımda",
+	accountsUsedTip: "Bir profilin modeli ya da yedeği bu sağlayıcıyı kullanıyor",
+	accountsKind_signin: "giriş yok",
+	accountsKind_reauth: "yeniden giriş",
+	accountsKind_optin: "kapalı",
+	accountsKind_rate_limited: "hız sınırı",
+	accountsKind_error: "kullanılamıyor",
+	accountsReason_signin: (reason, tool) => tool ? `Giriş bulunamadı (${reason}). ${tool} ile giriş yap.` : `Giriş bulunamadı (${reason}).`,
+	accountsReason_reauth: (reason) => `Kayıtlı giriş artık çalışmıyor (${reason}).`,
+	accountsReason_optin: (reason, tool) => `Kota eklentisinde kapalı (${reason}). ${tool || "Bu sağlayıcıyı"} okumak için aç.`,
+	accountsReason_rate_limited: () => "Sağlayıcı kota okumalarını sınırlıyor. Giriş gerekmiyor.",
+	accountsReason_error: (reason) => `Son okuma başarısız (${reason}). Bir sonraki yenilemede tekrar denenir.`,
+	accountsRetryIn: (left) => `${left} sonra tekrar`,
+	accountsRetrySoon: "bir sonraki yenilemede tekrar",
+	accountsSigninAction: "Giriş yap",
+	accountsAddKeyAction: "API anahtarı ekle",
+	accountsReason_key: (reason) => `API anahtarı bulunamadı (${reason}).`,
+	accountsReauthAction: "Yeniden giriş yap",
+	accountsOptinAction: "Aç",
+	accountsCopyTip: "Bu komutu kopyala ve terminalde çalıştır (girişler tarayıcı açar, buradan çalıştırılamaz)",
+	accountsLimits: "Hermes'te profile hesap atama yok: bir profil kendi girişi olmadıkça paylaşılan havuzu kullanır (`hermes -p <profil> auth add <sağlayıcı>`). Sıra havuza, strateji profile aittir. Burada hiçbir kimlik profiller arasında taşınmaz ya da kopyalanmaz.",
+	accountsConfirmOrderTitle: (name) => `${name} hesap sırası değişsin mi?`,
+	accountsConfirmOrderShared: (owner, n) => `Bu, “${owner}” profilinin paylaşılan havuzu. Yeni sıra onu kullanan ${n} profilin hepsine uygulanır.`,
+	accountsConfirmOrderOwn: (owner) => `Bu havuzu yalnızca “${owner}” kullanıyor.`,
+	accountsConfirmBefore: "Şimdi",
+	accountsConfirmAfter: "Sonra",
+	accountsConfirmFirst: (label) => `fill_first ile ilk denenen: ${label}.`,
+	accountsConfirmProfiles: (list) => `Etkilenen: ${list}`,
+	accountsConfirmStrategyTitle: (profile, name) => `${profile} için ${name} stratejisi değişsin mi?`,
+	accountsConfirmStrategyDesc: (profile) => `Yalnızca “${profile}” değişir; diğer profiller kendi stratejisini korur.`,
+	accountsConfirmApply: "Uygula",
+	accountsConfirmBusy: "Uygulanıyor…",
+	accountsConfirmCancel: "Vazgeç",
+	accountsSavedOrder: (name) => `${name} hesap sırası kaydedildi`,
+	accountsSavedStrategy: (profile, s) => `${profile}: strateji ${s} oldu`,
+	accountsWriteUnsupported: "Ağ geçidindeki kota eklentisi eski, hesapları henüz değiştiremiyor — güncelle.",
+	accountsUnsupported: "Bu ağ geçidinin kota eklentisi Hesaplar görünümünden eski — arka ucu güncelle.",
+	accountsError: "Hesap verisi okunamadı.",
 	monitorOff: "Ajan izleme kapalı — Ayarlar'dan açabilirsin.",
 	monitorUnsupported:
 		"Bu gateway'deki kota eklentisinde ajan izleme yok — canlı oturumlar, sağlık, kullanım ve kanban için güncelle (./install.sh).",
