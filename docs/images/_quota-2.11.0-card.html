@@ -1,13 +1,6 @@
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<style>
-  :root{
-    --bg:#070b10; --panel:#0d131a; --stroke:#1f2a35; --text:#e6edf5;
-    --muted:#8a99ab; --dim:#5a6b7d; --teal:#2dd4bf; --violet:#8b5cf6;
-    --green:#34d399; --amber:#fbbf24; --red:#f87171;
-  }
+<!doctype html><html lang="en"><head><meta charset="utf-8"><style>
+  :root{--bg:#070b10;--panel:#0d131a;--stroke:#1f2a35;--text:#e6edf5;--muted:#8a99ab;
+    --dim:#5a6b7d;--teal:#2dd4bf;--violet:#8b5cf6;--green:#34d399;--amber:#fbbf24;--red:#f87171}
   *{box-sizing:border-box}
   html,body{margin:0;width:1600px;height:900px;overflow:hidden;background:var(--bg);
     font-family:"Noto Sans","DejaVu Sans",sans-serif;color:var(--text)}
@@ -43,21 +36,12 @@
     border:1px solid #1f4b45;background:#0b1a19;border-radius:6px;padding:4px 9px}
   pre{margin:0;padding:26px 28px 30px;font-family:"DejaVu Sans Mono",monospace;font-size:20px;
     line-height:1.52;color:#c9d6e4;white-space:pre}
-  .b{color:#f1f5f9;font-weight:700}
-  .m{color:#8a99ab}
-  .d{color:#5a6b7d}
-  .t{color:#5eead4}
-  .v{color:#c4b5fd}
-  .g{color:var(--green)} .a{color:var(--amber)} .r{color:var(--red)}
-  .e{color:#334155}
-  .num{color:#f8fafc;font-weight:700}
+  .b{color:#f1f5f9;font-weight:700}.m{color:#8a99ab}.d{color:#5a6b7d}.t{color:#5eead4}
+  .g{color:var(--green)}.a{color:var(--amber)}.r{color:var(--red)}.e{color:#334155}
   footer{position:absolute;left:72px;right:72px;bottom:46px;display:flex;align-items:center;
     font-family:"DejaVu Sans Mono",monospace;font-size:15px;color:#74879a}
-  footer .repo{color:#a7f3d0}
-  footer .sep{margin:0 12px;color:#334155}
-  footer .right{margin-left:auto;color:#5a6b7d}
-</style>
-</head>
+  footer .repo{color:#a7f3d0}footer .sep{margin:0 12px;color:#334155}footer .right{margin-left:auto;color:#5a6b7d}
+</style></head>
 <body>
   <div class="glow g1"></div><div class="glow g2"></div><div class="grid"></div>
   <header>
@@ -68,21 +52,17 @@
   <main>
     <section>
       <h1>All your AI quotas.<br><span class="grad">One clean read.</span></h1>
-      <p class="sub">/quota shows only the providers you actually have, the worst quota first, with what is left at a glance.</p>
-      <ul class="chips">
-        <li>only providers with an account</li>
-        <li>worst quota first, one bar per window</li>
-        <li>Codex special-reset estimate in the same view</li>
-      </ul>
+      <p class="sub">/quota lists only the providers you actually have, shows what is left as bars, worst quota first.</p>
+      <ul class="chips"><li>only providers with an account</li><li>worst quota first, one bar per window</li><li>Codex special-reset estimate</li></ul>
     </section>
     <section class="term">
       <div class="bar"><span class="dots">●●●</span><span class="title">hermes quota</span><span class="tag">2.11.0</span></div>
       <pre>📊 <span class="b">Quota</span> <span class="d">·</span> <span class="m">updated 2m ago</span>
 
-✨ <span class="t">Codex special reset</span> <span class="d">·</span> <span class="m">scheduled Oct 22 18:00</span> <span class="d">·</span> <span class="d">codex-resets.com</span>
+✨ <span class="t">Codex special reset</span> <span class="d">·</span> <span class="a">scheduled Oct 22 18:00</span> <span class="d">·</span> <span class="d">codex-resets.com</span>
 
-<span class="b">OpenAI Codex · ronaldrj@gmail.com</span> <span class="m">(Pro 100)</span>
-  Weekly             <span class="e">░░░░░░░░░░</span>   <span class="r">1%</span> <span class="m">left · resets in 4d 17h</span>
+<span class="b">OpenAI Codex · Work</span> <span class="m">(Pro 100)</span>
+  Weekly             <span class="r"></span><span class="e">░░░░░░░░░░</span>   <span class="r">1%</span> <span class="m">left · resets in 4d 17h</span>
 
 <span class="b">xAI Grok</span>
   Weekly Limit       <span class="a">█</span><span class="e">░░░░░░░░░</span>  <span class="a">14%</span> <span class="m">left · resets in 16h 42m</span>
@@ -95,10 +75,7 @@
   Current session    <span class="g">████████</span><span class="e">░░</span>  <span class="g">84%</span> <span class="m">left · resets in 4h 17m</span></pre>
     </section>
   </main>
-  <footer>
-    <span class="repo">github.com/rarf/hermes-quota-plugin</span>
+  <footer><span class="repo">github.com/rarf/hermes-quota-plugin</span>
     <span class="sep">·</span><span>local credentials only</span>
-    <span class="right">CLI · Desktop · TUI</span>
-  </footer>
-</body>
-</html>
+    <span class="right">CLI · Desktop · TUI</span></footer>
+</body></html>
