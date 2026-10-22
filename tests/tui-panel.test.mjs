@@ -283,6 +283,20 @@ test('special reset formats in the cache timezone, not the renderer zone', async
   assert.ok(specialResetModel(cache, now)); // unknown zone falls back, never hides
 });
 
+test('special reset shows the scheduled estimate instead of the post time', async () => {
+  const { specialResetModel, specialNoticeText } = await import(source);
+  const cache = specialCache({ id: 'r1', status: 'scheduled', reset_type: 'regular',
+    announced_at: '2026-10-22T06:55:54Z', scheduled_for: '2026-10-22T17:00:00Z',
+    source_url: SPECIAL_SOURCE });
+  cache.timezone = 'Europe/Lisbon';
+  const now = Date.parse('2026-10-22T12:00:00Z');
+  assert.equal(specialResetModel(cache, now).date, '22/10 18:00');
+  assert.match(specialNoticeText(cache, now), /22\/10 18:00/);
+  // A malformed estimate falls back to the publication time, never hides.
+  cache.codex_special_reset.announcement.scheduled_for = 'not-a-time';
+  assert.equal(specialResetModel(cache, now).date, '22/10 07:55');
+});
+
 test('special reset line keeps quota at 80 cols and shows announced date, state and credit', async () => {
   const { lineModel } = await import(source);
   const now = Date.parse('2026-10-22T12:00:00Z');

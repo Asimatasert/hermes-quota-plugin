@@ -16,7 +16,7 @@ See [TUI setup and commands](tui-panel.md).
 
 ```
 📊 Quota · updated 2m ago
-✨ Codex special reset · announced Oct 22 07:55 · scheduled · codex-resets.com
+✨ Codex special reset · scheduled Oct 22 18:00 · announced 07:55 · codex-resets.com
 
 Anthropic · Conta 2 (Team)
   Current session    ░░░░░░░░░░    0% left · resets in 1h 6m
@@ -30,9 +30,10 @@ Antigravity (Google AI Pro)
 ```
 
 - Friendly provider names and account labels, mirroring the Desktop/TUI tables.
-- A one-line **Codex special-reset announcement** when one is published — it is
-  announcement metadata, never an account allowance, so it never changes a
-  provider's bar. See [Codex special-reset announcements](codex-special-reset.md).
+- A one-line **Codex special-reset announcement** when one is published — the
+  publisher's scheduled estimate plus the post time. It is announcement
+  metadata, never an account allowance, so it never changes a provider's bar.
+  See [Codex special-reset announcements](codex-special-reset.md).
 - One bar per real meter, filled by what is **left**; the reset is relative while
   it is under a week away.
 - Blocks are sorted by the lowest remaining quota, so the provider that needs

@@ -109,6 +109,7 @@ class SelectionTests(unittest.TestCase):
             "status": "scheduled",
             "reset_type": "regular",
             "announced_at": "2026-10-21T09:30:00+00:00",
+            "scheduled_for": None,
             "source_url": "https://x.com/thsottiaux/status/1234567890123456789",
         })
 
@@ -161,7 +162,7 @@ class SelectionTests(unittest.TestCase):
         self.assertIsNone(module().select_announcement(payload(observed, None)))
         self.assertIsNone(module().select_announcement(payload(None, None)))
 
-    def test_output_ignores_text_schedule_forecast_and_statistics(self):
+    def test_output_keeps_the_schedule_but_ignores_text_and_statistics(self):
         scheduled = record("sched-2", status="scheduled")
         scheduled["scheduled_for"] = "2026-10-21T10:00:00+00:00"
         scheduled["text"] = "\x1b[31mcontrol characters\x07"
@@ -170,8 +171,14 @@ class SelectionTests(unittest.TestCase):
         chosen = module().select_announcement(payload(None, scheduled))
 
         self.assertEqual(set(chosen), {
-            "id", "status", "reset_type", "announced_at", "source_url",
+            "id", "status", "reset_type", "announced_at", "scheduled_for",
+            "source_url",
         })
+        # The publisher's estimate is carried, but the record stays scheduled:
+        # a scheduled time is not evidence that the reset ran.
+        self.assertEqual(chosen["scheduled_for"], "2026-10-21T10:00:00+00:00")
+        self.assertEqual(chosen["status"], "scheduled")
+        self.assertNotIn("control characters", repr(chosen))
 
     def test_wrong_api_version_is_a_schema_error(self):
         body = payload(None, None)
@@ -198,6 +205,7 @@ class ValidationTests(unittest.TestCase):
                 "status": "recorded",
                 "reset_type": "regular",
                 "announced_at": "2026-10-20T18:04:05+00:00",
+                "scheduled_for": None,
                 "source_url": bad_url,
             },
             "fetched_at": "2026-10-22T10:00:00+00:00",
@@ -248,6 +256,7 @@ class FetchCacheTests(_TempState):
                 "status": "recorded",
                 "reset_type": "banked",
                 "announced_at": "2026-10-20T18:04:05+00:00",
+                "scheduled_for": None,
                 "source_url": "https://x.com/thsottiaux/status/1234567890123456789",
             },
             "fetched_at": stamp(now),
@@ -491,6 +500,7 @@ class _CacheIntegration(unittest.TestCase):
             "announcement": {
                 "id": "reset-9", "status": "recorded", "reset_type": "regular",
                 "announced_at": "2026-10-20T18:04:05+00:00",
+                "scheduled_for": None,
                 "source_url": "https://x.com/thsottiaux/status/123",
             },
             "fetched_at": "2026-10-22T10:00:00+00:00",
@@ -583,6 +593,7 @@ class _CacheIntegration(unittest.TestCase):
             "announcement": {
                 "id": "disk-reset", "status": "scheduled", "reset_type": "regular",
                 "announced_at": "2026-10-21T09:30:00+00:00",
+                "scheduled_for": None,
                 "source_url": "https://x.com/thsottiaux/status/456",
             },
             "fetched_at": "2026-10-22T11:00:00+00:00",
@@ -727,6 +738,7 @@ class CliStatusContract(unittest.TestCase):
             "announcement": {
                 "id": "reset-10", "status": "scheduled", "reset_type": "regular",
                 "announced_at": "2026-10-21T09:30:00+00:00",
+                "scheduled_for": None,
                 "source_url": "https://x.com/thsottiaux/status/789",
             },
             "fetched_at": "2026-10-22T10:00:00+00:00",
@@ -759,6 +771,7 @@ class CliStatusContract(unittest.TestCase):
             "announcement": {
                 "id": "evil", "status": "recorded", "reset_type": "regular",
                 "announced_at": "2026-10-21T09:30:00+00:00",
+                "scheduled_for": None,
                 "source_url": "https://example.com/thsottiaux/status/789",
             },
             "fetched_at": "2026-10-22T10:00:00+00:00",
@@ -776,6 +789,7 @@ class CliStatusContract(unittest.TestCase):
             "announcement": {
                 "id": "reset-12", "status": "recorded", "reset_type": "regular",
                 "announced_at": "2026-10-21T09:30:00+00:00",
+                "scheduled_for": None,
                 "source_url": "https://x.com/thsottiaux/status/789",
             },
             "fetched_at": None,

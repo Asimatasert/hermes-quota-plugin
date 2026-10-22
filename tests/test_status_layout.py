@@ -230,6 +230,24 @@ class QuotaLayoutTests(unittest.TestCase):
             "Oct 22 15:55",
         )
 
+    def test_special_reset_prefers_the_scheduled_estimate_over_the_post_time(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        cmd, _plugin = _modules()
+        cache = self.cache({"openai-codex": record("openai-codex", [window()])})
+        entry = self.special()
+        entry["announcement"]["scheduled_for"] = "2026-10-22T17:00:00+00:00"
+        cache["codex_special_reset"] = entry
+        with mock.patch.object(cmd, "local_tz", return_value=ZoneInfo("Europe/Lisbon")):
+            line = cmd._special_reset_line(cache)
+        self.assertIn("scheduled Oct 22 18:00", line)
+        self.assertIn("announced 07:55", line)
+        self.assertEqual(
+            datetime.fromisoformat("2026-10-22T17:00:00+00:00")
+            .astimezone(ZoneInfo("Europe/Lisbon")).strftime("%b %d %H:%M"),
+            "Oct 22 18:00",
+        )
+
     def test_banked_special_reset_keeps_its_own_wording(self):
         cache = self.cache({"openai-codex": record("openai-codex", [window()])})
         entry = self.special()

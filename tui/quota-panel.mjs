@@ -151,13 +151,19 @@ export function specialResetModel(cache, now = Date.now()) {
   // Format in the user's configured zone (cache root) so a gateway or
   // renderer running under another TZ cannot shift the announcement hour.
   const zone = safeZone(cache?.timezone);
-  const fields = zoneParts(date, zone);
+  // The publisher's scheduled estimate is the actionable time; the announced
+  // timestamp only says when the post appeared.
+  const scheduledMs = typeof announcement.scheduled_for === 'string'
+    ? Date.parse(announcement.scheduled_for) : NaN;
+  const primary = Number.isFinite(scheduledMs) ? scheduledMs : time;
+  const fields = zoneParts(new Date(primary), zone);
   const nowFields = zoneParts(new Date(now), zone);
   const fetched = typeof root.fetched_at === 'string' ? Date.parse(root.fetched_at) : NaN;
   const year = fields.year === nowFields.year ? '' : `/${fields.year}`;
   return {
     id: clean(announcement.id), status, resetType,
     announcedAt, sourceUrl: announcement.source_url,
+    scheduled: Number.isFinite(scheduledMs),
     stale: root.stale !== false || !Number.isFinite(fetched),
     date: `${fields.day}/${fields.month}${year} ${fields.hour}:${fields.minute}`,
   };

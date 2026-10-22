@@ -93,6 +93,9 @@ def _announcement(value: Any, status: str) -> Optional[dict[str, Any]]:
     reset_id = _clean_text(value.get("id"), 64)
     reset_type = value.get("reset_type")
     announced_at = _iso_utc(value.get("announced_at"))
+    # The publisher's own estimate of when the reset lands. It is announcement
+    # metadata, not evidence that the reset ran; status stays "scheduled".
+    scheduled_for = _iso_utc(value.get("scheduled_for")) if status == "scheduled" else None
     source = value.get("source")
     if not reset_id or reset_type not in ("regular", "banked") or announced_at is None:
         return None
@@ -108,6 +111,7 @@ def _announcement(value: Any, status: str) -> Optional[dict[str, Any]]:
         "status": status,
         "reset_type": reset_type,
         "announced_at": announced_at,
+        "scheduled_for": scheduled_for,
         "source_url": source_url,
     }
 
@@ -115,8 +119,9 @@ def _announcement(value: Any, status: str) -> Optional[dict[str, Any]]:
 def select_announcement(payload: Any) -> Optional[dict[str, Any]]:
     """Pick a valid explicit announcement, scheduled first, else latest.
 
-    ``text``, ``scheduled_for``, forecasts and statistics are intentionally
-    ignored: an elapsed schedule does not prove that a reset ran.
+    ``text``, forecasts and statistics are intentionally ignored. The
+    publisher's ``scheduled_for`` is kept as an announced estimate; it never
+    proves that a reset ran, so the record stays ``scheduled``.
     """
     if not isinstance(payload, dict):
         raise SpecialResetError("schema")
@@ -178,6 +183,9 @@ def normalize_entry(value: Any) -> dict[str, Any]:
                 "status": status,
                 "reset_type": reset_type,
                 "announced_at": announced_at,
+                # An announced estimate only; status still carries the state.
+                "scheduled_for": _iso_utc(announcement.get("scheduled_for"))
+                if status == "scheduled" else None,
                 "source_url": source_url,
             }
     fetched_at = _iso_utc(value.get("fetched_at"))

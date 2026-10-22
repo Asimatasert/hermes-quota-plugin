@@ -268,16 +268,25 @@ def _special_reset_line(cache: dict[str, Any]) -> str:
         return ""
     title = "Codex banked reset" if announcement.get("reset_type") == "banked" \
         else "Codex special reset"
-    parts = [
-        f"✨ **{title}**",
+    zone = local_tz()
+    announced_local = announced.astimezone(zone)
+    scheduled = _parse_iso(announcement.get("scheduled_for"))
+    scheduled_local = scheduled.astimezone(zone) if scheduled is not None else None
+    parts = [f"✨ **{title}**"]
+    if scheduled_local is not None:
+        # The publisher's estimate is the actionable time; the announcement
+        # timestamp is when the post appeared.
+        parts.append(f"scheduled {scheduled_local.strftime('%b %d %H:%M')}")
+        same_day = scheduled_local.date() == announced_local.date()
+        parts.append(f"announced {announced_local.strftime('%H:%M' if same_day else '%b %d %H:%M')}")
+    else:
         # Date and time: an announcement without the hour is not actionable.
-        f"announced {announced.astimezone(local_tz()).strftime('%b %d %H:%M')}",
-    ]
-    status = announcement.get("status")
-    if status == "scheduled":
-        parts.append("scheduled")
-    elif status == "recorded":
-        parts.append("recorded")
+        parts.append(f"announced {announced_local.strftime('%b %d %H:%M')}")
+        status = announcement.get("status")
+        if status == "scheduled":
+            parts.append("scheduled")
+        elif status == "recorded":
+            parts.append("recorded")
     if entry.get("stale") is not False:
         parts.append("stale")
     parts.append("codex-resets.com")

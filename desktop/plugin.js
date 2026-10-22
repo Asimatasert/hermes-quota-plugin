@@ -722,6 +722,8 @@ function codexSpecial(data) {
 		const zone = typeof data.timezone === "string" ? data.timezone : "";
 		const announced = announcedDate(value.announced_at, zone);
 		if (!announced) return null;
+		const scheduled = typeof value.scheduled_for === "string"
+			? announcedDate(value.scheduled_for, zone) : "";
 		if (typeof value.source_url !== "string" || !SPECIAL_RESET_SOURCE.test(value.source_url)) return null;
 		const checked = typeof root.fetched_at === "string" ? checkedDateTime(root.fetched_at) : "";
 		const fetched = typeof root.fetched_at === "string" ? Date.parse(root.fetched_at) : NaN;
@@ -731,6 +733,7 @@ function codexSpecial(data) {
 			banked: resetType === "banked",
 			typeLabel: resetType === "banked" ? "Banked reset" : "Special reset",
 			announced: `Announced ${announced}`,
+			scheduled: scheduled ? `Scheduled for ${scheduled}` : "",
 			sourceUrl: value.source_url,
 			credit: SPECIAL_RESET_CREDIT,
 			// Missing boolean or malformed success timestamp is not freshness.
@@ -756,6 +759,7 @@ function specialTipLines(special) {
 		`✨ Special reset announcement · ${special.announced}`,
 		`${special.typeLabel} · ${special.statusLabel}`,
 	];
+	if (special.scheduled) lines.push(special.scheduled);
 	if (special.stale) lines.push(special.checked ? `Stale · checked ${special.checked}` : "Stale");
 	lines.push(`Data: ${special.credit}`);
 	if (special.sourceUrl) lines.push(`Source: ${special.sourceUrl}`);
@@ -789,6 +793,12 @@ function SpecialResetNotice({ special }) {
 				className: "text-(--ui-text-tertiary)",
 				children: `${special.announced} · ${special.statusLabel}`,
 			}),
+			special.scheduled
+				? jsx("div", {
+						className: "font-medium text-(--ui-text-secondary)",
+						children: special.scheduled,
+					})
+				: null,
 			special.stale
 				? jsx("div", {
 						className: "text-(--ui-text-quaternary)",

@@ -25,6 +25,7 @@ payload carry one additive root key:
       "status": "scheduled",
       "reset_type": "regular",
       "announced_at": "2026-10-22T06:55:54+00:00",
+      "scheduled_for": "2026-10-22T17:00:00+00:00",
       "source_url": "https://x.com/thsottiaux/status/2113162413008884099"
     },
     "fetched_at": "2026-10-22T10:00:00+00:00",
@@ -40,6 +41,10 @@ payload carry one additive root key:
 - `reset_type` is `regular` or `banked`.
 - `announced_at` is the **publication time** of the announcement, not the time
   a reset ran or was applied.
+- `scheduled_for` is the publisher's **estimate** of when the reset lands
+  (`null` when the source does not publish one). It is displayed as
+  "scheduled …", never as evidence that the reset ran; the record stays
+  `status: scheduled`.
 - `source_url` is always an allowlisted `https://x.com/thsottiaux/status/<id>`
   post from an `x_post` source. Observed-only records, forecasts and statistics
   are rejected.

@@ -101,6 +101,14 @@ class SpecialResetDesktopTests(unittest.TestCase):
         self.assertRegex(rendered, r"0?3:55")  # 06:55Z -> 15:55 Tokyo
         self.assertNotIn("06:55", rendered)
 
+    def test_scheduled_estimate_is_shown_next_to_the_announcement(self):
+        root = special_root(announcement(scheduled_for="2026-10-22T17:00:00Z"))
+        data = payload(root=root, timezone="Europe/Lisbon")
+        rendered = self.pane(data)
+        self.assertIn("Scheduled for Oct 22, 2026", rendered)
+        self.assertRegex(rendered, r"0?6:00")  # 17:00Z -> 18:00 Lisbon
+        self.assertIn("Scheduled for", tooltip_text(self.status(data)))
+
     def test_banked_and_recorded_wording_is_state_not_execution(self):
         root = special_root(announcement(reset_type="banked", status="recorded",
                                         announced_at="2026-10-20T06:33:48Z"))
