@@ -1,12 +1,13 @@
 // Standalone Hermes Ink widget. No credentials or Hermes core imports.
-import { readFile, stat } from 'node:fs/promises';
+import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { execFile } from 'node:child_process';
 
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const clean = value => String(value ?? '').replace(/[\x00-\x1f\x7f-\x9f]/g, '').slice(0, 120);
 const list = value => Array.isArray(value) ? value : [];
+const SELECTOR = /^[a-z0-9][a-z0-9:_#.-]{0,119}$/i;
 
 // Keep these public display names aligned with Desktop PROVIDER_META.
 export const PROVIDER_NAMES = {
@@ -102,6 +103,61 @@ export function meterModel(cache, selector, now = Date.now()) {
 const shorten = (text, limit) => [...text].length <= limit ? text : [...text].slice(0, Math.max(0, limit - 1)).join('') + '…';
 const length = text => [...text].length;
 
+// Third-party aggregator metadata. Only a validated announcement is visible;
+// forecasts, observations and scheduled_for are deliberately ignored. The X
+// source is the verified announcer account, never arbitrary cached text.
+const SPECIAL_SOURCE = /^https:\/\/x\.com\/thsottiaux\/status\/\d+$/;
+
+/** Provider-level announcement from the cache root, or null when unusable. */
+export function specialResetModel(cache, now = Date.now()) {
+  const root = object(cache?.codex_special_reset) ? cache.codex_special_reset : null;
+  const announcement = root && object(root.announcement) ? root.announcement : null;
+  if (!announcement) return null;
+  const status = announcement.status === 'scheduled' || announcement.status === 'recorded' ? announcement.status : '';
+  const resetType = announcement.reset_type === 'regular' || announcement.reset_type === 'banked' ? announcement.reset_type : '';
+  const announcedAt = typeof announcement.announced_at === 'string' ? announcement.announced_at : '';
+  if (!status || !resetType || !announcement.id || typeof announcement.id !== 'string') return null;
+  // Require an explicit timezone so a date-only value cannot be reinterpreted.
+  if (!/(?:Z|[+-]\d{2}:\d{2})$/.test(announcedAt)) return null;
+  const time = Date.parse(announcedAt);
+  if (!Number.isFinite(time)) return null;
+  if (typeof announcement.source_url !== 'string' || !SPECIAL_SOURCE.test(announcement.source_url)) return null;
+  const date = new Date(time);
+  const pad = n => String(n).padStart(2, '0');
+  // A stale flag and a successful fetch timestamp are both required to call
+  // this fresh; missing or malformed metadata is qualified, never assumed.
+  const fetched = typeof root.fetched_at === 'string' ? Date.parse(root.fetched_at) : NaN;
+  const year = date.getFullYear() === new Date(now).getFullYear() ? '' : `/${date.getFullYear()}`;
+  return {
+    id: clean(announcement.id), status, resetType,
+    announcedAt, sourceUrl: announcement.source_url,
+    stale: root.stale !== false || !Number.isFinite(fetched),
+    date: `${pad(date.getDate())}/${pad(date.getMonth() + 1)}${year}`,
+  };
+}
+
+const ANNOUNCEMENT_CREDIT = 'codex-resets.com';
+function announcementVariants(special) {
+  const mark = special.stale ? 'STALE · ' : '';
+  const banked = special.resetType === 'banked';
+  return [
+    `${mark}${banked ? 'Banked special reset' : 'Special reset'} · announced ${special.date} · ${special.status} · ${ANNOUNCEMENT_CREDIT}`,
+    `${mark}${banked ? 'Banked reset' : 'Reset'} · announced ${special.date} · ${special.status} · ${ANNOUNCEMENT_CREDIT}`,
+    `${mark}announced ${special.date} · ${special.status} · ${ANNOUNCEMENT_CREDIT}`,
+    `${mark}announced ${special.date} · ${ANNOUNCEMENT_CREDIT}`,
+    `${mark}ann. ${special.date} · ${ANNOUNCEMENT_CREDIT}`,
+  ];
+}
+
+/** Compact provider-level notice used by the picker where the one-row chip
+ *  cannot fit attribution (very narrow terminals). */
+export function specialNoticeText(cache, now = Date.now(), cols = 120) {
+  const special = specialResetModel(cache, now);
+  if (!special) return '';
+  if (cols < 60) return `${special.stale ? 'STALE · ' : ''}announced ${special.date} · ${ANNOUNCEMENT_CREDIT}`;
+  return `${special.resetType === 'banked' ? 'Banked' : 'Special'} reset · announced ${special.date} · ${special.status} · ${special.stale ? 'stale · ' : ''}${ANNOUNCEMENT_CREDIT}`;
+}
+
 /** Exactly one line; tightest known window first, with explicit overflow. */
 export function lineModel(cache, selector, cols, now = Date.now(), status = {}) {
   const model = meterModel(cache, selector, now);
@@ -130,7 +186,40 @@ export function lineModel(cache, selector, cols, now = Date.now(), status = {}) 
   if (overflow && length(text) > width && width > length(overflow)) {
     text = shorten(text.slice(0, -overflow.length), width - length(overflow)) + overflow;
   }
-  return { text: shorten(text, width), stale: model.stale, remaining, unavailable: model.unavailable, error: Boolean(status.error) };
+
+  // Announcement is provider-level and only meaningful beside Codex quota.
+  // Below 60 columns the one row cannot carry attribution without dropping
+  // mandatory quota state, so the chip stays pure quota and the picker shows
+  // the announcement instead.
+  const special = String(selector).split(':')[0] === 'openai-codex' ? specialResetModel(cache, now) : null;
+  if (special && width >= 60) {
+    const left = remaining === null ? '?' : String(remaining);
+    const quotaValue = model.unavailable ? 'unavailable' : `${left}%`;
+    const resetDay = meter?.resetDate ? meter.resetDate.split(' ')[0] : '';
+    const reset = resetDay ? ` · reset ${resetDay}` : '';
+    const mark = `${model.stale ? 'STALE · ' : ''}${status.error ? 'refresh error · ' : ''}`;
+    const shortLabel = model.label.replace(/^OpenAI /, '');
+    const account = shortLabel.includes(' · ') ? shortLabel.split(' · ').slice(1).join(' · ') : '';
+    const quotaVariants = [
+      text,
+      `${mark}Quota · ${model.label} · ${quotaValue}${reset}${overflow}`,
+      `${mark}Quota · ${shortLabel} · ${quotaValue}${reset}${overflow}`,
+      `${mark}Quota · ${shortLabel} · ${quotaValue}${overflow}`,
+      `${mark}${shortLabel} ${quotaValue}${overflow}`,
+      `${mark}${account || shortLabel} ${quotaValue}${overflow}`,
+      `${mark}${quotaValue}${overflow}`,
+    ];
+    const announcements = announcementVariants(special);
+    // Quota identity and state stay mandatory; only secondary detail degrades.
+    const pairs = [[0, 0], [0, 1], [0, 2], [1, 1], [1, 2], [1, 3], [2, 2], [2, 3],
+      [2, 4], [2, 5], [0, 5], [0, 6], [3, 4], [3, 5]];
+    const candidate = pairs
+      .map(([a, q]) => `${announcements[a]} · ${quotaVariants[q]}`)
+      .find(value => length(value) <= width);
+    text = candidate || text;
+  }
+
+  return { text: shorten(text, width), stale: model.stale, remaining, unavailable: model.unavailable, error: Boolean(status.error), special: Boolean(special) };
 }
 
 /** Role-colored chip, with no status-bar-like background or full-width rule. */
@@ -185,6 +274,55 @@ export function createPoller({ read, refresh, onUpdate, now = Date.now }) {
 }
 
 const hermesHome = () => process.env.HERMES_HOME?.trim() || join(homedir(), '.hermes');
+
+/**
+ * Display preference only: account selector + whether the dock auto-opens.
+ * Deliberately NEXT TO the cache, never inside `tui-widgets/`: the TUI reloads
+ * every widget when that directory changes, so writing the preference there
+ * would remount the dock and write again — an endless reload/write loop.
+ */
+export const PREFS_VERSION = 1;
+const defaultPrefs = () => ({ selected: null, autoOpen: true });
+
+export const prefsPath = (home = hermesHome()) => join(home, 'quota-panel.state.json');
+
+/** Anything unrecognised falls back to a closed default; never throws. */
+export function normalizePrefs(value) {
+  const prefs = defaultPrefs();
+  if (!object(value)) return prefs;
+  if (typeof value.selected === 'string' && SELECTOR.test(value.selected.trim())) prefs.selected = value.selected.trim();
+  if (typeof value.autoOpen === 'boolean') prefs.autoOpen = value.autoOpen;
+  return prefs;
+}
+
+export async function readPrefs(home = hermesHome()) {
+  const path = prefsPath(home);
+  try {
+    const info = await stat(path);
+    if (!info.isFile() || info.size > 8192) return defaultPrefs();
+    return normalizePrefs(JSON.parse(await readFile(path, 'utf8')));
+  } catch { return defaultPrefs(); }
+}
+
+/** Atomic, owner-only, best effort: a read-only HOME must not break the dock.
+ *  Rewriting an unchanged preference is skipped, so a remount cannot cause churn. */
+export async function writePrefs(prefs, home = hermesHome()) {
+  const next = normalizePrefs(prefs);
+  const current = await readPrefs(home);
+  if (current.selected === next.selected && current.autoOpen === next.autoOpen) return next;
+  const path = prefsPath(home);
+  const tmp = `${path}.${process.pid}.tmp`;
+  try {
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(tmp, `${JSON.stringify({ version: PREFS_VERSION, ...next }, null, 2)}\n`, { mode: 0o600 });
+    await rename(tmp, path);
+    return next;
+  } catch {
+    try { await rm(tmp, { force: true }); } catch { /* ignore */ }
+    return null;
+  }
+}
+
 export async function readCache() {
   const path = join(hermesHome(), 'quota_cache.json');
   if ((await stat(path)).size > 1024 * 1024) throw new Error('Cache too large');
@@ -202,8 +340,51 @@ function refreshCache(signal) {
   });
 }
 
+/** Serialized so a fast open/close/open sequence cannot write an older state last. */
+export function createPrefsStore(home = hermesHome()) {
+  let queue = Promise.resolve();
+  let current = defaultPrefs();
+  const store = {
+    get: () => current,
+    async load() { current = await readPrefs(home); return current; },
+    save(patch) {
+      const next = { ...current, ...patch };
+      current = normalizePrefs(next);
+      queue = queue.then(async () => {
+        const written = await writePrefs({ ...(await readPrefs(home)), ...patch }, home);
+        return written;
+      }).catch(() => null);
+      return queue;
+    },
+    idle: () => queue,
+  };
+  return store;
+}
+
+/**
+ * Auto-open the saved dock once per TUI process. The `restored` flag lives on
+ * globalThis because a /widgets-reload re-imports this module with a fresh
+ * cache-busting query — a module-local flag would reopen a dock the user closed.
+ */
+export async function restoreSavedPanel(sdk, panel, { home, force = false } = {}) {
+  const prefs = await readPrefs(home);
+  const shared = globalThis.__hermesQuotaPanel ??= { restored: false };
+  if (!prefs.autoOpen || !prefs.selected) return null;
+  if (shared.restored && !force) return null;
+  if (typeof sdk?.openWidget !== 'function') return null;
+  shared.restored = true;
+  sdk.openWidget(panel, { selected: [prefs.selected] });
+  return prefs.selected;
+}
+
+/** Mounting the dock IS the preference: it is what survives a restart. */
+export function markDockVisible(prefs, selected) {
+  return prefs.save(selected.length ? { selected: selected[0], autoOpen: true } : { autoOpen: true });
+}
+
 export default function register(sdk) {
   const { h, Box, Text, React, defineWidgetApp, Overlay, Dialog } = sdk;
+  const prefs = createPrefsStore();
   let chosen = null;
   let panel, picker;
   function Panel({ selected, t, cols }) {
@@ -214,6 +395,8 @@ export default function register(sdk) {
         sdk.openWidget(picker, picker.init(''));
         return;
       }
+      // Showing the dock IS the preference: this is what makes it survive a restart.
+      void markDockVisible(prefs, selected);
       const poller = createPoller({ read: readCache, refresh: refreshCache, onUpdate: setSnapshot });
       void poller.tick();
       const timer = setInterval(() => { setNow(Date.now()); void poller.tick(); }, 15000);
@@ -229,7 +412,7 @@ export default function register(sdk) {
     React.useEffect(() => {
       let mounted = true;
       readCache().then(cache => {
-        if (mounted) sdk.updateWidget(picker, current => ({ ...current, phase: 'ready', options: pickerOptions(cache), stale: panelModel(cache).stale }));
+        if (mounted) sdk.updateWidget(picker, current => ({ ...current, phase: 'ready', options: pickerOptions(cache), stale: panelModel(cache).stale, special: specialNoticeText(cache, Date.now(), cols) }));
       }, () => {
         if (mounted) sdk.updateWidget(picker, current => ({ ...current, phase: 'error' }));
       });
@@ -242,6 +425,7 @@ export default function register(sdk) {
       h(Dialog, { width: Math.max(12, Math.min(76, cols)), title: 'Quota · choose provider / account', hint: '↑↓ choose · Enter confirm · Esc cancel' },
         h(Box, { flexDirection: 'column' },
           h(Text, { color: t.color.muted, wrap: 'truncate-end' }, 'From quota cache · no key scan · display only'),
+          state.special ? h(Text, { key: 'special', color: t.color.muted, wrap: 'truncate-end' }, state.special) : null,
           ...(state.phase === 'loading' ? [h(Text, { key: 'loading' }, 'Reading cache…')]
             : state.phase === 'error' ? [h(Text, { key: 'error', color: t.color.error }, 'Cache unavailable. Run /quota refresh first.')]
               : !visible.length ? [h(Text, { key: 'empty' }, 'No configured providers in cache. Run /quota refresh.')]
@@ -255,11 +439,14 @@ export default function register(sdk) {
   panel = defineWidgetApp({
     id: 'quota-panel', help: 'Toggle one-account quota bar above the composer',
     mode: 'ambient', zone: 'dock-top', width: 100,
-    usage: '/quota-panel [provider:account] · /quota-select to choose interactively',
+    usage: '/quota-panel [provider:account|on|off] · /quota-select to choose interactively',
     init(arg) {
-      const selected = [...new Set(arg.trim().split(/[\s,]+/).filter(Boolean))];
-      if (selected.length > 1 || selected.some(id => !/^[a-z0-9][a-z0-9:_#.-]{0,119}$/i.test(id))) return null;
-      if (!selected.length && chosen) selected.push(chosen);
+      const value = arg.trim();
+      if (/^off$/i.test(value)) { void prefs.save({ autoOpen: false }); return null; }
+      const selected = value && !/^on$/i.test(value) ? [...new Set(value.split(/[\s,]+/).filter(Boolean))] : [];
+      if (selected.length > 1 || selected.some(id => !SELECTOR.test(id))) return null;
+      const remembered = chosen || prefs.get().selected;
+      if (!selected.length && remembered) selected.push(remembered);
       return { selected };
     },
     reduce: state => state,
@@ -267,11 +454,12 @@ export default function register(sdk) {
   });
   picker = defineWidgetApp({
     id: 'quota-select', help: 'Choose a cached configured provider/account for the quota bar', mode: 'modal',
-    init: () => ({ phase: 'loading', options: [], index: 0 }),
+    init: () => ({ phase: 'loading', options: [], index: 0, special: '' }),
     reduce(state, { ch, key }) {
       if (key.escape || (key.ctrl && ch === 'c') || ch === 'q') return null;
       if (key.return && state.options[state.index]) {
         chosen = state.options[state.index].id;
+        void prefs.save({ selected: chosen, autoOpen: true });
         sdk.openWidget(panel, { selected: [chosen] });
         return null;
       }
@@ -281,4 +469,10 @@ export default function register(sdk) {
     },
     render: ({ state, t, cols, rows }) => h(Picker, { state, t, cols, rows }),
   });
+  // Auto-open the remembered dock (once per process, never on /widgets-reload).
+  void (async () => {
+    await restoreSavedPanel(sdk, panel);
+    const saved = await prefs.load();
+    if (!chosen && saved.selected) chosen = saved.selected;
+  })();
 }

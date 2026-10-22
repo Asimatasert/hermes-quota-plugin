@@ -31,8 +31,17 @@ Cache schema (``quota_cache.json``)::
         },
         "grok": {"label": "grok", "plan": null,
                  "unavailable_reason": "cloudflare-blocked", "windows": []}
+      },
+      "codex_special_reset": {
+        "announcement": null,
+        "fetched_at": null,
+        "stale": true,
+        "unavailable_reason": "codex-not-configured"
       }
     }
+
+``codex_special_reset`` is public announcement metadata for Codex. It is not
+account quota: it never changes a provider window or ``reset_at``.
 """
 
 from __future__ import annotations
@@ -40,6 +49,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
 import threading
 import time
 from datetime import datetime, timezone
@@ -48,6 +58,7 @@ from typing import Any, Optional
 from hermes_constants import get_hermes_home
 from .quota_providers import PROVIDER_FETCHERS, QuotaAccount, QuotaResult, GENERATED_ACCOUNT_ID_PREFIX
 from .quota_providers.codex import display_label
+from . import codex_special_reset
 
 logger = logging.getLogger(__name__)
 
@@ -232,6 +243,61 @@ def _unavailable_record(provider_id: str, reason: str) -> dict[str, Any]:
     }
 
 
+def _codex_configured(providers: dict[str, Any]) -> bool:
+    """Whether the real Codex result reflects a configured account.
+
+    The announcement source is only consulted when Codex is actually set up,
+    so an unrelated quota sweep never makes this third-party request. Any
+    response other than the two "nothing configured" reasons means Codex was
+    found, including a failed usage fetch for an existing account.
+    """
+    record = providers.get("openai-codex")
+    if not isinstance(record, dict):
+        return False
+    return record.get("unavailable_reason") not in (
+        "no-credentials", "fetcher-unavailable",
+    )
+
+
+def _special_rank(entry: Any) -> tuple[float, int]:
+    """Order announcement cache entries by honest success time, then trust."""
+    normalized = codex_special_reset.normalize_entry(entry)
+    fetched_at = normalized.get("fetched_at")
+    stamp = float("-inf")
+    if fetched_at:
+        try:
+            stamp = datetime.fromisoformat(fetched_at).timestamp()
+        except (ValueError, TypeError, OverflowError):
+            stamp = float("-inf")
+    return stamp, 0 if normalized.get("stale") else 1
+
+
+def _prefer_newer_special(on_disk: Any, candidate: dict[str, Any]) -> dict[str, Any]:
+    """Never let a slow process clobber a newer success written by another."""
+    if not isinstance(on_disk, dict):
+        return candidate
+    if _special_rank(on_disk) > _special_rank(candidate):
+        return codex_special_reset.normalize_entry(on_disk)
+    return candidate
+
+
+def _collect_special_reset(previous: Any, configured: bool,
+                           deadline: float, state_path: str) -> dict[str, Any]:
+    """Fetch the public announcement inside the existing sweep deadline."""
+    if not configured:
+        return codex_special_reset.empty_entry("codex-not-configured")
+    if deadline <= time.monotonic():
+        # Never start a request we already have no budget to wait for.
+        return codex_special_reset.stale_entry(previous, "timeout")
+    try:
+        return codex_special_reset.refresh(
+            previous, state_path=state_path,
+            timeout=max(0.0, deadline - time.monotonic()))
+    except Exception:
+        logger.debug("quota_cache ▸ special reset failed", exc_info=True)
+        return codex_special_reset.stale_entry(previous, "fetch-error")
+
+
 def _fetch_one(provider_id: str, fetcher: Any) -> dict[str, Any]:
     """Run one fetcher. Fail-open by contract — never raises."""
     try:
@@ -264,9 +330,13 @@ def refresh_quota_cache(*, budget: Optional[float] = None) -> dict[str, Any]:
     Returns the cache dict that was written.
     """
     budget_s = REFRESH_BUDGET_S if budget is None else max(0.0, float(budget))
+    previous_special = read_quota_cache().get("codex_special_reset")
     items = list(PROVIDER_FETCHERS.items())
     results: dict[str, Any] = {}
     lock = threading.Lock()
+    deadline = time.monotonic() + budget_s
+    # Resolve on the profile's caller thread, before spawning any workers.
+    state_path = codex_special_reset._state_path()
 
     def _worker(pid: str, fetcher: Any, event: threading.Event) -> None:
         record = _unavailable_record(pid, "fetch-error")
@@ -296,9 +366,33 @@ def refresh_quota_cache(*, budget: Optional[float] = None) -> dict[str, Any]:
             daemon=True,
         ).start()
 
-    deadline = time.monotonic() + budget_s
+    special_result: dict[str, Any] = {}
+    special_done = threading.Event()
+
+    def _special_worker() -> None:
+        try:
+            codex_done = events.get("openai-codex")
+            if codex_done is None:
+                special_result["entry"] = codex_special_reset.empty_entry(
+                    "codex-not-configured")
+                return
+            codex_done.wait(max(0.0, deadline - time.monotonic()))
+            with lock:
+                codex = results.get("openai-codex") or _unavailable_record(
+                    "openai-codex", "timeout")
+            special_result["entry"] = _collect_special_reset(
+                previous_special, _codex_configured({"openai-codex": codex}),
+                deadline, state_path)
+        finally:
+            special_done.set()
+
+    # Wait only for Codex discovery, not every other provider: a slow unrelated
+    # vendor must not consume the announcement collector's entire budget.
+    threading.Thread(target=_special_worker, name="quota-special-reset",
+                     daemon=True).start()
     for event in events.values():
         event.wait(max(0.0, deadline - time.monotonic()))
+    special_done.wait(max(0.0, deadline - time.monotonic()))
 
     with lock:
         providers: dict[str, Any] = {}
@@ -306,15 +400,38 @@ def refresh_quota_cache(*, budget: Optional[float] = None) -> dict[str, Any]:
             record = results.get(provider_id) or _unavailable_record(provider_id, "timeout")
             providers.update(_expand_accounts(provider_id, record))
 
-    cache = {"fetched_at": datetime.now(timezone.utc).isoformat(), "providers": providers}
+    special = special_result.get("entry") if special_done.is_set() else None
+    if not isinstance(special, dict):
+        special = codex_special_reset.stale_entry(previous_special, "timeout")
+    cache = {
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "providers": providers,
+        "codex_special_reset": special,
+    }
 
     try:
         with _CACHE_LOCK:
+            # A sibling process may have written a newer announcement success
+            # while this sweep ran; its entry is authoritative.
+            on_disk = read_quota_cache().get("codex_special_reset")
+            cache["codex_special_reset"] = _prefer_newer_special(on_disk, special)
             path = _cache_path()
-            tmp = path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(cache, fh, indent=2, sort_keys=True)
-            os.replace(tmp, path)
+            fd, tmp = tempfile.mkstemp(
+                prefix="." + os.path.basename(path) + ".", suffix=".tmp",
+                dir=os.path.dirname(os.path.abspath(path)))
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump(cache, fh, indent=2, sort_keys=True)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp, path)
+                tmp = None
+            finally:
+                if tmp is not None:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
     except Exception:
         logger.debug("quota_cache ▸ write failed", exc_info=True)
 

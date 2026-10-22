@@ -4,7 +4,46 @@
 
 The optional Ink TUI widget provides a one-line, right-aligned quota chip above
 the composer. `/quota-select` opens a provider/account picker; `/quota-panel`
-toggles the display. See [TUI setup and commands](tui-panel.md).
+toggles the display, and the chosen account is remembered so the chip is already
+there on the next TUI start (`/quota-panel off` stops that). For an OpenAI Codex
+account the chip also carries a validated special-reset announcement when the
+width allows — see [Codex special-reset announcements](codex-special-reset.md).
+See [TUI setup and commands](tui-panel.md).
+
+## CLI dashboard
+
+`/quota` and `hermes quota` print one block per provider **with a saved account**:
+
+```
+📊 Quota · updated 2m ago
+✨ Codex special reset · announced Oct 22 · scheduled · codex-resets.com
+
+Anthropic · Conta 2 (Team)
+  Current session    ░░░░░░░░░░    0% left · resets in 1h 6m
+
+xAI Grok
+  Weekly Limit       ██░░░░░░░░   16% left · resets in 20h 12m
+
+Antigravity (Google AI Pro)
+  Gemini · 5h        ██████████   97% left · resets in 2h 12m
+  Claude/GPT · week  ███░░░░░░░   31% left · resets in 5d 20h
+```
+
+- Friendly provider names and account labels, mirroring the Desktop/TUI tables.
+- A one-line **Codex special-reset announcement** when one is published — it is
+  announcement metadata, never an account allowance, so it never changes a
+  provider's bar. See [Codex special-reset announcements](codex-special-reset.md).
+- One bar per real meter, filled by what is **left**; the reset is relative while
+  it is under a week away.
+- Blocks are sorted by the lowest remaining quota, so the provider that needs
+  attention comes first.
+- Providers with no credential are hidden, with a one-line count at the bottom.
+  `/quota <provider>` (e.g. `/quota cursor`) still explains why one is absent.
+  Any other unavailable reason — `config-invalid`, `rate-limited`, `no-data` —
+  stays visible with its actionable detail.
+- `/quota claude`, `/quota codex`, `/quota google` and similar words resolve to
+  the provider they mean; a space-containing filter such as `/quota conta 2`
+  works too.
 
 ## Hermes Desktop
 
@@ -55,9 +94,9 @@ Everything lives in the pane's **Quota Settings** view and persists locally:
 
 | Command | What it does |
 | --- | --- |
-| `/quota` | Show the current table in chat (refreshes first if stale) |
+| `/quota` | Show the dashboard for every provider with a saved account (refreshes first if stale) |
 | `hermes quota` | Same as `hermes quota status` |
-| `hermes quota status` | Table of every enabled provider |
+| `hermes quota status` | Dashboard of every provider with a saved account |
 | `hermes quota status --json` | Raw payload for the desktop widget |
 | `hermes quota status --json --cached` | The cache as-is — never refreshes (widget poll path) |
 | `hermes quota status --max-age N` | Refresh first when the cache is older than N seconds |

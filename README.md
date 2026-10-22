@@ -11,6 +11,7 @@ See provider quotas, reset times and account balances in Hermes Desktop and the 
 - Separate, configurable Claude account cards; no summed or invented allowances.
 - Honest unavailable states and opt-in access to sensitive credential sources.
 - Optional Ink TUI quota chip with an interactive account picker and theme colors.
+- Codex special-reset announcements, separate from account renewals, with data from [Codex Resets](https://codex-resets.com/).
 
 ## Install
 
@@ -59,6 +60,7 @@ Extra Claude accounts are opt-in and read-only: no refresh-token exchange, crede
 - [Usage, settings and commands](docs/usage.md)
 - [Providers and their limitations](docs/providers.md)
 - [Claude accounts and friendly names](docs/claude-accounts.md)
+- [Codex special-reset announcements and source limitations](docs/codex-special-reset.md)
 - [Troubleshooting—including remote names/icons](docs/troubleshooting.md)
 - [Development and tests](docs/development.md) · [Add a provider](docs/add-provider.md)
 - [Acknowledgements](docs/contributors.md)

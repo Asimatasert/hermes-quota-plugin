@@ -155,6 +155,7 @@ else
   cat "$RUN_ROOT/install-1.log"
 fi
 [ -d "$H1/plugins/quota" ] && ok "backend installed" || bad "backend missing"
+[ -f "$H1/plugins/quota/codex_special_reset.py" ] && ok "special reset collector installed" || bad "special reset collector missing"
 [ -d "$H1/desktop-plugins/quota" ] && ok "widget installed" || bad "widget missing"
 L="$H1/profiles/alpha/plugins/quota"
 [ -L "$L" ] && [ -e "$L" ] && ok "alpha backend link resolves" || bad "alpha backend link broken: $L"

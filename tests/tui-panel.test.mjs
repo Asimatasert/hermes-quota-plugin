@@ -215,6 +215,159 @@ test('refresh failure is visible and retries are throttled; fresh caches never r
   fresh.stop();
 });
 
+const SPECIAL_SOURCE = 'https://x.com/thsottiaux/status/2113162413008884099';
+const specialCache = (announcement, extra = {}) => ({
+  fetched_at: '2026-10-22T12:00:00Z',
+  providers: { 'openai-codex': { accounts: [{ id: 'work', label: 'Personal', windows: [
+    { label: 'Session', used_percent: 20, reset_at: '2026-10-22T13:00:00Z' },
+    { label: 'Weekly', used_percent: 80, reset_at: '2026-10-27T14:30:00Z' },
+  ] }] } },
+  codex_special_reset: {
+    announcement, fetched_at: '2026-10-22T12:00:00Z', stale: false, unavailable_reason: null, ...extra,
+  },
+});
+
+test('special reset announcement is a validated provider-level model, not a forecast', async () => {
+  const { specialResetModel } = await import(source);
+  const base = { id: 'reset-1', status: 'scheduled', reset_type: 'banked',
+    announced_at: '2026-10-22T06:55:54Z', source_url: SPECIAL_SOURCE };
+  const model = specialResetModel(specialCache(base));
+  assert.equal(model.status, 'scheduled');
+  assert.equal(model.resetType, 'banked');
+  assert.match(model.date, /^22\/10/);
+  assert.equal(model.sourceUrl, SPECIAL_SOURCE);
+  assert.equal(model.stale, false);
+
+  const recorded = specialResetModel(specialCache({ ...base, status: 'recorded' }));
+  assert.equal(recorded.status, 'recorded');
+
+  for (const bad of [
+    { ...base, status: 'executing' },
+    { ...base, reset_type: 'unknown' },
+    { ...base, announced_at: '2026-10-22T06:55:54' },
+    { ...base, announced_at: 'not-a-dateZ' },
+    { ...base, id: '' },
+    { ...base, source_url: 'https://x.com/attacker/status/1' },
+    { ...base, source_url: 'http://x.com/thsottiaux/status/2113162413008884099' },
+  ]) {
+    assert.equal(specialResetModel(specialCache(bad)), null, JSON.stringify(bad));
+  }
+
+  assert.equal(specialResetModel({ providers: {} }), null);
+  assert.equal(specialResetModel({ codex_special_reset: { announcement: null } }), null);
+  const stale = specialResetModel(specialCache(base, { stale: true }));
+  assert.equal(stale.stale, true);
+  // Missing/malformed freshness metadata is qualified as stale, not fresh.
+  const unknown = specialCache(base);
+  delete unknown.codex_special_reset.stale;
+  assert.equal(specialResetModel(unknown).stale, true);
+  unknown.codex_special_reset.stale = false;
+  unknown.codex_special_reset.fetched_at = 'not-a-date';
+  assert.equal(specialResetModel(unknown).stale, true);
+  // Old announcements keep their year so they cannot look recent.
+  const old = specialResetModel(specialCache({ ...base, announced_at: '2024-03-02T06:55:54Z' }),
+    Date.parse('2026-10-22T12:00:00Z'));
+  assert.match(old.date, /^02\/03\/2024$/);
+});
+
+test('special reset line keeps quota at 80 cols and shows announced date, state and credit', async () => {
+  const { lineModel } = await import(source);
+  const now = Date.parse('2026-10-22T12:00:00Z');
+  for (const cols of [80, 100, 120]) {
+    const line = lineModel(specialCache({ id: 'r1', status: 'scheduled', reset_type: 'regular',
+      announced_at: '2026-10-22T06:55:54Z', source_url: SPECIAL_SOURCE }), 'openai-codex', cols, now);
+    assert.ok([...line.text].length <= cols, `${cols}: ${line.text}`);
+    assert.match(line.text, /announced 22\/10/, `${cols}: ${line.text}`);
+    assert.match(line.text, /scheduled/, `${cols}: ${line.text}`);
+    assert.doesNotMatch(line.text, /scheduled_for|17:00|in \d|countdown/i);
+    assert.match(line.text, /codex-resets\.com/, `${cols}: ${line.text}`);
+    assert.match(line.text, /20%|80%/, `${cols}: ${line.text}`);
+    assert.match(line.text, /Codex/, `${cols}: ${line.text}`);
+    assert.doesNotMatch(line.text, /[\x00-\x1f\x7f]/);
+    assert.doesNotMatch(line.text, /\n/);
+  }
+  const wide = lineModel(specialCache({ id: 'r1', status: 'recorded', reset_type: 'banked',
+    announced_at: '2026-10-20T06:33:48Z', source_url: SPECIAL_SOURCE }), 'openai-codex', 120, now).text;
+  assert.match(wide, /Banked/);
+  assert.match(wide, /recorded/);
+  assert.doesNotMatch(wide, /happened|for you|executed/i);
+  // Account renewal stays visibly separate from the announcement date.
+  assert.match(wide, /reset 27\/10/);
+});
+
+test('special reset line degrades safely at 40 cols and is absent outside Codex', async () => {
+  const { lineModel, specialNoticeText } = await import(source);
+  const now = Date.parse('2026-10-22T12:00:00Z');
+  const cache = specialCache({ id: 'r1', status: 'scheduled', reset_type: 'regular',
+    announced_at: '2026-10-22T06:55:54Z', source_url: SPECIAL_SOURCE });
+  const line = lineModel(cache, 'openai-codex', 40, now);
+  assert.ok([...line.text].length <= 40, line.text);
+  // At 40 columns mandatory quota identity/state wins; attribution lives in
+  // the picker instead of being truncated into a misleading fragment.
+  assert.match(line.text, /Quota/);
+  assert.match(line.text, /20%|80%/);
+  assert.doesNotMatch(line.text, /codex-resets\.com/);
+  assert.doesNotMatch(line.text, /\n/);
+  assert.match(specialNoticeText(cache, now), /Special reset · announced 22\/10 · scheduled · codex-resets\.com/);
+  const narrow = specialNoticeText(cache, now, 40);
+  assert.match(narrow, /announced 22\/10 · codex-resets\.com/);
+  assert.ok([...narrow].length <= 40);
+
+  const other = lineModel(cache, 'openai-codex:work', 120, now);
+  assert.match(other.text, /announced 22\/10/); // selected Codex account keeps the provider notice
+  assert.match(other.text, /Personal/);
+  const anthropic = lineModel({ ...cache,
+    providers: { anthropic: { windows: [{ label: 'Weekly', used_percent: 10 }] } } }, 'anthropic', 120, now);
+  assert.doesNotMatch(anthropic.text, /announced|codex-resets|Special/i);
+});
+
+test('special reset never hides unavailable, stale or refresh-error quota state', async () => {
+  const { lineModel } = await import(source);
+  const now = Date.parse('2026-10-22T12:00:00Z');
+  const base = specialCache({ id: 'r1', status: 'scheduled', reset_type: 'regular',
+    announced_at: '2026-10-22T06:55:54Z', source_url: SPECIAL_SOURCE });
+  const unavailable = JSON.parse(JSON.stringify(base));
+  unavailable.providers['openai-codex'].accounts[0].unavailable_reason = 'auth-failed';
+  unavailable.codex_special_reset.stale = true;
+  const row = lineModel(unavailable, 'openai-codex', 120, now, { error: true });
+  assert.match(row.text, /unavailable/);
+  assert.doesNotMatch(row.text, /\?%/);
+  assert.match(row.text, /STALE/);
+  assert.match(row.text, /refresh error/);
+  assert.match(row.text, /announced 22\/10/);
+  const stale = lineModel(base, 'openai-codex', 80, now);
+  assert.doesNotMatch(stale.text, /\?%/);
+});
+
+test('special reset hides malformed root data, marks stale, and barely styles as a warning', async () => {
+  const { lineModel, renderLine } = await import(source);
+  const now = Date.parse('2026-10-22T12:00:00Z');
+  const good = specialCache({ id: 'r1', status: 'recorded', reset_type: 'regular',
+    announced_at: '2026-10-22T06:55:54Z', source_url: SPECIAL_SOURCE }, { stale: true });
+  const stale = lineModel(good, 'openai-codex', 120, now);
+  assert.match(stale.text, /STALE/);
+  assert.match(stale.text, /announced 22\/10/);
+  for (const bad of [
+    { announcement: { id: 'x', status: 'nope', reset_type: 'regular', announced_at: '2026-10-22T06:55:54Z' } },
+    { announcement: 'text' },
+    null,
+    { announcement: { id: 'x', status: 'scheduled', reset_type: 'regular', announced_at: '22/10/2026' } },
+  ]) {
+    const cache = specialCache(null);
+    cache.codex_special_reset = bad;
+    assert.doesNotMatch(lineModel(cache, 'openai-codex', 120, now).text, /codex-resets|announced/);
+  }
+
+  const sdk = { Box: 'Box', Text: 'Text', h: (type, props, ...children) => ({ type, props, children }) };
+  const t = { color: { primary: 'P', muted: 'M', ok: 'OK', warn: 'W', error: 'E' } };
+  const tree = renderLine(sdk, stale, t, 100);
+  assert.equal(tree.props.height, 1);
+  assert.equal(tree.props.justifyContent, 'flex-end');
+  const colors = tree.children[0].children.map(node => node.props?.color);
+  assert.ok(!colors.includes('E'), 'announcement must not be alarming red');
+  assert.ok(colors.includes('M'));
+});
+
 test('real cache reader respects HERMES_HOME and rejects malformed cache', async () => {
   const { mkdtemp, writeFile, rm } = await import('node:fs/promises');
   const { join } = await import('node:path');
@@ -232,6 +385,119 @@ test('real cache reader respects HERMES_HOME and rejects malformed cache', async
   } finally {
     if (previous === undefined) delete process.env.HERMES_HOME;
     else process.env.HERMES_HOME = previous;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('the display preference is owner-only, atomic and never trusts junk', async () => {
+  const { mkdtemp, readFile, stat, writeFile, rm } = await import('node:fs/promises');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const { normalizePrefs, prefsPath, readPrefs, writePrefs } = await import(source);
+  const dir = await mkdtemp(join(tmpdir(), 'quota-prefs-'));
+  try {
+    assert.deepEqual(await readPrefs(dir), { selected: null, autoOpen: true });
+    assert.deepEqual(await writePrefs({ selected: 'anthropic:work', autoOpen: true }, dir),
+      { selected: 'anthropic:work', autoOpen: true });
+    assert.equal((await stat(prefsPath(dir))).mode & 0o777, 0o600);
+    assert.deepEqual(JSON.parse(await readFile(prefsPath(dir), 'utf8')),
+      { version: 1, selected: 'anthropic:work', autoOpen: true });
+    assert.deepEqual(await readPrefs(dir), { selected: 'anthropic:work', autoOpen: true });
+    await writeFile(prefsPath(dir), '{"selected":"anthropic:work","autoOpen":false}');
+    assert.deepEqual(await readPrefs(dir), { selected: 'anthropic:work', autoOpen: false });
+    await writeFile(prefsPath(dir), 'not json at all');
+    assert.deepEqual(await readPrefs(dir), { selected: null, autoOpen: true });
+    assert.deepEqual(normalizePrefs({ selected: '$(touch hacked)', autoOpen: 'true' }), { selected: null, autoOpen: true });
+    assert.deepEqual(normalizePrefs({ selected: ' grok ', autoOpen: false }), { selected: 'grok', autoOpen: false });
+    assert.deepEqual(normalizePrefs(['grok']), { selected: null, autoOpen: true });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('the preference never lands in the watched widget directory and rewrites nothing', async () => {
+  const { mkdtemp, rm, stat } = await import('node:fs/promises');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const { prefsPath, writePrefs } = await import(source);
+  const dir = await mkdtemp(join(tmpdir(), 'quota-watch-'));
+  try {
+    // Writing inside tui-widgets/ would hot-reload the widget, remount the dock
+    // and write again — the reload/write loop seen in a live TUI.
+    assert.ok(!prefsPath(dir).startsWith(join(dir, 'tui-widgets')), 'preference must stay outside the watched directory');
+    await writePrefs({ selected: 'grok' }, dir);
+    const first = (await stat(prefsPath(dir))).mtimeMs;
+    await new Promise(resolve => setTimeout(resolve, 20));
+    await writePrefs({ selected: 'grok' }, dir);
+    assert.equal((await stat(prefsPath(dir))).mtimeMs, first, 'an unchanged preference must not be rewritten');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('the saved dock auto-opens once per TUI process and honours auto-open', async () => {
+  const { mkdtemp, rm } = await import('node:fs/promises');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const { restoreSavedPanel, writePrefs } = await import(source);
+  const dir = await mkdtemp(join(tmpdir(), 'quota-restore-'));
+  const opened = [];
+  const sdk = { openWidget: (app, state) => opened.push({ app, state }) };
+  const panel = { id: 'quota-panel' };
+  delete globalThis.__hermesQuotaPanel;
+  try {
+    assert.equal(await restoreSavedPanel(sdk, panel, { home: dir }), null);
+    await writePrefs({ selected: 'anthropic:account2', autoOpen: true }, dir);
+    assert.equal(await restoreSavedPanel(sdk, panel, { home: dir }), 'anthropic:account2');
+    assert.deepEqual(opened, [{ app: panel, state: { selected: ['anthropic:account2'] } }]);
+    assert.equal(await restoreSavedPanel(sdk, panel, { home: dir }), null, 'a /widgets-reload must not reopen it');
+    await writePrefs({ selected: 'grok', autoOpen: false }, dir);
+    assert.equal(await restoreSavedPanel(sdk, panel, { home: dir, force: true }), null, 'off stays off');
+    await writePrefs({ selected: 'grok', autoOpen: true }, dir);
+    assert.equal(await restoreSavedPanel(sdk, panel, { home: dir, force: true }), 'grok');
+    assert.equal(opened.length, 2);
+    assert.equal(await restoreSavedPanel({}, panel, { home: dir, force: true }), null, 'no host hook, no crash');
+  } finally {
+    delete globalThis.__hermesQuotaPanel;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('showing the dock persists it; off and on drive only the startup preference', async () => {
+  const { mkdtemp, rm } = await import('node:fs/promises');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const { createPrefsStore, markDockVisible, readPrefs, writePrefs, default: register } = await import(source);
+  const dir = await mkdtemp(join(tmpdir(), 'quota-toggle-'));
+  const previous = process.env.HERMES_HOME;
+  delete globalThis.__hermesQuotaPanel;
+  try {
+    const store = createPrefsStore(dir);
+    await markDockVisible(store, ['anthropic:work']);
+    await store.save({ autoOpen: false });
+    // Serialized writes: the last intent wins, never an older one landing last.
+    void store.save({ autoOpen: true });
+    await store.idle();
+    assert.deepEqual(await readPrefs(dir), { selected: 'anthropic:work', autoOpen: true });
+
+    process.env.HERMES_HOME = dir;
+    await writePrefs({ selected: 'anthropic:work', autoOpen: true }, dir);
+    const apps = [], opened = [];
+    register({ defineWidgetApp: value => { apps.push(value); return value; },
+      openWidget: (app, state) => opened.push(state) });
+    await new Promise(resolve => setTimeout(resolve, 25));
+    assert.deepEqual(opened, [{ selected: ['anthropic:work'] }], 'a new TUI session restores the dock');
+    const app = apps.find(value => value.id === 'quota-panel');
+    assert.equal(app.init('off'), null, 'off closes without a dock state');
+    await new Promise(resolve => setTimeout(resolve, 25));
+    assert.deepEqual(await readPrefs(dir), { selected: 'anthropic:work', autoOpen: false });
+    assert.deepEqual(app.init('on'), { selected: ['anthropic:work'] }, 'on reopens the remembered account');
+    assert.deepEqual(app.init('anthropic:work').selected, ['anthropic:work']);
+    assert.equal(app.init('anthropic grok'), null, 'still one selector at a time');
+  } finally {
+    if (previous === undefined) delete process.env.HERMES_HOME;
+    else process.env.HERMES_HOME = previous;
+    delete globalThis.__hermesQuotaPanel;
     await rm(dir, { recursive: true, force: true });
   }
 });

@@ -674,6 +674,150 @@ function formatReset(resetIso, format) {
 	return absolute ? `${relative} (${absolute})` : relative;
 }
 
+// ---- Codex special-reset announcement -------------------------------------
+// Provider-level metadata from the cache root (`codex_special_reset`). It is a
+// third-party announcement record, never an account entitlement, and it is
+// shown once beside Codex rather than repeated per account. Anything malformed
+// is hidden so quota rendering keeps working.
+
+const SPECIAL_RESET_CREDIT = "https://codex-resets.com/";
+const SPECIAL_RESET_SOURCE = /^https:\/\/x\.com\/thsottiaux\/status\/\d+$/;
+const SPECIAL_RESET_STATUS = {
+	scheduled: "Scheduled · waiting for execution",
+	recorded: "Recorded",
+};
+
+function announcedDate(iso) {
+	if (!iso) return "";
+	const dt = new Date(iso);
+	if (!Number.isFinite(dt.getTime())) return "";
+	return new Intl.DateTimeFormat(undefined, {
+		year: "numeric", month: "short", day: "2-digit",
+	}).format(dt);
+}
+
+function codexSpecial(data) {
+	try {
+		const root = data && typeof data === "object" ? data.codex_special_reset : null;
+		if (!root || typeof root !== "object" || Array.isArray(root)) return null;
+		const value = root.announcement;
+		if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+		if (typeof value.id !== "string" || !value.id) return null;
+		const status = Object.prototype.hasOwnProperty.call(SPECIAL_RESET_STATUS, value.status)
+			? value.status : null;
+		const resetType = value.reset_type === "regular" || value.reset_type === "banked"
+			? value.reset_type : null;
+		if (!status || !resetType) return null;
+		// Only an explicitly zoned ISO timestamp is accepted; no local guess.
+		if (typeof value.announced_at !== "string" || !/(?:Z|[+-]\d{2}:\d{2})$/.test(value.announced_at)) return null;
+		const announced = announcedDate(value.announced_at);
+		if (!announced) return null;
+		if (typeof value.source_url !== "string" || !SPECIAL_RESET_SOURCE.test(value.source_url)) return null;
+		const checked = typeof root.fetched_at === "string" ? checkedDateTime(root.fetched_at) : "";
+		const fetched = typeof root.fetched_at === "string" ? Date.parse(root.fetched_at) : NaN;
+		return {
+			status,
+			statusLabel: SPECIAL_RESET_STATUS[status],
+			banked: resetType === "banked",
+			typeLabel: resetType === "banked" ? "Banked reset" : "Special reset",
+			announced: `Announced ${announced}`,
+			sourceUrl: value.source_url,
+			credit: SPECIAL_RESET_CREDIT,
+			// Missing boolean or malformed success timestamp is not freshness.
+			stale: root.stale !== false || !Number.isFinite(fetched),
+			checked,
+		};
+	} catch {
+		return null;
+	}
+}
+
+function openSpecialLink(url) {
+	if (url !== SPECIAL_RESET_CREDIT && !SPECIAL_RESET_SOURCE.test(url)) return;
+	try {
+		host.openExternal?.(url);
+	} catch {
+		/* opening a link must never break quota rendering */
+	}
+}
+
+function specialTipLines(special) {
+	const lines = [
+		`Special reset announcement · ${special.announced}`,
+		`${special.typeLabel} · ${special.statusLabel}`,
+	];
+	if (special.stale) lines.push(special.checked ? `Stale · checked ${special.checked}` : "Stale");
+	lines.push(`Data: ${special.credit}`);
+	if (special.sourceUrl) lines.push(`Source: ${special.sourceUrl}`);
+	return lines;
+}
+
+function SpecialResetNotice({ special }) {
+	const t = usePluginI18n(ID);
+	const linkClass = "text-(--ui-text-quaternary) underline decoration-dotted underline-offset-2 hover:text-(--ui-text-secondary) transition-colors";
+	return jsxs("div", {
+		"data-quota-special-reset": true,
+		className: "flex flex-col gap-1 rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-elevated) px-3 py-2 text-[0.6875rem]",
+		style: { flexShrink: 0, minWidth: 0, overflowWrap: "anywhere" },
+		children: [
+			jsxs("div", {
+				className: "flex items-center justify-between gap-2",
+				children: [
+					jsx("span", {
+						className: "font-medium text-(--ui-text-secondary)",
+						children: t("specialResetTitle"),
+					}),
+					special.banked
+						? jsx("span", {
+								className: "rounded bg-(--ui-control-hover-background) px-1.5 py-0.5 text-[0.625rem] text-(--ui-text-tertiary)",
+								children: special.typeLabel,
+							})
+						: null,
+				],
+			}),
+			jsx("div", {
+				className: "text-(--ui-text-tertiary)",
+				children: `${special.announced} · ${special.statusLabel}`,
+			}),
+			special.stale
+				? jsx("div", {
+						className: "text-(--ui-text-quaternary)",
+						children: special.checked ? t("specialResetStaleChecked", special.checked) : t("specialResetStale"),
+					})
+				: null,
+			jsxs("div", {
+				className: "flex flex-wrap items-center gap-x-3 gap-y-0.5",
+				children: [
+					jsx("a", {
+						href: special.credit,
+						target: "_blank",
+						rel: "noreferrer",
+						className: linkClass,
+						onClick: (event) => {
+							event.preventDefault();
+							openSpecialLink(special.credit);
+						},
+						children: special.credit,
+					}),
+					special.sourceUrl
+						? jsx("a", {
+								href: special.sourceUrl,
+								target: "_blank",
+								rel: "noreferrer",
+								className: linkClass,
+								onClick: (event) => {
+									event.preventDefault();
+									openSpecialLink(special.sourceUrl);
+								},
+								children: t("specialResetSource"),
+							})
+						: null,
+				],
+			}),
+		],
+	});
+}
+
 function isConfigured(provider) {
 	return provider && !provider.unavailable_reason;
 }
@@ -1139,6 +1283,8 @@ function QuotaChipWithBar() {
 	const stale = useCodexStale(data, isError || isPlaceholderData);
 	const providers =
 		data && data.providers ? statusEntries(data.providers, stale) : [];
+	const special = data && data.providers && isProviderEnabled("openai-codex") && data.providers["openai-codex"]
+		? codexSpecial(data) : null;
 	let worst = null;
 	let worstLabel = "";
 	let worstProvider = null;
@@ -1156,14 +1302,14 @@ function QuotaChipWithBar() {
 		// Unknown Codex cannot be ranked. Keep it alongside the existing
 		// balance-only fallback; money has no meaningful worst percentage.
 		const fallback = providers.filter(([pid, p]) => isProviderEnabled(pid) && (p?.display_accounts || accountFacts(p).balances.length));
-		if (fallback.length === 1 && fallback[0][1]?.display_accounts) return jsx(ProviderChip, { pid: fallback[0][0], provider: fallback[0][1] });
+		if (fallback.length === 1 && fallback[0][1]?.display_accounts) return jsx(ProviderChip, { pid: fallback[0][0], provider: fallback[0][1], special: fallback[0][0] === "openai-codex" ? special : null });
 		return fallback.length
-			? jsx("span", { className: "inline-flex h-full items-center", children: fallback.map(([pid, p]) => jsx(ProviderChip, { pid, provider: p, key: pid })) })
+			? jsx("span", { className: "inline-flex h-full items-center", children: fallback.map(([pid, p]) => jsx(ProviderChip, { pid, provider: p, special: pid === "openai-codex" ? special : null, key: pid })) })
 			: jsx("span", { children: "Q:none" });
 	}
 	const tone = toneForRemaining(worst);
 	const fill = toneColor(tone);
-	const tip = makeWorstTip(worstLabel, worst, data && data.providers, stale);
+	const tip = makeWorstTip(worstLabel, worst, data && data.providers, stale, special);
 	const button = jsxs("button", {
 		type: "button",
 		"aria-label": worstLabel + " " + (worstProvider?.display_accounts ? codexValue(worst) : worst + "%") + " · Open Quota pane",
@@ -1241,7 +1387,7 @@ function statusEntries(providers, stale = false) {
 	});
 }
 
-function codexAccountsTip(provider) {
+function codexAccountsTip(provider, special) {
 	const lines = [];
 	for (const [index, account] of provider.display_accounts.entries()) {
 		const remaining = codexRemaining(account);
@@ -1262,10 +1408,12 @@ function codexAccountsTip(provider) {
 			lines.push(`  ${w.label}${windows.length > 1 ? ` · ${value}` : ""}${reset ? ` · ${reset}` : ""}`);
 		}
 	}
+	// Provider-level announcement: appended once, never repeated per account.
+	if (special) lines.push("", ...specialTipLines(special));
 	return lines.join("\n");
 }
 
-function ProviderChip({ pid, provider }) {
+function ProviderChip({ pid, provider, special }) {
 	const cachedRemaining = provider?.display_stale ? provider.display_cached_remaining : provider?.display_remaining;
 	const r = provider && provider.unavailable_reason ? null : provider?.display_accounts ? cachedRemaining : worstWindow(provider);
 	const staleValue = Boolean(provider?.display_accounts && provider.display_stale && r != null);
@@ -1274,7 +1422,7 @@ function ProviderChip({ pid, provider }) {
 	const tone = provider?.display_accounts ? (provider.display_stale ? "muted" : toneForRemaining(r)) : providerTone(provider);
 	const dot = toneColor(tone);
 	const label = providerDisplayName(pid, provider);
-	const tip = makeProviderTip(pid, provider);
+	const tip = makeProviderTip(pid, provider, special);
 	const button = jsxs(
 		"button",
 		{
@@ -1298,7 +1446,7 @@ function ProviderChip({ pid, provider }) {
 }
 
 // Keep other providers' window details; Codex uses its compact account summary.
-function makeWorstTip(worstLabel, worst, providersObj, stale = false) {
+function makeWorstTip(worstLabel, worst, providersObj, stale = false, special = null) {
 	if (!providersObj) return `Quota · lowest ${worst}% (${worstLabel})`;
 	const blocks = [];
 	let hasCodex = false;
@@ -1309,15 +1457,16 @@ function makeWorstTip(worstLabel, worst, providersObj, stale = false) {
 		if (lines.length) blocks.push(lines.join("\n"));
 	}
 	if (blocks.length === 0) return `Quota · lowest ${worst}% (${worstLabel})`;
-	if (hasCodex && blocks.length === 1) return blocks[0];
+	const suffix = hasCodex && special ? `\n\n${specialTipLines(special).join("\n")}` : "";
+	if (hasCodex && blocks.length === 1) return blocks[0] + suffix;
 
-	return `Quota breakdown:\n${blocks.join("\n")}${hasCodex ? "" : "\nClick to open Quota pane"}`;
+	return `Quota breakdown:\n${blocks.join("\n")}${hasCodex ? "" : "\nClick to open Quota pane"}${suffix}`;
 }
 
 // Build a rich multiline tip for a single provider: lists ALL its windows
 // plus plan and detail lines (credits, banked resets).
-function makeProviderTip(pid, provider) {
-	if (provider?.display_accounts) return codexAccountsTip(provider);
+function makeProviderTip(pid, provider, special) {
+	if (provider?.display_accounts) return codexAccountsTip(provider, pid === "openai-codex" ? special : null);
 	const name = providerDisplayName(pid, provider);
 	if (!provider) return `${name}: unavailable`;
 	const details = asList(provider && provider.details);
@@ -1368,10 +1517,12 @@ function StatusBar() {
 		.filter(([pid]) => (!isError || pid === "openai-codex") && isProviderEnabled(pid))
 		.filter(([, p]) => p?.display_accounts || isConfigured(p));
 	if (entries.length === 0) return jsx(StatusDot, { tone: "muted" });
+	// Provider-level Codex announcement, surfaced once in the hover tip.
+	const special = codexSpecial(data);
 	return jsx("span", {
 		className: "inline-flex h-full items-center",
 		children: entries.map(([pid, p]) =>
-			jsx(ProviderChip, { pid, provider: p, key: pid }),
+			jsx(ProviderChip, { pid, provider: p, special: pid === "openai-codex" ? special : null, key: pid }),
 		),
 	});
 }
@@ -1876,9 +2027,17 @@ function QuotaPane() {
 		);
 		const withData = all.filter(([, p]) => isConfigured(p));
 		const withoutData = all.filter(([, p]) => !isConfigured(p));
+		// The announcement belongs to the Codex provider as a whole, so it is
+		// rendered once here instead of prefixing every account card.
+		const special =
+			!disabled.includes("openai-codex") &&
+			Object.prototype.hasOwnProperty.call(data.providers, "openai-codex")
+				? codexSpecial(data)
+				: null;
 		body = jsxs("div", {
 			className: "flex flex-col gap-2",
 			children: [
+				special ? jsx(SpecialResetNotice, { special, key: "codex-special-reset" }) : null,
 				...withData.map(([id, p], index) =>
 					jsx(ProviderRow, { id, provider: p, key: id === "openai-codex" ? `${id}-${index}` : id }),
 				),
@@ -2068,6 +2227,10 @@ export default {
 				noData: "no window data",
 				noDataSection: (n) => `No data (${n}) — click to expand`,
 				reset: (when) => `reset ${when}`,
+				specialResetTitle: "Special reset announcement",
+				specialResetSource: "View source announcement",
+				specialResetStale: "Stale announcement data",
+				specialResetStaleChecked: (checked) => `Stale announcement data · checked ${checked}`,
 				fetched: (when) => `Checked ${when}`,
 				fetchedAge: (age, interval) => `${age} old · poll ${interval}s`,
 				versionSkew: (widget, backend) =>
