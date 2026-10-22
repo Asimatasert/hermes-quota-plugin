@@ -15,6 +15,11 @@ function renderWidget(options = {}) {
     // Keep tooltip labels separate from trigger text/native title. This is a
     // structural test seam, not a simulation of hover (see hover test).
     Tip: props => ({type: 'Tip', props}),
+    // Radix Popover.Root renders no element, and the card is only built while
+    // open (useState(false) here): a closed chip stays Tip > trigger > button.
+    Popover: props => { const kids = [].concat(props.children).filter(Boolean); return kids.length === 1 ? kids[0] : {type: 'Popover', props}; },
+    PopoverTrigger: props => props.children,
+    PopoverContent: props => ({type: 'PopoverContent', props}),
     StatusDot: ({tone}) => jsx('span', {'data-tone': tone}),
     Input: 'input', Switch: 'input', SegmentedControl: 'span', icons: {},
     // Quota commands route to the focused profile's owner (#26); the pane reads

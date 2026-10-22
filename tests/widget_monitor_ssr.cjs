@@ -70,6 +70,9 @@ const sdk = {
   StatusDot: () => React.createElement('span', null),
   Switch: props => React.createElement('button', {'aria-checked': !!props.checked}),
   Tip: ({children}) => children,
+  Popover: ({children}) => React.createElement(React.Fragment, null, children),
+  PopoverTrigger: ({children}) => children,
+  PopoverContent: props => React.createElement('div', {'data-chip-card': props['data-chip-card']}, props.children),
   useMutation: () => ({mutate: () => {}, isPending: false}),
   usePluginI18n: () => translate,
   useQuery: opts => {
@@ -101,7 +104,6 @@ mod.register({
 
 const html = {};
 const page = items.find(i => i.area === 'routes');
-const agents = items.find(i => i.id === 'agents');
 for (const view of options.views || ['quota', 'live', 'health', 'usage', 'kanban']) {
   storage.set('paneView', view);
   // Re-apply persisted settings (register() read them once at load).
@@ -112,10 +114,12 @@ for (const view of options.views || ['quota', 'live', 'health', 'usage', 'kanban
     errors.push('render ' + view + ': ' + (e && e.stack || e));
   }
 }
-try {
-  html.agents = ReactDOMServer.renderToStaticMarkup(agents.render());
-} catch (e) {
-  errors.push('render agents: ' + (e && e.stack || e));
+for (const id of ['agents', 'cost']) {
+  try {
+    html[id] = ReactDOMServer.renderToStaticMarkup(items.find(i => i.id === id).render());
+  } catch (e) {
+    errors.push('render ' + id + ': ' + (e && e.stack || e));
+  }
 }
 try {
   html.settings = ReactDOMServer.renderToStaticMarkup(React.createElement(vm.runInContext('QuotaSettings', context)));

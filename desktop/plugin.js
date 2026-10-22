@@ -28,6 +28,9 @@ import {
 	Input,
 	icons,
 	PANES_AREA,
+	Popover,
+	PopoverContent,
+	PopoverTrigger,
 	queryClient,
 	ROUTES_AREA,
 	SegmentedControl,
@@ -1117,6 +1120,9 @@ function useQuota() {
 	});
 }
 
+// The bar is a clipped single line: a chip must never wrap or get squeezed.
+const CHIP_NOWRAP = { whiteSpace: "nowrap", flexShrink: 0 };
+
 // Statusbar tips must use the SDK portal, not native title (unreliable in
 // Electron). Preserve account/window lines; escape the short statusbar pane.
 function QuotaTip({ label, children }) {
@@ -1142,6 +1148,7 @@ function QuotaTip({ label, children }) {
 function QuotaChipWithBar() {
 	const { data, isError, isPlaceholderData } = useQuota();
 	const stale = useCodexStale(data, isError || isPlaceholderData);
+	const alerts = useQuotaChipAlerts();
 	const providers =
 		data && data.providers ? statusEntries(data.providers, stale) : [];
 	let worst = null;
@@ -1161,30 +1168,33 @@ function QuotaChipWithBar() {
 		// Unknown Codex cannot be ranked. Keep it alongside the existing
 		// balance-only fallback; money has no meaningful worst percentage.
 		const fallback = providers.filter(([pid, p]) => isProviderEnabled(pid) && (p?.display_accounts || accountFacts(p).balances.length));
-		if (fallback.length === 1 && fallback[0][1]?.display_accounts) return jsx(ProviderChip, { pid: fallback[0][0], provider: fallback[0][1] });
+		if (fallback.length === 1 && fallback[0][1]?.display_accounts) return jsx(ProviderChip, { pid: fallback[0][0], provider: fallback[0][1], alert: alerts(fallback[0][0], fallback[0][1]) });
 		return fallback.length
-			? jsx("span", { className: "inline-flex h-full items-center", children: fallback.map(([pid, p]) => jsx(ProviderChip, { pid, provider: p, key: pid })) })
+			? jsx("span", { className: "inline-flex h-full items-center", children: fallback.map(([pid, p]) => jsx(ProviderChip, { pid, provider: p, alert: alerts(pid, p), key: pid })) })
 			: jsx("span", { children: "Q:none" });
 	}
+	// Worst mode is one chip for every provider, so its alert is the most
+	// urgent one across all of them.
+	const alert = mergeChipAlerts(providers.filter(([pid]) => isProviderEnabled(pid)).map(([pid, p]) => alerts(pid, p)));
 	const tone = toneForRemaining(worst);
 	const tip = makeWorstTip(worstLabel, worst, data && data.providers, stale);
+	const valueText = worstLabel + " " + (worstProvider?.display_accounts ? codexValue(worst) : worst + "%");
 	const button = jsxs("button", {
 		type: "button",
-		"aria-label": worstLabel + " " + (worstProvider?.display_accounts ? codexValue(worst) : worst + "%") + " · Open Quota pane",
+		"aria-label": valueText + chipAlertAria(alert) + " · " + tr("chipQuotaOpen"),
 		className:
-			"inline-flex items-center gap-1.5 px-1.5 py-0.5 rounded cursor-pointer hover:bg-(--chrome-action-hover) transition-colors",
-		onClick: () => {
-			if (typeof host.navigate === "function") host.navigate("/quota");
-		},
+			"qm-sb-chip inline-flex items-center gap-1.5 px-1.5 py-0.5 rounded cursor-pointer hover:bg-(--chrome-action-hover) transition-colors",
+		style: CHIP_NOWRAP,
 		children: [
 			jsx(Ring, { value: worst, tone, size: 13, stroke: 2, label: `${worst}%` }),
 			jsx("span", {
 				className: "text-[0.6875rem] text-(--ui-text-secondary)",
-				children: worstLabel + " " + (worstProvider?.display_accounts ? codexValue(worst) : worst + "%"),
+				children: valueText,
 			}),
+			jsx(ChipAlert, { alert }),
 		],
 	});
-	return jsx(QuotaTip, { label: tip, children: button });
+	return jsx(ChipPopover, { tip, kind: "quota", width: 300, card: (close) => jsx(QuotaCard, { close }), children: button });
 }
 
 // Only explicit saved labels are display text; never infer an identity.
@@ -1262,7 +1272,7 @@ function codexAccountsTip(provider) {
 	return lines.join("\n");
 }
 
-function ProviderChip({ pid, provider }) {
+function ProviderChip({ pid, provider, alert = null }) {
 	const cachedRemaining = provider?.display_stale ? provider.display_cached_remaining : provider?.display_remaining;
 	const r = provider && provider.unavailable_reason ? null : provider?.display_accounts ? cachedRemaining : worstWindow(provider);
 	const staleValue = Boolean(provider?.display_accounts && provider.display_stale && r != null);
@@ -1276,14 +1286,12 @@ function ProviderChip({ pid, provider }) {
 		"button",
 		{
 			type: "button",
-			"aria-label": `${label} ${value}${staleValue ? " · stale" : ""} · Open Quota pane`,
+			"aria-label": `${label} ${value}${staleValue ? " · stale" : ""}${chipAlertAria(alert)} · ${tr("chipQuotaOpen")}`,
 			className: cn(
-				"inline-flex h-full items-center gap-1 px-1.5 text-[0.6875rem]",
+				"qm-sb-chip inline-flex h-full items-center gap-1 px-1.5 text-[0.6875rem]",
 				"text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground transition-colors",
 			),
-			onClick: () => {
-				if (typeof host.navigate === "function") host.navigate("/quota");
-			},
+			style: CHIP_NOWRAP,
 			children: [
 				// A percentage gets Agent Bar's mini ring; balance/availability-only
 				// providers keep the plain dot.
@@ -1292,10 +1300,11 @@ function ProviderChip({ pid, provider }) {
 					: jsx("span", { className: "inline-block h-1.5 w-1.5 rounded-full", style: { background: dot } }),
 				jsx("span", { children: label }),
 				jsx("span", { className: "tabular-nums", style: staleValue ? { textDecoration: "line-through" } : undefined, children: value }),
+				jsx(ChipAlert, { alert }),
 			],
 		},
 	);
-	return jsx(QuotaTip, { label: tip, children: button });
+	return jsx(ChipPopover, { tip, kind: "quota", width: 300, card: (close) => jsx(QuotaCard, { close }), children: button });
 }
 
 // Keep other providers' window details; Codex uses its compact account summary.
@@ -1312,7 +1321,7 @@ function makeWorstTip(worstLabel, worst, providersObj, stale = false) {
 	if (blocks.length === 0) return `Quota · lowest ${worst}% (${worstLabel})`;
 	if (hasCodex && blocks.length === 1) return blocks[0];
 
-	return `Quota breakdown:\n${blocks.join("\n")}${hasCodex ? "" : "\nClick to open Quota pane"}`;
+	return `Quota breakdown:\n${blocks.join("\n")}${hasCodex ? "" : `\n${tr("chipQuotaOpen")}`}`;
 }
 
 // Build a rich multiline tip for a single provider: lists ALL its windows
@@ -1325,7 +1334,7 @@ function makeProviderTip(pid, provider) {
 	if (provider.unavailable_reason) {
 		// Preserve actionable diagnostics alongside the reason code.
 		const lines = [`${name}: unavailable (${provider.unavailable_reason})`, ...details];
-		lines.push("Click to open Quota pane");
+		lines.push(tr("chipQuotaOpen"));
 		return lines.join("\n");
 	}
 	const lines = providerWindowLines(pid, provider);
@@ -1335,7 +1344,7 @@ function makeProviderTip(pid, provider) {
 	if (provider.plan) lines.unshift(`Plan: ${provider.plan}`);
 	lines.unshift(name);
 	if (details.length) lines.push(...details);
-	lines.push("Click to open Quota pane");
+	lines.push(tr("chipQuotaOpen"));
 	return lines.join("\n");
 }
 
@@ -1359,6 +1368,7 @@ function StatusBar() {
 	const mode = useValue(statusbarModeAtom);
 	const { data, isError, isPlaceholderData } = useQuota();
 	const stale = useCodexStale(data, isError || isPlaceholderData);
+	const alerts = useQuotaChipAlerts();
 	if (!showStatusBar) return null;
 	if (mode === "worst") return jsx(QuotaChipWithBar, {});
 	if (!data || !data.providers)
@@ -1372,7 +1382,7 @@ function StatusBar() {
 	return jsx("span", {
 		className: "inline-flex h-full items-center",
 		children: entries.map(([pid, p]) =>
-			jsx(ProviderChip, { pid, provider: p, key: pid }),
+			jsx(ProviderChip, { pid, provider: p, alert: alerts(pid, p), key: pid }),
 		),
 	});
 }
@@ -2050,7 +2060,11 @@ function QuotaSettings() {
 				children: [
 					jsx(ShowStatusBarControl, {}, "show"),
 					jsx(StatusbarModeControl, {}, "mode"),
+					jsx(QuotaAlertsControl, {}, "quotaAlerts"),
 					jsx(AgentsChipControl, {}, "agents"),
+					jsx(ChipSparkControl, {}, "spark"),
+					jsx(ChipFlashControl, {}, "flash"),
+					jsx(CostChipControl, {}, "cost"),
 					jsx(NavBadgeControl, {}, "nav"),
 				],
 			}),
@@ -2350,6 +2364,16 @@ const MONITOR_ENABLED_KEY = "monitorEnabled";
 const monitorEnabledAtom = atom(true);
 const AGENTS_CHIP_KEY = "statusbarAgents";
 const agentsChipAtom = atom(true);
+// Status-bar extras, each with its own switch in Settings ▸ Status bar.
+const CHIP_SPARK_KEY = "statusbarSparkline";
+const chipSparkAtom = atom(true);
+const CHIP_FLASH_KEY = "statusbarFlash";
+const chipFlashAtom = atom(true);
+const QUOTA_ALERTS_KEY = "statusbarQuotaAlerts";
+const quotaAlertsAtom = atom(true);
+// null = never chosen: the cost chip then follows "is a budget set?".
+const COST_CHIP_KEY = "statusbarCost";
+const costChipAtom = atom(null);
 const QUOTA_FORECAST_KEY = "quotaForecast";
 const quotaForecastAtom = atom(true);
 const HISTORY_DAYS_KEY = "historyDays";
@@ -2383,6 +2407,15 @@ function applyStoredMonitor() {
 	applyStored(PANE_VIEW_KEY, paneViewAtom, MONITOR_VIEWS, "quota");
 	applyStoredBoolean(MONITOR_ENABLED_KEY, monitorEnabledAtom, true);
 	applyStoredBoolean(AGENTS_CHIP_KEY, agentsChipAtom, true);
+	applyStoredBoolean(CHIP_SPARK_KEY, chipSparkAtom, true);
+	applyStoredBoolean(CHIP_FLASH_KEY, chipFlashAtom, true);
+	applyStoredBoolean(QUOTA_ALERTS_KEY, quotaAlertsAtom, true);
+	try {
+		const cost = readStored(COST_CHIP_KEY, null);
+		costChipAtom.set(typeof cost === "boolean" ? cost : null);
+	} catch {
+		/* noop */
+	}
 	applyStoredBoolean(QUOTA_FORECAST_KEY, quotaForecastAtom, true);
 	for (const kind of NOTIFY_KINDS) applyStoredBoolean(notifyKey(kind), notifyAtoms[kind], true);
 	try {
@@ -3878,44 +3911,665 @@ function AccountHints({ providers }) {
 	});
 }
 
-// ---- status bar: working / your-turn chip (+ the notifier) ----
+// ---- status bar: chips, cards and the attention flash ----------------------
+//
+// Agents, quota and cost chips share ONE monitor snapshot query (useMonitor —
+// React Query dedupes by key) plus the quota status query the provider chips
+// already read, so no chip adds a CLI call. Each renders nothing until its data
+// exists (old backend, monitor off, no usage yet). Hover keeps the short SDK
+// tip; a click opens a Popover card whose footer links to the matching tab.
+// The bar is crowded, so the chips stay a few characters wide and the detail
+// lives in the cards.
+
+const SB_STYLE_ID = "quota-plugin-statusbar-css";
+// Every selector carries the plugin's own `qm-sb-` prefix: the sheet is global.
+const STATUSBAR_CSS = [
+	"@keyframes qm-sb-flash{0%,100%{background-color:transparent}50%{background-color:color-mix(in srgb,var(--qm-sb-flash) 30%,transparent)}}",
+	".qm-sb-flash{animation:qm-sb-flash .9s ease-in-out 3}",
+	"@media (prefers-reduced-motion:reduce){.qm-sb-flash{animation:none;background-color:color-mix(in srgb,var(--qm-sb-flash) 18%,transparent)}}",
+	".qm-sb-chip:focus-visible,.qm-sb-row:focus-visible{outline:1px solid var(--ui-accent);outline-offset:-1px}",
+	// A row's "open" / "copy" hint shows on hover or keyboard focus only.
+	".qm-sb-act{opacity:0;transition:opacity .12s}.qm-sb-row:hover .qm-sb-act,.qm-sb-row:focus-visible .qm-sb-act{opacity:1}",
+].join("\n");
+
+/** Injects the chip keyframes once (idempotent; hot reload replaces the text). */
+function ensureStatusbarStyles() {
+	try {
+		if (typeof document === "undefined" || !document.head) return null;
+		let el = document.getElementById(SB_STYLE_ID);
+		if (!el) {
+			el = document.createElement("style");
+			el.id = SB_STYLE_ID;
+			document.head.appendChild(el);
+		}
+		if (el.textContent !== STATUSBAR_CSS) el.textContent = STATUSBAR_CSS;
+		return el;
+	} catch {
+		return null;
+	}
+}
+
+// The flash runs three 0.9 s beats; the class is dropped a little after.
+const FLASH_MS = 3_000;
+const FLASH_STATES = ["needs_approval", "waiting"];
+
+/** Open main sessions that wait on the user right now: id → state. */
+function attentionStates(live) {
+	const out = new Map();
+	for (const r of asList(live && live.running)) {
+		if (!r || r.subagent || r.id == null) continue;
+		const state = sessionState(r);
+		if (FLASH_STATES.includes(state)) out.set(String(r.id), state);
+	}
+	return out;
+}
+
+/**
+ * Flash only when a session NEWLY enters "your turn" / "needs approval".
+ * `prev` null is the first look: it seeds and never flashes, so opening the app
+ * with five sessions already waiting stays calm. A session that stays in the
+ * same state never re-flashes; approval outranks your-turn.
+ */
+function attentionFlash(prev, live) {
+	const next = attentionStates(live);
+	let kind = null;
+	if (prev) {
+		for (const [id, state] of next) {
+			if (prev.get(id) === state) continue;
+			if (state === "needs_approval") kind = "needs_approval";
+			else if (!kind) kind = "waiting";
+		}
+	}
+	return { next, kind };
+}
+
+// Per gateway/profile, module-level: a remount (hot reload, bar re-render)
+// must not count every waiting session as new again.
+const _flashSeen = new Map();
+
+function useAttentionFlash(scope, snapshot) {
+	const [flash, setFlash] = useState(null);
+	const key = scope ? `${scope.connectionId}|${scope.profile}` : "";
+	useEffect(() => {
+		// Re-assert the keyframes: a hot reload may dispose the old copy last.
+		ensureStatusbarStyles();
+		if (!snapshot) return;
+		const r = attentionFlash(_flashSeen.has(key) ? _flashSeen.get(key) : null, snapshot.live);
+		_flashSeen.set(key, r.next);
+		if (r.kind && chipFlashAtom.get()) setFlash(r.kind);
+	}, [key, snapshot]);
+	useEffect(() => {
+		if (!flash) return undefined;
+		const id = setTimeout(() => setFlash(null), FLASH_MS);
+		return () => clearTimeout(id);
+	}, [flash]);
+	return flash;
+}
+
+/** Tokens per minute over the last `n` sampled minutes, oldest first. */
+function tokenSeries(live, n = 30) {
+	return asList(live && live.tokens).slice(-n).map(tokenTotal);
+}
+
+/** Coloured count segments of the compact agents chip; zero counts drop out. */
+function agentChipSegments(counts) {
+	const c = asObject(counts);
+	const segments = [
+		["needs_approval", c.needs_approval],
+		["working", c.working],
+		["waiting", c.your_turn],
+		["stalled", c.stalled],
+	]
+		.map(([state, n]) => ({ state, n: Math.max(0, Number(n) || 0) }))
+		.filter((s) => s.n > 0);
+	return segments.length ? segments : [{ state: "working", n: 0 }];
+}
+
+const AGENT_CARD_ORDER = ["needs_approval", "waiting", "stalled", "working"];
+
+/** Open main sessions grouped for the agents card, most urgent group first. */
+function agentCardGroups(live) {
+	const rows = asList(live && live.running).filter((r) => r && !r.subagent && sessionState(r) !== "ended");
+	const bucket = (r) => (AGENT_CARD_ORDER.includes(sessionState(r)) ? sessionState(r) : "working");
+	return AGENT_CARD_ORDER.map((state) => ({
+		state,
+		rows: rows.filter((r) => bucket(r) === state).sort((a, b) => (Number(b.last) || 0) - (Number(a.last) || 0)),
+	})).filter((g) => g.rows.length);
+}
+
+/** What clicking a card row does: Hermes sessions open, CLI rows copy. */
+function agentRowAction(row) {
+	const hermes = row && row.open ? row.open.kind === "hermes-session" : !row || !row.kind || row.kind === "hermes";
+	if (hermes) return "open";
+	return row && row.open && row.open.command ? "copy" : "none";
+}
+
+// Quota chip alerts: a reset countdown once a window is this full, plus the
+// forecast's time-to-full when it fills before the reset.
+const QUOTA_CHIP_ALERT_USED = 85;
+
+/** Most urgent reset / fill for one provider's windows, or null. Pure. */
+function quotaChipAlert(pid, provider, burnMap, nowSec = Date.now() / 1000) {
+	if (!provider || provider.unavailable_reason || provider.display_stale) return null;
+	let reset = null;
+	let full = null;
+	for (const w of asWindowList(provider.windows)) {
+		const used = finiteNumber(w.used_percent);
+		if (used == null) continue;
+		const resetSec = isoToSeconds(w.reset_at);
+		if (used >= QUOTA_CHIP_ALERT_USED && resetSec != null && resetSec > nowSec) {
+			const seconds = resetSec - nowSec;
+			if (!reset || used > reset.used || (used === reset.used && seconds < reset.seconds)) reset = { window: w.label || "", used, seconds };
+		}
+		const f = forecastFor(burnFor(burnMap, pid, provider, w.label), w, nowSec);
+		if (f && f.fills && f.inSeconds != null && (!full || f.inSeconds < full.seconds)) full = { window: w.label || "", seconds: f.inSeconds, soon: Boolean(f.soon) };
+	}
+	if (!reset && !full) return null;
+	return {
+		reset: reset ? { ...reset, text: fmtSpan(reset.seconds) } : null,
+		full: full ? { ...full, text: fmtSpan(full.seconds) } : null,
+	};
+}
+
+/** Worst-mode chip: the fullest reset and the earliest fill across providers. */
+function mergeChipAlerts(alerts) {
+	let reset = null;
+	let full = null;
+	for (const a of asList(alerts)) {
+		if (!a) continue;
+		if (a.reset && (!reset || a.reset.used > reset.used || (a.reset.used === reset.used && a.reset.seconds < reset.seconds))) reset = a.reset;
+		if (a.full && (!full || a.full.seconds < full.seconds)) full = a.full;
+	}
+	return reset || full ? { reset, full } : null;
+}
+
+function chipAlertAria(alert) {
+	if (!alert) return "";
+	return [alert.reset ? ` · ${tr("popoverReset", alert.reset.text)}` : "", alert.full ? ` · ${tr("fillsIn", alert.full.text)}` : ""].join("");
+}
+
+/** `(pid, provider) → alert` bound to the shared snapshot's live burn. */
+function useQuotaChipAlerts() {
+	const on = useValue(quotaAlertsAtom);
+	const mon = useMonitor();
+	const nowMs = useNow(30_000);
+	const burnMap = on && mon.snapshot ? monitorBurnMap(mon.snapshot, null) : null;
+	return (pid, provider) => (on ? quotaChipAlert(pid, provider, burnMap, nowMs / 1000) : null);
+}
+
+function ChipAlert({ alert }) {
+	const t = usePluginI18n(ID);
+	if (!alert) return null;
+	return jsxs("span", {
+		"data-chip-alert": true,
+		style: { display: "inline-flex", alignItems: "center", gap: 5, ...UI.num },
+		children: [
+			alert.reset
+				? jsx("span", { "data-chip-reset": alert.reset.text, style: { color: "var(--ui-text-quaternary)" }, children: `↻ ${alert.reset.text}` }, "r")
+				: null,
+			alert.full
+				? jsx("span", { "data-chip-full": alert.full.text, style: { color: toneColor(alert.full.soon ? "bad" : "warn"), fontWeight: 600 }, children: t("chipFullIn", alert.full.text) }, "f")
+				: null,
+		],
+	});
+}
+
+/** Agent Bar's budget thresholds: ≥ 100 % danger, ≥ 80 % warn. */
+function budgetTone(pct) {
+	if (pct == null || !Number.isFinite(pct)) return null;
+	return pct >= 100 ? "bad" : pct >= 80 ? "warn" : "good";
+}
+
+/** Today vs the daily budget and month-to-date vs the monthly one; worst wins. */
+function costChipState(summary, daily, monthly) {
+	const parts = [];
+	if (daily > 0) parts.push({ kind: "daily", spent: summary.today, limit: daily, pct: (summary.today / daily) * 100 });
+	if (monthly > 0) parts.push({ kind: "monthly", spent: summary.mtd, limit: monthly, pct: (summary.mtd / monthly) * 100 });
+	const worst = parts.reduce((a, b) => (!a || b.pct > a.pct ? b : a), null);
+	return { parts, worst, tone: budgetTone(worst ? worst.pct : null) };
+}
+
+/** The chip only shows if switched on — by default only once a budget exists. */
+function costChipEnabled(stored, daily, monthly) {
+	return typeof stored === "boolean" ? stored : daily > 0 || monthly > 0;
+}
+
+/** Status-bar money: "$4.20", "$46.50", "$460", "$1.2k", "$12k". */
+function fmtUsdShort(value) {
+	const n = finiteNumber(value);
+	if (n == null) return "—";
+	const abs = Math.abs(n);
+	const sign = n < 0 ? "-" : "";
+	if (abs >= 9_950) return `${sign}$${Math.round(abs / 1000)}k`;
+	if (abs >= 999.5) return `${sign}$${(abs / 1000).toFixed(1)}k`;
+	if (abs >= 99.995) return `${sign}$${Math.round(abs)}`;
+	return `${sign}$${abs.toFixed(2)}`;
+}
+
+/** Top models by today's cost (the snapshot's `usage.today.by_model`). */
+function topModelsToday(usage, n = 3) {
+	return asList(asObject(asObject(usage).today).by_model)
+		.filter((m) => m && m.model)
+		.slice()
+		.sort((a, b) => (Number(b.cost) || 0) - (Number(a.cost) || 0))
+		.slice(0, n);
+}
+
+// ---- status bar: shared pieces ----
+
+/** Tiny inline area sparkline for a chip; hidden when everything is zero. */
+function MiniSpark({ values, width = 30, height = 12, color = "var(--ui-accent)" }) {
+	if (!Array.isArray(values) || values.length < 2 || !values.some((v) => v > 0)) return null;
+	const top = Math.max(...values) || 1;
+	const step = width / (values.length - 1);
+	const line = values
+		.map((v, i) => `${i ? "L" : "M"}${(i * step).toFixed(1)} ${(height - 1 - (Math.max(0, v) / top) * (height - 2)).toFixed(1)}`)
+		.join(" ");
+	return jsxs("svg", {
+		width,
+		height,
+		viewBox: `0 0 ${width} ${height}`,
+		"aria-hidden": true,
+		"data-chip-spark": true,
+		style: { display: "block", flexShrink: 0, overflow: "visible" },
+		children: [
+			jsx("path", { d: `${line} L${width} ${height} L0 ${height} Z`, fill: color, fillOpacity: 0.16, stroke: "none" }, "a"),
+			jsx("path", { d: line, fill: "none", stroke: color, strokeWidth: 1.1, strokeLinejoin: "round", strokeLinecap: "round" }, "l"),
+		],
+	});
+}
+
+/**
+ * A chip button with the SDK tip on hover and a Popover card on click. The
+ * card is only built while open, so a closed chip costs nothing extra.
+ * Tip > PopoverTrigger > button: both triggers are Slots on the same button,
+ * the way core stacks Tooltip + DropdownMenu triggers in its own status bar.
+ */
+function ChipPopover({ tip, card, kind, width = 300, children }) {
+	const [open, setOpen] = useState(false);
+	const trigger = jsx(PopoverTrigger, { asChild: true, children });
+	return jsxs(Popover, {
+		open,
+		onOpenChange: setOpen,
+		children: [
+			tip ? jsx(QuotaTip, { label: tip, children: trigger }, "tip") : trigger,
+			open
+				? jsx(PopoverContent, {
+						side: "top",
+						align: "end",
+						sideOffset: 6,
+						"data-chip-card": kind,
+						style: { width, maxWidth: "calc(100vw - 16px)", padding: 0 },
+						children: card(() => setOpen(false)),
+					}, "card")
+				: null,
+		],
+	});
+}
+
+/** Card frame: small uppercase header, scrolling body, one link in the footer. */
+function ChipCard({ kind, title, sub, link, onLink, children }) {
+	return jsxs("div", {
+		"data-chip-card-body": kind,
+		style: { ...UI.col, maxHeight: "min(70vh, 460px)" },
+		children: [
+			jsxs("div", {
+				style: { display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 8, padding: "9px 12px 6px", minWidth: 0 },
+				children: [
+					jsx("span", { style: { fontSize: "0.625rem", fontWeight: 650, letterSpacing: "0.06em", textTransform: "uppercase", color: "var(--ui-text-tertiary)", ...UI.ellipsis }, children: title }),
+					sub ? jsx("span", { style: { ...UI.faint, ...UI.num, flexShrink: 0 }, children: sub }) : null,
+				],
+			}),
+			jsx("div", { style: { ...UI.col, gap: 10, padding: "2px 12px 10px", overflowY: "auto", minHeight: 0 }, children }),
+			jsx("div", {
+				style: { display: "flex", justifyContent: "flex-end", borderTop: "1px solid var(--ui-stroke-tertiary)", padding: "4px 6px" },
+				children: jsx("button", {
+					type: "button",
+					"data-card-link": kind,
+					className: "qm-sb-row cursor-pointer rounded hover:bg-(--chrome-action-hover) transition-colors",
+					style: { border: 0, background: "transparent", padding: "3px 8px", fontSize: "0.6875rem", fontWeight: 600, color: "var(--ui-accent)" },
+					onClick: onLink,
+					children: `${link} →`,
+				}),
+			}),
+		],
+	});
+}
+
+function openMonitorTab(view) {
+	setPaneView(view);
+	if (typeof host.navigate === "function") host.navigate("/quota");
+}
+
+// ---- agents chip + card ----
+
+function AgentCardRow({ row, nowSec, onPick }) {
+	const t = usePluginI18n(ID);
+	const state = sessionState(row);
+	const action = agentRowAction(row);
+	const who = !row.kind || row.kind === "hermes" ? row.profile || "default" : row.source_name || row.kind;
+	return jsxs("button", {
+		type: "button",
+		"data-card-row": row.id,
+		"data-row-action": action,
+		className: "qm-sb-row cursor-pointer rounded hover:bg-(--chrome-action-hover) transition-colors",
+		title: action === "open" ? t("openSessionTip") : action === "copy" ? t("copyCommandTip", row.open.command) : undefined,
+		onClick: () => onPick(row),
+		style: { ...UI.row, gap: 8, width: "100%", padding: "4px 6px", border: 0, background: "transparent", color: "inherit", textAlign: "left", boxSizing: "border-box" },
+		children: [
+			jsx(Dot, { color: STATE_STYLE[state] || STATE_STYLE.ended, size: 6, halo: state === "working" }),
+			jsxs("span", {
+				style: { ...UI.col, flex: "1 1 auto", gap: 1 },
+				children: [
+					jsx("span", { style: { ...UI.text, ...UI.ellipsis }, children: row.title || t("untitled") }),
+					jsx("span", { style: { ...UI.tiny, ...UI.ellipsis, ...UI.num }, children: [who, row.model, row.last ? t("ago", fmtSpan(nowSec - Number(row.last))) : null].filter(Boolean).join(" · ") }),
+				],
+			}),
+			action !== "none" ? jsx("span", { className: "qm-sb-act", style: { ...UI.tiny, flexShrink: 0 }, children: action === "open" ? t("cardOpen") : t("cardCopy") }) : null,
+		],
+	});
+}
+
+const AGENT_CARD_ROWS = 5;
+
+function AgentsCard({ snapshot, scope, close }) {
+	const t = usePluginI18n(ID);
+	const live = asObject(snapshot && snapshot.live);
+	const nowSec = finiteNumber(live.now) ?? Date.now() / 1000;
+	const counts = liveCounts(live);
+	const groups = agentCardGroups(live);
+	const series = tokenSeries(live, 60);
+	const pick = (row) => {
+		close();
+		void openMonitorTarget(scope, { open: row.open, row, sessionId: row.id, profile: row.profile }, snapshot);
+	};
+	return jsxs(ChipCard, {
+		kind: "agents",
+		title: `${t("openSessions")} · ${counts.open || 0}`,
+		sub: finiteNumber(live.last_1m) != null ? t("tokensPerMinN", fmtTokens(live.last_1m)) : null,
+		link: t("cardOpenLive"),
+		onLink: () => {
+			close();
+			openMonitorTab("live");
+		},
+		children: [
+			series.some((v) => v > 0)
+				? jsx(Sparkline, { values: series, height: 24, color: counts.working ? STATE_STYLE.working : "var(--ui-accent)", label: t("tokensChart") }, "spark")
+				: null,
+			groups.length
+				? groups.map((g) =>
+						jsxs("div", {
+							"data-card-group": g.state,
+							style: { ...UI.col, gap: 1 },
+							children: [
+								jsxs("div", { style: { ...UI.row, gap: 6, padding: "0 0 2px" }, children: [jsx(StateBadge, { state: g.state }), jsx("span", { style: { ...UI.faint, ...UI.num }, children: String(g.rows.length) })] }),
+								...g.rows.slice(0, AGENT_CARD_ROWS).map((row) => jsx(AgentCardRow, { row, nowSec, onPick: pick }, row.id)),
+								g.rows.length > AGENT_CARD_ROWS ? jsx("span", { style: { ...UI.tiny, padding: "1px 6px" }, children: t("moreDetails", g.rows.length - AGENT_CARD_ROWS) }, "more") : null,
+							],
+						}, g.state),
+					)
+				: jsx(Empty, { children: t("noOpenSessions") }, "empty"),
+			counts.subagents ? jsx("span", { style: UI.tiny, children: t("subagentsN", counts.subagents) }, "subs") : null,
+		],
+	});
+}
 
 function MonitorStatus() {
 	const t = usePluginI18n(ID);
 	const show = useValue(agentsChipAtom);
 	const showBar = useValue(showStatusBarAtom);
+	const spark = useValue(chipSparkAtom);
 	const { data } = useQuota();
 	const mon = useMonitor();
 	useMonitorNotifier(mon.scope, data, mon.snapshot);
+	const flash = useAttentionFlash(mon.scope, mon.snapshot);
 	if (!show || !showBar || !mon.snapshot) return null;
-	const counts = liveCounts(mon.snapshot.live);
+	const live = asObject(mon.snapshot.live);
+	const counts = liveCounts(live);
 	if (!counts.open) return null;
 	const approval = Number(counts.needs_approval) || 0;
 	const label = [
 		t("chipWorking", counts.working || 0),
 		counts.your_turn ? t("chipYourTurn", counts.your_turn) : null,
 		approval ? t("chipApproval", approval) : null,
+		counts.stalled ? t("countStalled", counts.stalled) : null,
 	].filter(Boolean).join(" · ");
-	const color = approval ? STATE_STYLE.needs_approval : counts.working ? STATE_STYLE.working : STATE_STYLE.waiting;
-	return jsx(QuotaTip, {
-		label: `${t("openSessions")}: ${counts.open}\n${label}\n${t("chipOpenLive")}`,
-		children: jsxs("button", {
-			type: "button",
-			"aria-label": `${label} · ${t("chipOpenLive")}`,
-			"data-agents-chip": true,
-			className: cn(
-				"inline-flex h-full items-center gap-1 px-1.5 text-[0.6875rem]",
-				"text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground transition-colors",
+	const series = spark ? tokenSeries(live, 30) : [];
+	const button = jsxs("button", {
+		type: "button",
+		"aria-label": `${label} · ${t("chipOpenList")}`,
+		"data-agents-chip": true,
+		"data-flash": flash || undefined,
+		className: cn(
+			"qm-sb-chip inline-flex h-full items-center gap-1 px-1.5 text-[0.6875rem]",
+			"text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground transition-colors",
+			flash ? "qm-sb-flash" : null,
+		),
+		style: { ...CHIP_NOWRAP, gap: 6, ...(flash ? { "--qm-sb-flash": STATE_STYLE[flash] } : {}) },
+		children: [
+			...agentChipSegments(counts).map((s) =>
+				jsxs("span", {
+					"data-seg": s.state,
+					style: { display: "inline-flex", alignItems: "center", gap: 3 },
+					children: [
+						jsx(Dot, { color: STATE_STYLE[s.state], size: 6 }),
+						jsx("span", { className: "tabular-nums", style: s.state === "needs_approval" ? { color: STATE_STYLE.needs_approval, fontWeight: 600 } : undefined, children: String(s.n) }),
+					],
+				}, s.state),
 			),
-			onClick: () => {
-				setPaneView("live");
-				if (typeof host.navigate === "function") host.navigate("/quota");
-			},
-			children: [
-				jsx(Dot, { color, size: 6, halo: Boolean(counts.working) && !approval }),
-				jsx("span", { className: "tabular-nums", style: approval ? { color: STATE_STYLE.needs_approval, fontWeight: 600 } : undefined, children: label }),
-			],
-		}),
+			jsx(MiniSpark, { values: series, color: counts.working ? STATE_STYLE.working : "var(--ui-text-quaternary)" }, "spark"),
+		],
+	});
+	return jsx(ChipPopover, {
+		tip: `${t("openSessions")}: ${counts.open}\n${label}\n${t("chipOpenList")}`,
+		kind: "agents",
+		width: 320,
+		card: (close) => jsx(AgentsCard, { snapshot: mon.snapshot, scope: mon.scope, close }),
+		children: button,
+	});
+}
+
+// ---- quota card ----
+
+function QuotaCardWindow({ w, nowMs }) {
+	const t = usePluginI18n(ID);
+	const r = remainingPct(w);
+	const tone = toneForRemaining(r);
+	const label = w.label || "window";
+	const reset = w.reset_at ? relativeCountdown(w.reset_at, nowMs) : "";
+	return jsxs("div", {
+		"data-card-window": label,
+		title: [label, r == null ? "—" : `${r}% ${t("left")}`, reset ? t("popoverReset", reset) : ""].filter(Boolean).join(" · "),
+		style: { ...UI.col, alignItems: "center", gap: 2, width: 84 },
+		children: [
+			jsx(Ring, {
+				value: r,
+				tone,
+				size: 32,
+				stroke: 3,
+				label: `${label} ${r == null ? "—" : `${r}% ${t("left")}`}`,
+				children: jsx("span", { style: { fontSize: 9, fontWeight: 650, color: "var(--ui-text-primary)", ...UI.num }, children: r == null ? "—" : `${r}%` }),
+			}),
+			jsx("span", { style: { ...UI.tiny, color: "var(--ui-text-secondary)", textAlign: "center", lineHeight: 1.2, maxWidth: "100%", ...UI.ellipsis }, children: label }),
+			reset ? jsx("span", { style: { ...UI.tiny, ...UI.num, lineHeight: 1.1 }, children: `↻ ${reset}` }) : null,
+		],
+	});
+}
+
+function QuotaCard({ close }) {
+	const t = usePluginI18n(ID);
+	const { data } = useQuota();
+	const mon = useMonitor();
+	const forecastOn = useValue(quotaForecastAtom);
+	const nowMs = useNow(30_000);
+	const burnMap = mon.snapshot ? monitorBurnMap(mon.snapshot, null) : null;
+	const entries = providerEntries(data && data.providers).filter(
+		([pid, p]) => isProviderEnabled(pid) && isConfigured(p) && (asWindowList(p.windows).length || accountFacts(p).balances.length),
+	);
+	const toQuota = () => {
+		close();
+		openMonitorTab("quota");
+	};
+	return jsx(ChipCard, {
+		kind: "quota",
+		title: t("quotaCardTitle"),
+		sub: data && data.age_s != null ? t("checkedAgo", formatAgeSeconds(Number(data.age_s))) : null,
+		link: t("cardOpenQuota"),
+		onLink: toQuota,
+		children: entries.length
+			? entries.map(([pid, p], i) => {
+					const windows = asWindowList(p.windows);
+					const forecasts = forecastOn
+						? windows
+								.map((w) => ({ w, f: forecastFor(burnFor(burnMap, pid, p, w.label), w, nowMs / 1000) }))
+								.filter((x) => x.f)
+						: [];
+					const balances = accountFacts(p).balances;
+					return jsxs("div", {
+						"data-card-provider": pid,
+						style: { ...UI.col, gap: 6, paddingTop: i ? 8 : 0, borderTop: i ? "1px solid var(--ui-stroke-tertiary)" : undefined },
+						children: [
+							jsxs("button", {
+								type: "button",
+								className: "qm-sb-row cursor-pointer rounded hover:bg-(--chrome-action-hover) transition-colors",
+								onClick: toQuota,
+								title: t("cardOpenQuota"),
+								style: { ...UI.row, gap: 6, border: 0, background: "transparent", padding: "1px 2px", color: "inherit", textAlign: "left", width: "100%" },
+								children: [
+									jsx(ProviderBadge, { pid }),
+									jsx("span", { style: { ...UI.text, fontWeight: 600, ...UI.ellipsis, flex: "1 1 auto" }, children: providerDisplayName(pid, p) }),
+									p.plan ? jsx(Pill, { color: "var(--ui-text-tertiary)", children: p.plan }) : null,
+								],
+							}),
+							windows.length
+								? jsx("div", { style: { display: "flex", flexWrap: "wrap", gap: "8px 4px" }, children: windows.map((w, j) => jsx(QuotaCardWindow, { w, nowMs }, `${w.label}-${j}`)) })
+								: null,
+							balances.length ? jsx("span", { style: UI.meta, children: balances.map((b) => balanceText(b)).join(" · ") }) : null,
+							...forecasts.map(({ w, f }, j) =>
+								jsxs("div", {
+									"data-card-forecast": w.label,
+									style: { display: "flex", alignItems: "baseline", gap: 6, minWidth: 0 },
+									children: [
+										jsx("span", { style: { ...UI.faint, flexShrink: 0, maxWidth: 96, ...UI.ellipsis }, children: w.label }),
+										jsx(ForecastLine, { forecast: f }),
+									],
+								}, `f-${j}`),
+							),
+						],
+					}, `${pid}-${i}`);
+				})
+			: jsx(Empty, { children: t("empty") }),
+	});
+}
+
+// ---- cost chip + card ----
+
+function BudgetUnderline({ pct, tone }) {
+	if (pct == null) return null;
+	return jsx("span", {
+		"aria-hidden": true,
+		"data-cost-bar": Math.round(pct),
+		style: { position: "absolute", left: 6, right: 6, bottom: 2, height: 2, borderRadius: 2, background: "var(--ui-stroke-tertiary)", overflow: "hidden" },
+		children: jsx("span", { style: { display: "block", height: "100%", width: `${Math.max(2, Math.min(100, pct))}%`, background: toneColor(tone) } }),
+	});
+}
+
+function MiniStat({ label, value, color }) {
+	return jsxs("div", {
+		style: { ...UI.col, gap: 1, minWidth: 0 },
+		children: [
+			jsx("span", { style: { ...UI.tiny, ...UI.ellipsis }, children: label }),
+			jsx("span", { style: { ...UI.num, fontSize: "0.875rem", fontWeight: 650, color: color || "var(--ui-text-primary)", ...UI.ellipsis }, children: value }),
+		],
+	});
+}
+
+function CostCard({ snapshot, close }) {
+	const t = usePluginI18n(ID);
+	const daily = useValue(budgetDailyAtom);
+	const monthly = useValue(budgetMonthlyAtom);
+	const nowMs = useNow(60_000);
+	const usage = asObject(snapshot && snapshot.usage);
+	const u = usageSummary(usage, nowMs);
+	const st = costChipState(u, daily, monthly);
+	const over = monthly > 0 && u.projection > monthly;
+	const models = topModelsToday(usage).map((m) => ({ label: m.model, cost: m.cost, sub: fmtTokens(m.tokens) }));
+	return jsxs(ChipCard, {
+		kind: "cost",
+		title: t("costCardTitle"),
+		sub: t("budgetSub"),
+		link: t("cardOpenUsage"),
+		onLink: () => {
+			close();
+			openMonitorTab("usage");
+		},
+		children: [
+			jsxs("div", {
+				style: { display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 8 },
+				children: [
+					jsx(MiniStat, { label: t("costToday"), value: fmtUsd(u.today), color: st.worst && st.worst.kind === "daily" && st.tone !== "good" ? toneColor(st.tone) : undefined }, "today"),
+					jsx(MiniStat, { label: t("costMonth"), value: fmtUsd(u.mtd) }, "month"),
+					jsx(MiniStat, { label: t("monthEnd"), value: `≈ ${fmtUsd(u.projection)}`, color: over ? toneColor("warn") : undefined }, "proj"),
+				],
+			}, "stats"),
+			st.parts.length
+				? jsxs("div", {
+						style: { ...UI.col, gap: 8 },
+						children: [
+							jsx(BudgetBar, { label: t("budgetDaily"), spent: u.today, limit: daily }, "d"),
+							// The month-end projection is already the third stat above.
+							jsx(BudgetBar, { label: t("budgetMonthly"), spent: u.mtd, limit: monthly }, "m"),
+						],
+					}, "budgets")
+				: jsx(Empty, { children: t("budgetHint") }, "hint"),
+			jsx(TopList, { title: t("topModelsToday"), rows: models }, "models"),
+		],
+	});
+}
+
+function CostChip() {
+	const t = usePluginI18n(ID);
+	const showBar = useValue(showStatusBarAtom);
+	const stored = useValue(costChipAtom);
+	const daily = useValue(budgetDailyAtom);
+	const monthly = useValue(budgetMonthlyAtom);
+	const nowMs = useNow(60_000);
+	const mon = useMonitor();
+	if (!showBar || !costChipEnabled(stored, daily, monthly) || !mon.snapshot || !mon.snapshot.usage) return null;
+	const u = usageSummary(mon.snapshot.usage, nowMs);
+	const st = costChipState(u, daily, monthly);
+	const pct = st.worst ? Math.round(st.worst.pct) : null;
+	const budgetText = st.worst ? t(st.worst.kind === "daily" ? "costOfDaily" : "costOfMonthly", pct) : null;
+	const tipLines = [
+		`${t("costToday")}: ${fmtUsd(u.today)}${daily > 0 ? ` / ${fmtUsd(daily)}` : ""}`,
+		`${t("costMonth")}: ${fmtUsd(u.mtd)}${monthly > 0 ? ` / ${fmtUsd(monthly)}` : ""}`,
+		`${t("monthEnd")}: ≈ ${fmtUsd(u.projection)}`,
+		t("chipCostOpen"),
+	];
+	const button = jsxs("button", {
+		type: "button",
+		"aria-label": [t("costChipAria", fmtUsd(u.today)), budgetText, t("chipCostOpen")].filter(Boolean).join(" · "),
+		"data-cost-chip": st.tone || "none",
+		className: cn(
+			"qm-sb-chip inline-flex h-full items-center gap-1 px-1.5 text-[0.6875rem]",
+			"text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground transition-colors",
+		),
+		style: { ...CHIP_NOWRAP, position: "relative" },
+		children: [
+			jsx("span", {
+				className: "tabular-nums",
+				style: st.tone === "warn" || st.tone === "bad" ? { color: toneColor(st.tone), fontWeight: 600 } : undefined,
+				children: fmtUsdShort(u.today),
+			}),
+			jsx(BudgetUnderline, { pct: st.worst ? st.worst.pct : null, tone: st.tone }),
+		],
+	});
+	return jsx(ChipPopover, {
+		tip: tipLines.join("\n"),
+		kind: "cost",
+		width: 300,
+		card: (close) => jsx(CostCard, { snapshot: mon.snapshot, close }),
+		children: button,
 	});
 }
 
@@ -3929,6 +4583,37 @@ function AgentsChipControl() {
 	const t = usePluginI18n(ID);
 	const chip = useValue(agentsChipAtom);
 	return jsx(SettingSwitch, { label: t("agentsChipLabel"), checked: chip, onChange: (v) => setStored(AGENTS_CHIP_KEY, !!v, agentsChipAtom) });
+}
+
+function ChipSparkControl() {
+	const t = usePluginI18n(ID);
+	const on = useValue(chipSparkAtom);
+	return jsx(SettingSwitch, { label: t("chipSparkLabel"), checked: on, onChange: (v) => setStored(CHIP_SPARK_KEY, !!v, chipSparkAtom) });
+}
+
+function ChipFlashControl() {
+	const t = usePluginI18n(ID);
+	const on = useValue(chipFlashAtom);
+	return jsx(SettingSwitch, { label: t("chipFlashLabel"), hint: t("chipFlashHint"), checked: on, onChange: (v) => setStored(CHIP_FLASH_KEY, !!v, chipFlashAtom) });
+}
+
+function QuotaAlertsControl() {
+	const t = usePluginI18n(ID);
+	const on = useValue(quotaAlertsAtom);
+	return jsx(SettingSwitch, { label: t("quotaAlertsLabel"), hint: t("quotaAlertsHint", QUOTA_CHIP_ALERT_USED), checked: on, onChange: (v) => setStored(QUOTA_ALERTS_KEY, !!v, quotaAlertsAtom) });
+}
+
+function CostChipControl() {
+	const t = usePluginI18n(ID);
+	const stored = useValue(costChipAtom);
+	const daily = useValue(budgetDailyAtom);
+	const monthly = useValue(budgetMonthlyAtom);
+	return jsx(SettingSwitch, {
+		label: t("costChipLabel"),
+		hint: t("costChipHint"),
+		checked: costChipEnabled(stored, daily, monthly),
+		onChange: (v) => setStored(COST_CHIP_KEY, !!v, costChipAtom),
+	});
 }
 
 function NavBadgeControl() {
@@ -4254,6 +4939,32 @@ const I18N_EN = {
 	chipYourTurn: (n) => `${n} your turn`,
 	chipApproval: (n) => `${n} approval`,
 	chipOpenLive: "Click to open Live",
+	// ---- status bar chips + cards ----
+	chipOpenList: "Click for the session list",
+	chipQuotaOpen: "Click for the quota card (links to the Quota pane)",
+	chipCostOpen: "Click for spend details",
+	chipFullIn: (span) => `full ~${span}`,
+	cardOpenLive: "Open Live",
+	cardOpenQuota: "Open Quota",
+	cardOpenUsage: "Open Usage",
+	cardOpen: "open",
+	cardCopy: "copy",
+	tokensPerMinN: (n) => `${n} tokens/min`,
+	quotaCardTitle: "Quota windows",
+	checkedAgo: (age) => `checked ${age} ago`,
+	costCardTitle: "Spend",
+	monthEnd: "Month-end",
+	topModelsToday: "Top models · today",
+	costChipAria: (cost) => `${cost} spent today`,
+	costOfDaily: (pct) => `${pct}% of the daily budget`,
+	costOfMonthly: (pct) => `${pct}% of the monthly budget`,
+	quotaAlertsLabel: "Reset countdown and time-to-full on the quota chip",
+	quotaAlertsHint: (pct) => `Only when a window is ${pct}%+ used, or the burn forecast fills it before it resets.`,
+	chipSparkLabel: "Tokens / minute sparkline in the agents chip",
+	chipFlashLabel: "Flash the agents chip when a session needs you",
+	chipFlashHint: "Once per session newly waiting for your turn or an approval. Follows Reduce motion.",
+	costChipLabel: "Spend-today chip",
+	costChipHint: "Tinted against your budget (80% warn, 100% over). Default: on once a budget is set.",
 	notifyQuotaTitle: (pct) => `Quota at ${pct}%`,
 	notifyResetsIn: (span) => ` — resets in ${span}`,
 	notifySoonTitle: "Quota filling up soon",
@@ -4473,6 +5184,32 @@ const I18N_TR = {
 	chipYourTurn: (n) => `${n} sıra sende`,
 	chipApproval: (n) => `${n} onay`,
 	chipOpenLive: "Canlı görünümü açmak için tıkla",
+	// ---- status bar chips + cards ----
+	chipOpenList: "Oturum listesi için tıkla",
+	chipQuotaOpen: "Kota kartı için tıkla (Kota paneline bağlantı içerir)",
+	chipCostOpen: "Harcama ayrıntıları için tıkla",
+	chipFullIn: (span) => `dolu ~${span}`,
+	cardOpenLive: "Canlı'yı aç",
+	cardOpenQuota: "Kota'yı aç",
+	cardOpenUsage: "Kullanım'ı aç",
+	cardOpen: "aç",
+	cardCopy: "kopyala",
+	tokensPerMinN: (n) => `${n} token/dk`,
+	quotaCardTitle: "Kota pencereleri",
+	checkedAgo: (age) => `${age} önce bakıldı`,
+	costCardTitle: "Harcama",
+	monthEnd: "Ay sonu",
+	topModelsToday: "En çok harcayan modeller · bugün",
+	costChipAria: (cost) => `bugün ${cost} harcandı`,
+	costOfDaily: (pct) => `günlük bütçenin %${pct}'i`,
+	costOfMonthly: (pct) => `aylık bütçenin %${pct}'i`,
+	quotaAlertsLabel: "Kota çipinde sıfırlanma sayacı ve dolma süresi",
+	quotaAlertsHint: (pct) => `Yalnızca bir pencere %${pct} ve üstü dolduğunda ya da tahmin sıfırlanmadan önce dolacağını gösterdiğinde.`,
+	chipSparkLabel: "Ajan çipinde dakikalık token grafiği",
+	chipFlashLabel: "Bir oturum seni beklediğinde ajan çipi yanıp sönsün",
+	chipFlashHint: "Yeni 'sıra sende' ya da onay bekleyen her oturum için bir kez. Hareketi azalt ayarına uyar.",
+	costChipLabel: "Bugünkü harcama çipi",
+	costChipHint: "Bütçene göre renklenir (%80 uyarı, %100 aşım). Varsayılan: bütçe girildiğinde açık.",
 	notifyQuotaTitle: (pct) => `Kota %${pct} doldu`,
 	notifyResetsIn: (span) => ` — ${span} sonra sıfırlanır`,
 	notifySoonTitle: "Kota yakında dolacak",
@@ -4715,6 +5452,23 @@ export default {
 			order: 124,
 			render: () => jsx(MonitorStatus, {}),
 		});
+
+		// Spend-today chip, right of the quota chips. Off unless a budget is
+		// set (or the user switched it on); reads the same monitor snapshot.
+		ctx.register({
+			id: "cost",
+			area: STATUSBAR_AREAS.right,
+			order: 126,
+			render: () => jsx(CostChip, {}),
+		});
+
+		// Chip keyframes (attention flash) + focus ring, scoped `qm-sb-`.
+		const styleEl = ensureStatusbarStyles();
+		try {
+			ctx.onDispose?.(() => styleEl?.remove?.());
+		} catch {
+			/* older host */
+		}
 
 		// Route page (/quota).
 		ctx.register({

@@ -279,8 +279,14 @@ class MonitorViewsTest(unittest.TestCase):
 
     def test_agents_chip(self):
         out = run(component='agents', data=quota_payload(), monitor=snapshot())
-        s = text(out['tree'])
-        self.assertIn('1 working · 1 your turn · 1 approval', s)
+        tree = out['tree']
+        # Compact form: coloured dot + number per non-zero state; the words
+        # live in the aria-label and the tip.
+        chip = find(tree, lambda n: n.get('props', {}).get('data-agents-chip'))[0]
+        self.assertIn('1 working · 1 your turn · 1 approval', chip['props']['aria-label'])
+        segs = [n['props']['data-seg'] for n in find(tree, lambda n: 'data-seg' in n.get('props', {}))]
+        self.assertEqual(segs, ['needs_approval', 'working', 'waiting'])
+        self.assertEqual(text(chip).split(), ['1', '1', '1'])
         off = run(component='agents', data=quota_payload(), monitor=snapshot(), storage={'statusbarAgents': False})
         self.assertIsNone(off['tree'])
 
@@ -454,6 +460,8 @@ class MonitorRealReactTest(unittest.TestCase):
         self.assertIn('$12.50 / $10.00', html['usage'])
         self.assertIn('Pick a logo', html['kanban'])
         self.assertIn('1 working', html['agents'])
+        self.assertIn('data-cost-chip="bad"', html['cost'])
+        self.assertIn('$12.50', html['cost'])
         self.assertIn('Notifications', html['settings'])
         for markup in html.values():
             self.assertNotRegex(markup, r'#[0-9a-fA-F]{3,6}\b|rgb\(')
@@ -464,6 +472,7 @@ class MonitorRealReactTest(unittest.TestCase):
         self.assertEqual(bad, [])
         self.assertIn('./install.sh', out['html']['live'])
         self.assertEqual(out['html']['agents'], '')
+        self.assertEqual(out['html']['cost'], '')
 
 
 if __name__ == '__main__':

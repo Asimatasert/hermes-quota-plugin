@@ -75,6 +75,8 @@ async function run(options = {}) {
     useQuery: queryResult,
     useQueryClient: () => ({invalidateQueries: () => {}}), useMutation: () => ({}),
     Tip: props => ({type: 'Tip', props}),
+    Popover: props => ({type: 'Popover', props}), PopoverTrigger: props => props.children,
+    PopoverContent: props => ({type: 'PopoverContent', props}),
     StatusDot: ({tone}) => jsx('span', {'data-tone': tone}),
     Input: 'input', Switch: 'input', SegmentedControl: 'segmented', icons: {},
     host,
@@ -102,6 +104,7 @@ async function run(options = {}) {
     pane: 'QuotaPane()',
     settings: 'QuotaSettings()',
     agents: 'MonitorStatus()',
+    cost: 'CostChip()',
     status: 'StatusBar()',
     live: 'LiveView({mon: useMonitor()})',
   };
