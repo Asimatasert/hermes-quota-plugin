@@ -85,6 +85,7 @@ class SpecialResetDesktopTests(unittest.TestCase):
                 rendered = self.pane(payload(root=special_root()), mode=mode)
                 self.assertEqual(rendered.count("Special reset announcement"), 1)
                 self.assertIn("Announced Oct 22, 2026", rendered)
+                self.assertIn("06:55", rendered)  # hour, not just the day
                 self.assertIn("Scheduled · waiting for execution", rendered)
                 self.assertIn(CREDIT, rendered)
                 self.assertIn("View source announcement", rendered)

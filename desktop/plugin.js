@@ -693,6 +693,7 @@ function announcedDate(iso) {
 	if (!Number.isFinite(dt.getTime())) return "";
 	return new Intl.DateTimeFormat(undefined, {
 		year: "numeric", month: "short", day: "2-digit",
+		hour: "2-digit", minute: "2-digit",
 	}).format(dt);
 }
 
@@ -743,7 +744,7 @@ function openSpecialLink(url) {
 
 function specialTipLines(special) {
 	const lines = [
-		`Special reset announcement · ${special.announced}`,
+		`✨ Special reset announcement · ${special.announced}`,
 		`${special.typeLabel} · ${special.statusLabel}`,
 	];
 	if (special.stale) lines.push(special.checked ? `Stale · checked ${special.checked}` : "Stale");
@@ -2227,7 +2228,7 @@ export default {
 				noData: "no window data",
 				noDataSection: (n) => `No data (${n}) — click to expand`,
 				reset: (when) => `reset ${when}`,
-				specialResetTitle: "Special reset announcement",
+				specialResetTitle: "✨ Special reset announcement",
 				specialResetSource: "View source announcement",
 				specialResetStale: "Stale announcement data",
 				specialResetStaleChecked: (checked) => `Stale announcement data · checked ${checked}`,

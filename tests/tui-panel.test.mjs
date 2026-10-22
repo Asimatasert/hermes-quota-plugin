@@ -267,7 +267,7 @@ test('special reset announcement is a validated provider-level model, not a fore
   // Old announcements keep their year so they cannot look recent.
   const old = specialResetModel(specialCache({ ...base, announced_at: '2024-03-02T06:55:54Z' }),
     Date.parse('2026-10-22T12:00:00Z'));
-  assert.match(old.date, /^02\/03\/2024$/);
+  assert.match(old.date, /^02\/03\/2024 \d{2}:\d{2}$/);
 });
 
 test('special reset line keeps quota at 80 cols and shows announced date, state and credit', async () => {
@@ -290,6 +290,8 @@ test('special reset line keeps quota at 80 cols and shows announced date, state 
     announced_at: '2026-10-20T06:33:48Z', source_url: SPECIAL_SOURCE }), 'openai-codex', 120, now).text;
   assert.match(wide, /Banked/);
   assert.match(wide, /recorded/);
+  assert.match(wide, /✨/);
+  assert.match(wide, /announced \d{2}\/10 \d{2}:\d{2}/);
   assert.doesNotMatch(wide, /happened|for you|executed/i);
   // Account renewal stays visibly separate from the announcement date.
   assert.match(wide, /reset 27\/10/);
@@ -308,9 +310,9 @@ test('special reset line degrades safely at 40 cols and is absent outside Codex'
   assert.match(line.text, /20%|80%/);
   assert.doesNotMatch(line.text, /codex-resets\.com/);
   assert.doesNotMatch(line.text, /\n/);
-  assert.match(specialNoticeText(cache, now), /Special reset · announced 22\/10 · scheduled · codex-resets\.com/);
+  assert.match(specialNoticeText(cache, now), /✨ Special reset · announced 22\/10 \d{2}:\d{2} · scheduled · codex-resets\.com/);
   const narrow = specialNoticeText(cache, now, 40);
-  assert.match(narrow, /announced 22\/10 · codex-resets\.com/);
+  assert.match(narrow, /announced 22\/10 \d{2}:\d{2} · codex-resets\.com/);
   assert.ok([...narrow].length <= 40);
 
   const other = lineModel(cache, 'openai-codex:work', 120, now);

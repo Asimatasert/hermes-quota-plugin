@@ -132,7 +132,7 @@ export function specialResetModel(cache, now = Date.now()) {
     id: clean(announcement.id), status, resetType,
     announcedAt, sourceUrl: announcement.source_url,
     stale: root.stale !== false || !Number.isFinite(fetched),
-    date: `${pad(date.getDate())}/${pad(date.getMonth() + 1)}${year}`,
+    date: `${pad(date.getDate())}/${pad(date.getMonth() + 1)}${year} ${pad(date.getHours())}:${pad(date.getMinutes())}`,
   };
 }
 
@@ -141,8 +141,8 @@ function announcementVariants(special) {
   const mark = special.stale ? 'STALE · ' : '';
   const banked = special.resetType === 'banked';
   return [
-    `${mark}${banked ? 'Banked special reset' : 'Special reset'} · announced ${special.date} · ${special.status} · ${ANNOUNCEMENT_CREDIT}`,
-    `${mark}${banked ? 'Banked reset' : 'Reset'} · announced ${special.date} · ${special.status} · ${ANNOUNCEMENT_CREDIT}`,
+    `${mark}✨ ${banked ? 'Banked special reset' : 'Special reset'} · announced ${special.date} · ${special.status} · ${ANNOUNCEMENT_CREDIT}`,
+    `${mark}✨ ${banked ? 'Banked reset' : 'Reset'} · announced ${special.date} · ${special.status} · ${ANNOUNCEMENT_CREDIT}`,
     `${mark}announced ${special.date} · ${special.status} · ${ANNOUNCEMENT_CREDIT}`,
     `${mark}announced ${special.date} · ${ANNOUNCEMENT_CREDIT}`,
     `${mark}ann. ${special.date} · ${ANNOUNCEMENT_CREDIT}`,
@@ -155,7 +155,7 @@ export function specialNoticeText(cache, now = Date.now(), cols = 120) {
   const special = specialResetModel(cache, now);
   if (!special) return '';
   if (cols < 60) return `${special.stale ? 'STALE · ' : ''}announced ${special.date} · ${ANNOUNCEMENT_CREDIT}`;
-  return `${special.resetType === 'banked' ? 'Banked' : 'Special'} reset · announced ${special.date} · ${special.status} · ${special.stale ? 'stale · ' : ''}${ANNOUNCEMENT_CREDIT}`;
+  return `✨ ${special.resetType === 'banked' ? 'Banked' : 'Special'} reset · announced ${special.date} · ${special.status} · ${special.stale ? 'stale · ' : ''}${ANNOUNCEMENT_CREDIT}`;
 }
 
 /** Exactly one line; tightest known window first, with explicit overflow. */
