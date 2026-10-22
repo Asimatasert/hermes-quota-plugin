@@ -250,6 +250,7 @@ function applyStoredAll() {
 	applyStoredPaneDetail();
 	applyStoredRefreshInterval();
 	applyStoredDisabledProviders();
+	applyStoredMonitor();
 }
 
 // ---- provider identity (names from the model picker) -----------------------
@@ -1393,7 +1394,7 @@ function QuotaBar({ value, tone }) {
 // One provider card: bordered box with label + plan, a thick tonal bar per
 // window, colored "% left", reset line, and provider detail lines (credits,
 // banked resets). Unavailable providers render as a muted card.
-function ProviderRow({ id, provider }) {
+function ProviderRow({ id, provider, monitor }) {
 	const t = usePluginI18n(ID);
 	const resetFormat = useValue(resetFormatAtom);
 	// 'dense' = every window, reset time and detail line; 'clean' = just the
@@ -1533,6 +1534,22 @@ function ProviderRow({ id, provider }) {
 								],
 							}),
 							jsx(QuotaBar, { value: r, tone }),
+							// Agent monitor extras: burn rate / "fills before reset" and
+							// the used-% history. Absent without a monitor payload.
+							monitor
+								? jsx(ForecastLine, {
+										forecast: forecastFor(burnFor(monitor.burnMap, id, provider, w.label), w, monitor.nowSec),
+									})
+								: null,
+							monitor && monitor.history
+								? jsx(Sparkline, {
+										points: historyFor(monitor.history, id, provider, w.label),
+										max: 100,
+										height: 18,
+										color: toneColor(tone === "muted" ? "good" : tone),
+										label: `${w.label || "window"} history`,
+									})
+								: null,
 							dense && w.reset_at
 								? jsx("div", {
 										className: "text-[0.6875rem] text-(--ui-text-quaternary)",
@@ -1793,6 +1810,7 @@ function QuotaSettings() {
 			jsx(ResetFormatControl, {}),
 			jsx(RefreshIntervalControl, {}),
 			jsx(DisabledProvidersControl, {}),
+			jsx(MonitorSettings, {}),
 		],
 	});
 }
@@ -1803,6 +1821,16 @@ function QuotaPane() {
 	const [view, setView] = useState("list"); // 'list' | 'settings'
 	const { data, isError, isLoading } = useQuota();
 	const update = useUpdateCheck(data && data.installed_sha);
+	// Agent monitor tabs. Every hook runs unconditionally; the views only read
+	// the shared snapshot query (one spawn per poll, deduped with the chip).
+	const tab = useValue(paneViewAtom);
+	const monitorOn = useValue(monitorEnabledAtom);
+	const forecastOn = useValue(quotaForecastAtom);
+	const mon = useMonitor();
+	const activeTab = monitorOn && MONITOR_VIEWS.includes(tab) ? tab : "quota";
+	const showForecast = Boolean(forecastOn && view !== "settings" && activeTab === "quota" && mon.snapshot);
+	const history = useMonitorHistory(mon.scope, showForecast);
+	useMonitorNotifier(mon.scope, data, mon.snapshot);
 	// Footer honesty: the backend reports the cache age (authoritative across
 	// machines, no clock skew), the ticker keeps it live, and the configured
 	// cadence is shown next to it so "60s" is verifiable at a glance.
@@ -1845,6 +1873,8 @@ function QuotaPane() {
 	let body;
 	if (view === "settings") {
 		body = jsx(QuotaSettings, {});
+	} else if (activeTab !== "quota") {
+		body = jsx(MonitorBody, { mon, view: activeTab });
 	} else if (isLoading) {
 		body = jsx("div", {
 			className: "text-xs text-(--ui-text-tertiary)",
@@ -1876,11 +1906,15 @@ function QuotaPane() {
 		);
 		const withData = all.filter(([, p]) => isConfigured(p));
 		const withoutData = all.filter(([, p]) => !isConfigured(p));
+		const monitorExtras = showForecast
+			? { burnMap: monitorBurnMap(mon.snapshot, history), history, nowSec: Date.now() / 1000 }
+			: null;
 		body = jsxs("div", {
 			className: "flex flex-col gap-2",
 			children: [
+				mon.snapshot ? jsx(AccountHints, { providers: data.providers }, "account-hints") : null,
 				...withData.map(([id, p], index) =>
-					jsx(ProviderRow, { id, provider: p, key: id === "openai-codex" ? `${id}-${index}` : id }),
+					jsx(ProviderRow, { id, provider: p, monitor: monitorExtras, key: id === "openai-codex" ? `${id}-${index}` : id }),
 				),
 				withoutData.length > 0
 					? jsxs("details", {
@@ -1945,7 +1979,10 @@ function QuotaPane() {
 												),
 												title: t("refreshTip"),
 												disabled: refresh.isPending,
-												onClick: () => refresh.mutate(),
+												onClick: () =>
+													activeTab === "quota"
+														? refresh.mutate()
+														: qc.invalidateQueries({ queryKey: MONITOR_QUERY_KEY }),
 												children: jsx(icons.RefreshCw, {
 													className: cn(
 														"h-3.5 w-3.5",
@@ -1979,13 +2016,29 @@ function QuotaPane() {
 					}),
 				],
 			}),
+			view !== "settings" && monitorOn
+				? jsx("div", { style: { flexShrink: 0, minWidth: 0 }, "data-monitor-tabs": true, children: jsx(MonitorTabs, {}) })
+				: null,
 			jsx("div", {
 				className: "min-h-0 flex-1",
 				"data-quota-scroll": true,
 				style: { minHeight: 0, minWidth: 0, overflowY: "auto", overflowX: "hidden", flex: "1 1 0%" },
 				children: jsxs("div", { children: [body, jsx(UpdateBanner, { update }), versionSkew] }),
 			}),
-			data && data.fetched_at
+			view !== "settings" && activeTab !== "quota"
+				? mon.snapshot && finiteNumber(mon.snapshot.generated_at) != null
+					? jsx("div", {
+							className: "pt-2 text-[0.6875rem] text-(--ui-text-quaternary)",
+							"data-quota-checked": true,
+							style: { flexShrink: 0, minWidth: 0, overflowWrap: "anywhere" },
+							children: t(
+								"monitorUpdated",
+								checkedDateTime(new Date(Number(mon.snapshot.generated_at) * 1000).toISOString()),
+								pollSeconds,
+							),
+						})
+					: null
+				: data && data.fetched_at
 				? jsx("div", {
 						className: "pt-2 text-[0.6875rem] text-(--ui-text-quaternary)",
 						"data-quota-checked": true,
@@ -2004,6 +2057,2011 @@ function QuotaPane() {
 		],
 	});
 }
+
+// ---- agent monitor (`hermes quota monitor ...`) ----------------------------
+//
+// The Agent Bar port. One `quota monitor snapshot --json` spawn per poll at the
+// user's refresh interval feeds the Live / Health / Usage / Kanban views, the
+// agents status chip and the notifier; `quota monitor history --json` (quota
+// history + burn) is read less often and only while the Quota view shows it.
+// An older backend without `monitor` answers with an argparse error — that is
+// shown as a quiet "update backend" notice, never as a broken pane, and the
+// quota chip/pane keep working exactly as before.
+
+const MONITOR_VIEWS = ["quota", "live", "health", "usage", "kanban"];
+const PANE_VIEW_KEY = "paneView";
+const paneViewAtom = atom("quota");
+const MONITOR_ENABLED_KEY = "monitorEnabled";
+const monitorEnabledAtom = atom(true);
+const AGENTS_CHIP_KEY = "statusbarAgents";
+const agentsChipAtom = atom(true);
+const QUOTA_FORECAST_KEY = "quotaForecast";
+const quotaForecastAtom = atom(true);
+const HISTORY_DAYS_KEY = "historyDays";
+const HISTORY_DAYS_OPTIONS = [1, 7];
+const historyDaysAtom = atom(1);
+// Live/attention poll cadence, separate from the quota cache interval (600 s by
+// default): sessions change by the second, provider quotas do not.
+const LIVE_INTERVAL_KEY = "liveInterval";
+const LIVE_INTERVAL_OPTIONS = [15, 30, 60, 300];
+const LIVE_INTERVAL_DEFAULT = 30;
+const liveIntervalAtom = atom(LIVE_INTERVAL_DEFAULT);
+const BUDGET_DAILY_KEY = "budgetDaily";
+const BUDGET_MONTHLY_KEY = "budgetMonthly";
+const budgetDailyAtom = atom(0);
+const budgetMonthlyAtom = atom(0);
+
+// Per-kind notification toggles (Agent Bar's notify* prefs), all on by default.
+const NOTIFY_KINDS = ["quota", "budget", "kanban", "health", "agents", "turns"];
+const notifyAtoms = {};
+for (const kind of NOTIFY_KINDS) notifyAtoms[kind] = atom(true);
+function notifyKey(kind) {
+	return `notify${kind[0].toUpperCase()}${kind.slice(1)}`;
+}
+
+function cleanBudget(value) {
+	const n = Number(value);
+	return Number.isFinite(n) && n > 0 ? Math.round(n * 100) / 100 : 0;
+}
+
+function applyStoredMonitor() {
+	applyStored(PANE_VIEW_KEY, paneViewAtom, MONITOR_VIEWS, "quota");
+	applyStoredBoolean(MONITOR_ENABLED_KEY, monitorEnabledAtom, true);
+	applyStoredBoolean(AGENTS_CHIP_KEY, agentsChipAtom, true);
+	applyStoredBoolean(QUOTA_FORECAST_KEY, quotaForecastAtom, true);
+	for (const kind of NOTIFY_KINDS) applyStoredBoolean(notifyKey(kind), notifyAtoms[kind], true);
+	try {
+		const days = Number(readStored(HISTORY_DAYS_KEY, 1));
+		historyDaysAtom.set(HISTORY_DAYS_OPTIONS.includes(days) ? days : 1);
+		const live = Number(readStored(LIVE_INTERVAL_KEY, LIVE_INTERVAL_DEFAULT));
+		liveIntervalAtom.set(LIVE_INTERVAL_OPTIONS.includes(live) ? live : LIVE_INTERVAL_DEFAULT);
+		budgetDailyAtom.set(cleanBudget(readStored(BUDGET_DAILY_KEY, 0)));
+		budgetMonthlyAtom.set(cleanBudget(readStored(BUDGET_MONTHLY_KEY, 0)));
+	} catch {
+		/* noop */
+	}
+}
+
+function setPaneView(view) {
+	if (MONITOR_VIEWS.includes(view)) setStored(PANE_VIEW_KEY, view, paneViewAtom);
+}
+
+function setBudget(kind, value) {
+	const key = kind === "monthly" ? BUDGET_MONTHLY_KEY : BUDGET_DAILY_KEY;
+	setStored(key, cleanBudget(value), kind === "monthly" ? budgetMonthlyAtom : budgetDailyAtom);
+}
+
+// Module-level translator for handlers/notifications (no component around).
+function tr(key, ...args) {
+	try {
+		if (CTX && CTX.i18n && typeof CTX.i18n.t === "function") {
+			const v = CTX.i18n.t(key, ...args);
+			if (v != null && v !== key) return v;
+		}
+	} catch {
+		/* fall back to English */
+	}
+	const v = I18N_EN[key];
+	return typeof v === "function" ? v(...args) : v != null ? v : key;
+}
+
+// ---- formatting ----
+
+function finiteNumber(value) {
+	if (value == null || value === "" || typeof value === "boolean") return null;
+	const n = Number(value);
+	return Number.isFinite(n) ? n : null;
+}
+
+function fmtTokens(value) {
+	const n = finiteNumber(value);
+	if (n == null) return "—";
+	const abs = Math.abs(n);
+	if (abs >= 1e6) return `${(n / 1e6).toFixed(abs >= 1e7 ? 0 : 1)}M`;
+	if (abs >= 1e3) return `${(n / 1e3).toFixed(abs >= 1e4 ? 0 : 1)}k`;
+	return String(Math.round(n));
+}
+
+function fmtUsd(value) {
+	const n = finiteNumber(value);
+	if (n == null) return "—";
+	const abs = Math.abs(n);
+	const text = abs >= 1000 ? Math.round(abs).toLocaleString("en-US") : abs.toFixed(2);
+	return `${n < 0 ? "-" : ""}$${text}`;
+}
+
+function fmtSpan(seconds) {
+	const s = finiteNumber(seconds);
+	if (s == null) return "";
+	if (s < 60) return "<1m";
+	const totalMin = Math.floor(s / 60);
+	const days = Math.floor(totalMin / 1440);
+	const hours = Math.floor((totalMin % 1440) / 60);
+	const mins = totalMin % 60;
+	if (days > 0) return `${days}d ${hours}h`;
+	if (hours > 0) return `${hours}h ${mins}m`;
+	return `${mins}m`;
+}
+
+function fmtSeconds(value) {
+	const s = finiteNumber(value);
+	if (s == null) return "—";
+	return s < 60 ? `${s < 10 ? s.toFixed(1) : Math.round(s)}s` : fmtSpan(s);
+}
+
+function isoToSeconds(value) {
+	if (value == null || value === "") return null;
+	const n = finiteNumber(value);
+	if (n != null) return n > 1e12 ? n / 1000 : n;
+	const ms = new Date(value).getTime();
+	return Number.isFinite(ms) ? ms / 1000 : null;
+}
+
+function localDay(date) {
+	const d = date instanceof Date ? date : new Date(date);
+	const mm = String(d.getMonth() + 1).padStart(2, "0");
+	const dd = String(d.getDate()).padStart(2, "0");
+	return `${d.getFullYear()}-${mm}-${dd}`;
+}
+
+function asObject(value) {
+	return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+// ---- data ----
+
+const MONITOR_QUERY_KEY = ["quota", "monitor"];
+const MONITOR_TIMEOUT_MS = 30_000;
+
+function monitorQueryKey(scope, kind) {
+	return [...MONITOR_QUERY_KEY, kind, scope ? scope.connectionId : null, scope ? scope.profile : null];
+}
+
+// argparse's answer when the gateway's quota plugin predates `monitor`.
+function isMonitorUnsupportedError(error) {
+	const text = String((error && error.message) || error || "");
+	return /invalid choice|unrecognized arguments|unknown command|no such command/i.test(text);
+}
+
+function asMonitorPayload(value) {
+	return value && typeof value === "object" && !Array.isArray(value) && value.monitor_version != null && !value.unsupported
+		? value
+		: null;
+}
+
+async function fetchMonitor(scope, argv) {
+	let result;
+	try {
+		result = await quotaCli(scope, argv, MONITOR_TIMEOUT_MS);
+	} catch (error) {
+		if (isMonitorUnsupportedError(error)) return { unsupported: true };
+		throw error;
+	}
+	try {
+		return parseJsonOutput(result.output || "", "monitor_version");
+	} catch {
+		// Exit 0 without a monitor payload: an older build printing help.
+		return { unsupported: true };
+	}
+}
+
+function useMonitor() {
+	const enabled = useValue(monitorEnabledAtom);
+	const intervalSec = useValue(liveIntervalAtom);
+	const owner = useValue(host.state.focusedSessionOwner);
+	const scope = normalizeQuotaScope(owner);
+	const intervalMs = Math.max(REFRESH_INTERVAL_MIN, Number(intervalSec) || LIVE_INTERVAL_DEFAULT) * 1000;
+	const query = useQuery({
+		queryKey: monitorQueryKey(scope, "snapshot"),
+		queryFn: () => fetchMonitor(scope, ["quota", "monitor", "snapshot", "--json"]),
+		enabled: Boolean(scope) && enabled,
+		// An old backend is asked again on the next mount, not every interval.
+		refetchInterval: (q) => (q && q.state && q.state.data && q.state.data.unsupported ? false : intervalMs),
+		refetchIntervalInBackground: true,
+		staleTime: Math.max(5_000, Math.floor(intervalMs / 2)),
+		retry: 1,
+	});
+	const raw = query.data;
+	// A backend-side crash still answers one JSON object: {monitor_version, error}.
+	const payload = enabled ? asMonitorPayload(raw) : null;
+	const snapshot = payload && !(payload.error && !payload.live) ? payload : null;
+	return {
+		scope,
+		enabled,
+		snapshot,
+		unsupported: Boolean(enabled && raw && raw.unsupported),
+		isError: Boolean(enabled && !snapshot && ((query.isError && !payload) || (payload && payload.error))),
+		isLoading: Boolean(enabled && !snapshot && !payload && !(raw && raw.unsupported) && !query.isError),
+		error: query.error,
+	};
+}
+
+function useMonitorHistory(scope, active) {
+	const days = useValue(historyDaysAtom);
+	const intervalSec = useValue(refreshIntervalAtom);
+	const everyMs = Math.max(300, (Number(intervalSec) || REFRESH_INTERVAL_DEFAULT) * 3) * 1000;
+	const query = useQuery({
+		queryKey: monitorQueryKey(scope, `history:${days}`),
+		queryFn: () => fetchMonitor(scope, ["quota", "monitor", "history", "--json", "--days", String(days)]),
+		enabled: Boolean(scope) && Boolean(active),
+		refetchInterval: everyMs,
+		refetchIntervalInBackground: false,
+		staleTime: Math.floor(everyMs / 2),
+		retry: 0,
+	});
+	return active ? asMonitorPayload(query.data) : null;
+}
+
+/** Best-effort: lets the backend's `get_budget` tool see the widget budget. */
+async function syncBudgetToBackend() {
+	try {
+		const scope = normalizeQuotaScope(host.state.focusedSessionOwner.get());
+		if (!scope) return false;
+		await quotaCli(scope, [
+			"quota", "monitor", "set-budget",
+			"--daily", String(budgetDailyAtom.get()),
+			"--monthly", String(budgetMonthlyAtom.get()),
+			"--json",
+		]);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+// ---- derived facts (pure) ----
+
+const STATE_RANK = { needs_approval: 0, stalled: 1, working: 2, waiting: 3 };
+
+function sessionState(row) {
+	if (!row) return "ended";
+	if (row.status && row.status !== "running") return "ended";
+	return row.state || "working";
+}
+
+function liveCounts(live) {
+	const counts = asObject(live && live.counts);
+	if (Object.keys(counts).length) return counts;
+	const mains = asList(live && live.running).filter((r) => r && sessionState(r) !== "ended" && !r.subagent);
+	const n = (k) => mains.filter((r) => sessionState(r) === k).length;
+	return { open: mains.length, working: n("working"), needs_approval: n("needs_approval"), your_turn: n("waiting"), stalled: n("stalled") };
+}
+
+function tokenTotal(minute) {
+	let total = 0;
+	for (const v of Object.values(asObject(minute && minute.by))) {
+		const n = finiteNumber(v && typeof v === "object" ? v.tokens : v);
+		if (n != null) total += n;
+	}
+	return total;
+}
+
+function dayCost(entry) {
+	let total = 0;
+	for (const v of Object.values(asObject(entry && entry.by))) {
+		const n = finiteNumber(v && typeof v === "object" ? v.cost : null);
+		if (n != null) total += n;
+	}
+	const own = finiteNumber(entry && entry.cost);
+	return total || own || 0;
+}
+
+/** Today / month-to-date / month-end projection / last 7 days from `usage`. */
+function usageSummary(usage, nowMs = Date.now()) {
+	const now = new Date(nowMs);
+	const today = localDay(now);
+	const monthPrefix = today.slice(0, 7);
+	const todayUsage = asObject(usage && usage.today);
+	const month = asObject(usage && usage.month);
+	const daily = asList(month.daily).filter((d) => d && typeof d.day === "string");
+	const byDay = new Map(daily.map((d) => [d.day, dayCost(d)]));
+	const todayCost = finiteNumber(asObject(todayUsage.totals).cost) ?? byDay.get(today) ?? 0;
+	byDay.set(today, todayCost);
+	let mtd = 0;
+	let sawMonth = false;
+	for (const [day, cost] of byDay) {
+		if (day.startsWith(monthPrefix) && day <= today) {
+			mtd += cost;
+			sawMonth = true;
+		}
+	}
+	if (!sawMonth) mtd = finiteNumber(asObject(month.totals).cost) ?? todayCost;
+	const dayOfMonth = now.getDate();
+	const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
+	const projection = dayOfMonth > 0 ? (mtd / dayOfMonth) * daysInMonth : mtd;
+	const last7 = [];
+	for (let i = 6; i >= 0; i -= 1) {
+		const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() - i);
+		const day = localDay(d);
+		last7.push({ day, cost: byDay.get(day) || 0 });
+	}
+	return { today: todayCost, mtd, projection, dayOfMonth, daysInMonth, last7, todayTokens: finiteNumber(asObject(todayUsage.totals).tokens) };
+}
+
+function burnKey(provider, window) {
+	return `${provider}|${window}`;
+}
+
+/** History burn (has fills_before_reset/reset) overlaid by the fresher live burn. */
+function monitorBurnMap(snapshot, history) {
+	const map = new Map();
+	for (const source of [asList(history && history.burn), asList(snapshot && snapshot.live && snapshot.live.burn)]) {
+		for (const b of source) {
+			if (!b || !b.provider || !b.window) continue;
+			const key = burnKey(b.provider, b.window);
+			map.set(key, { ...(map.get(key) || {}), ...b });
+		}
+	}
+	return map;
+}
+
+function providerKeys(pid, provider) {
+	const keys = [pid];
+	const account = provider && (provider.account_key || provider.account_id);
+	if (account) keys.push(`${baseProviderId(pid)}#${account}`, `${baseProviderId(pid)}:${account}`);
+	return keys;
+}
+
+function burnFor(map, pid, provider, label) {
+	if (!map) return null;
+	for (const key of providerKeys(pid, provider)) {
+		const hit = map.get(burnKey(key, label));
+		if (hit) return hit;
+	}
+	return null;
+}
+
+function historyFor(history, pid, provider, label) {
+	const keys = providerKeys(pid, provider);
+	const hit = asList(history && history.history).find((h) => h && keys.includes(h.provider) && h.window === label);
+	return hit ? asList(hit.points).filter((p) => Array.isArray(p) && finiteNumber(p[0]) != null && finiteNumber(p[1]) != null) : [];
+}
+
+/** Burn rate + "fills before reset" forecast for one quota window. */
+function forecastFor(burn, window, nowSec = Date.now() / 1000) {
+	if (!burn) return null;
+	const perHour = finiteNumber(burn.per_hour);
+	if (perHour == null) return null;
+	const used = finiteNumber(window && window.used_percent) ?? finiteNumber(burn.used) ?? 0;
+	const reset = isoToSeconds(window && window.reset_at) ?? isoToSeconds(burn.reset);
+	let eta = finiteNumber(burn.eta_full);
+	if (eta == null && perHour > 0) eta = nowSec + ((100 - used) / perHour) * 3600;
+	const fills = perHour > 0 && used < 100 && eta != null && (typeof burn.fills_before_reset === "boolean" ? burn.fills_before_reset : reset == null || eta < reset);
+	return {
+		perHour,
+		eta,
+		reset,
+		fills,
+		soon: fills && eta - nowSec < 3600,
+		inSeconds: eta != null ? Math.max(0, eta - nowSec) : null,
+		marginSeconds: fills && reset != null ? reset - eta : null,
+	};
+}
+
+/** "work is nearly full, home has room" — several accounts of one provider. */
+function accountRoomHints(providers) {
+	const groups = new Map();
+	for (const [pid, p] of providerEntries(providers)) {
+		if (!isConfigured(p) || !isProviderEnabled(pid)) continue;
+		const base = baseProviderId(pid);
+		if (!groups.has(base)) groups.set(base, []);
+		groups.get(base).push([pid, p]);
+	}
+	const hints = [];
+	for (const entries of groups.values()) {
+		if (entries.length < 2) continue;
+		for (const [pid, p] of entries) {
+			for (const w of asWindowList(p.windows)) {
+				const used = finiteNumber(w.used_percent);
+				if (used == null || used < 90) continue;
+				let best = null;
+				for (const [opid, op] of entries) {
+					if (op === p) continue;
+					const left = worstWindow(op);
+					if (left != null && left >= 20 && (!best || left > best.left)) best = { pid: opid, provider: op, left };
+				}
+				if (!best) continue;
+				hints.push({
+					key: `${providerDisplayName(pid, p)}|${w.label}|${Math.floor((isoToSeconds(w.reset_at) || 0) / 3600)}`,
+					full: providerDisplayName(pid, p),
+					used: Math.round(used),
+					window: w.label || "window",
+					room: providerDisplayName(best.pid, best.provider),
+					left: Math.round(best.left),
+				});
+			}
+		}
+	}
+	return hints;
+}
+
+// ---- notifications (pure rules + dedupe; runner below) ----
+
+function limitKeys(map, max = 300) {
+	const entries = Object.entries(asObject(map));
+	return Object.fromEntries(entries.slice(Math.max(0, entries.length - max)));
+}
+
+function cardAlertKey(card) {
+	const fails = finiteNumber(card.consecutive_failures) || 0;
+	if (card.status === "blocked" && card.block_kind === "needs_input") return [`${card.id}|input`, "input"];
+	if (card.status === "blocked") return [`${card.id}|blocked`, "blocked"];
+	if (card.status === "review") return [`${card.id}|review`, "review"];
+	if (fails > 0 && !["done", "archived"].includes(card.status)) return [`${card.id}|fail${fails}`, "failing"];
+	return [null, null];
+}
+
+/**
+ * Decide which OS notifications one poll produces. Pure: `prev` is the dedupe
+ * state from the last call and the returned `state` replaces it. Threshold
+ * rules (quota 80/95 %, filling soon, account hint, budget 80/100 %) fire once
+ * per window period / day / month; set rules (kanban cards, failing models,
+ * locked credentials, attention items) fire on appearance only, and the first
+ * call merely seeds them so opening the app never floods the user.
+ */
+function monitorNotifications(input, prev, nowSec = Date.now() / 1000) {
+	const settings = asObject(input && input.settings);
+	const on = (kind) => settings[kind] !== false;
+	const old = asObject(prev);
+	const state = {
+		quota: { ...asObject(old.quota) },
+		soon: { ...asObject(old.soon) },
+		hint: { ...asObject(old.hint) },
+		budget: { ...asObject(old.budget) },
+		cards: [],
+		health: [],
+		attention: [],
+	};
+	const notes = [];
+	const push = (kind, key, title, body, target) => notes.push({ kind, key, title, body, target: target || null });
+	const providers = asObject(input && input.providers);
+	const snapshot = asObject(input && input.snapshot);
+	const live = asObject(snapshot.live);
+
+	// Quota thresholds, per provider window and reset period.
+	for (const [pid, p] of providerEntries(providers)) {
+		if (!isConfigured(p) || !isProviderEnabled(pid)) continue;
+		const name = providerDisplayName(pid, p);
+		for (const w of asWindowList(p.windows)) {
+			const used = finiteNumber(w.used_percent);
+			if (used == null) continue;
+			const level = used >= 95 ? 95 : used >= 80 ? 80 : 0;
+			const reset = isoToSeconds(w.reset_at);
+			const key = `${name}|${w.label}|${Math.floor((reset || 0) / 3600)}`;
+			if (level > (state.quota[key] || 0)) {
+				state.quota[key] = level;
+				if (on("quota")) {
+					const when = reset != null && reset > nowSec ? tr("notifyResetsIn", fmtSpan(reset - nowSec)) : "";
+					push("quota", key, tr("notifyQuotaTitle", Math.round(used)), `${name} · ${w.label || "window"}${when}`);
+				}
+			}
+			const burn = burnFor(input && input.burnMap, pid, p, w.label);
+			const f = forecastFor(burn, w, nowSec);
+			if (f && f.soon && !state.soon[key]) {
+				state.soon[key] = true;
+				if (on("quota")) push("soon", key, tr("notifySoonTitle"), `${name} · ${w.label || "window"} — ${tr("notifySoonBody", fmtSpan(f.inSeconds))}`);
+			}
+		}
+	}
+	for (const hint of accountRoomHints(providers)) {
+		if (state.hint[hint.key]) continue;
+		state.hint[hint.key] = true;
+		if (on("quota")) push("hint", hint.key, tr("accountHint", hint.full, hint.used, hint.room), tr("accountHintBody", hint.window, hint.left, hint.room));
+	}
+
+	// Budget thresholds (80 / 100 %), once per day / month.
+	const budget = asObject(input && input.budget);
+	if (snapshot.usage) {
+		const u = usageSummary(snapshot.usage, nowSec * 1000);
+		const today = localDay(new Date(nowSec * 1000));
+		const checks = [
+			[`day|${today}`, u.today, cleanBudget(budget.daily), tr("budgetDaily")],
+			[`month|${today.slice(0, 7)}`, u.mtd, cleanBudget(budget.monthly), tr("budgetMonthly")],
+		];
+		for (const [key, spent, limit, label] of checks) {
+			if (!(limit > 0)) continue;
+			const pct = (spent / limit) * 100;
+			const level = pct >= 100 ? 100 : pct >= 80 ? 80 : 0;
+			if (level > (state.budget[key] || 0)) {
+				state.budget[key] = level;
+				if (on("budget")) push("budget", key, tr("notifyBudgetTitle", label, Math.round(pct)), `${fmtUsd(spent)} / ${fmtUsd(limit)}`);
+			}
+		}
+	}
+
+	// Kanban: cards that become blocked / need input / wait for review / fail.
+	const fresh = [];
+	const oldCards = Array.isArray(old.cards) ? new Set(old.cards) : null;
+	for (const board of asList(asObject(snapshot.kanban).boards)) {
+		for (const card of asList(board && board.cards)) {
+			if (!card || !card.id) continue;
+			const [key, what] = cardAlertKey(card);
+			if (!key) continue;
+			state.cards.push(key);
+			if (oldCards && !oldCards.has(key)) fresh.push([board, card, what, key]);
+		}
+	}
+	if (on("kanban")) {
+		for (const [board, card, what, key] of fresh.slice(0, 5)) {
+			push("kanban", key, tr("notifyCardTitle", tr(`cardWhat_${what}`)), `${card.title || card.id}\n${board.board || ""} · ${card.assignee || tr("unassigned")}`, { open: card.open });
+		}
+	}
+
+	// Health: failing / exhausted models and locked credentials.
+	const oldHealth = Array.isArray(old.health) ? new Set(old.health) : null;
+	const health = asObject(snapshot.health);
+	const healthFresh = [];
+	for (const m of asList(health.models)) {
+		if (!m || !["failing", "account_exhausted"].includes(m.status)) continue;
+		const key = `m|${m.provider}|${m.model}|${m.status}`;
+		state.health.push(key);
+		if (oldHealth && !oldHealth.has(key)) healthFresh.push([key, tr("notifyModelTitle", tr(`modelStatus_${m.status}`), m.model), providerMeta(m.provider).name]);
+	}
+	for (const a of asList(health.accounts)) {
+		for (const c of asList(a && a.credentials)) {
+			if (!c || !c.locked) continue;
+			const key = `a|${a.provider}|${c.label || c.account_key || ""}`;
+			state.health.push(key);
+			if (oldHealth && !oldHealth.has(key)) {
+				const until = isoToSeconds(c.exhausted_until);
+				healthFresh.push([key, tr("notifyLockedTitle", providerMeta(a.provider).name), `${c.label || ""}${until && until > nowSec ? tr("unlocksIn", fmtSpan(until - nowSec)) : ""}`]);
+			}
+		}
+	}
+	if (on("health")) for (const [key, title, body] of healthFresh.slice(0, 5)) push("health", key, title, body);
+
+	// Agent attention items (approval / your turn / stalled / loop / big context).
+	const oldAttention = Array.isArray(old.attention) ? new Set(old.attention) : null;
+	const attentionFresh = [];
+	for (const item of asList(live.attention)) {
+		if (!item || !item.kind) continue;
+		const key = String(item.id || `${item.session_id}|${item.kind}|${item.since || ""}`);
+		state.attention.push(key);
+		if (oldAttention && !oldAttention.has(key)) attentionFresh.push([key, item]);
+	}
+	for (const [key, item] of attentionFresh.slice(0, 5)) {
+		if (!on(item.kind === "your_turn" ? "turns" : "agents")) continue;
+		const who = item.profile || tr("agent");
+		const title = I18N_EN[`attention_${item.kind}`] ? tr(`attention_${item.kind}`, who) : `${who}: ${item.kind}`;
+		const body = `${item.title || tr("untitled")}${item.detail ? ` — ${item.detail}` : ""}`;
+		push("attention", key, title, body, { sessionId: item.session_id, profile: item.profile, source: item.source });
+	}
+
+	state.quota = limitKeys(state.quota);
+	state.soon = limitKeys(state.soon);
+	state.hint = limitKeys(state.hint);
+	state.budget = limitKeys(state.budget, 60);
+	return { notes, state };
+}
+
+// The status chip and the pane(s) all watch the same poll objects; skip a
+// repeat call for the identical payload pair. (The rules are idempotent anyway:
+// a second run over the same data finds nothing new in the dedupe state.)
+let _lastNotifierRun = null;
+
+function notifierStorageKey(scope) {
+	return `monitorNotified:${encodeURIComponent(scope.connectionId)}:${encodeURIComponent(scope.profile)}`;
+}
+
+/** Apply the rules for one poll and post the OS notifications. Returns them. */
+function runMonitorNotifier(scope, providers, snapshot, history) {
+	if (!CTX || !scope || !asMonitorPayload(snapshot)) return [];
+	const runKey = `${scope.connectionId}|${scope.profile}`;
+	if (_lastNotifierRun && _lastNotifierRun.key === runKey && _lastNotifierRun.snapshot === snapshot && _lastNotifierRun.providers === providers) return [];
+	_lastNotifierRun = { key: runKey, snapshot, providers };
+	const storageKey = notifierStorageKey(scope);
+	let prev = {};
+	try {
+		const raw = CTX.storage.get(storageKey);
+		prev = raw ? (typeof raw === "string" ? JSON.parse(raw) : raw) : {};
+	} catch {
+		prev = {};
+	}
+	const settings = {};
+	for (const kind of NOTIFY_KINDS) settings[kind] = notifyAtoms[kind].get();
+	const { notes, state } = monitorNotifications(
+		{
+			providers,
+			snapshot,
+			burnMap: monitorBurnMap(snapshot, history),
+			settings,
+			budget: { daily: budgetDailyAtom.get(), monthly: budgetMonthlyAtom.get() },
+		},
+		prev,
+		Date.now() / 1000,
+	);
+	try {
+		CTX.storage.set(storageKey, JSON.stringify(state));
+	} catch {
+		/* noop */
+	}
+	for (const note of notes) {
+		try {
+			CTX.os?.notify?.({
+				title: note.title,
+				body: note.body,
+				onActivate: note.target ? () => void openMonitorTarget(scope, note.target, snapshot) : undefined,
+			});
+		} catch {
+			/* notifications are best-effort */
+		}
+	}
+	return notes;
+}
+
+function useMonitorNotifier(scope, quotaData, snapshot) {
+	useEffect(() => {
+		if (!snapshot) return;
+		const providers = quotaData && quotaData.providers ? quotaData.providers : null;
+		runMonitorNotifier(scope, providers, snapshot);
+	}, [scope && scope.connectionId, scope && scope.profile, snapshot, quotaData]);
+}
+
+// ---- open actions ----
+
+async function openHermesSession(scope, sessionId, profile) {
+	let route = null;
+	try {
+		if (profile && typeof host.profileRoutes === "function") {
+			const routes = await host.profileRoutes();
+			route = routes.find((r) => r.connectionId === (scope && scope.connectionId) && r.profile === profile) || null;
+		}
+	} catch {
+		route = null;
+	}
+	if (typeof host.openSession !== "function") return false;
+	if (route && route.mode === "remote") await host.openSession(sessionId, { route });
+	else if (profile) await host.openSession(sessionId, { profile });
+	else await host.openSession(sessionId);
+	return true;
+}
+
+async function copyCommand(command) {
+	let ok = false;
+	try {
+		ok = Boolean(await CTX?.os?.writeClipboard?.(command));
+	} catch {
+		ok = false;
+	}
+	try {
+		host.notify?.({ kind: ok ? "success" : "warning", message: ok ? tr("commandCopied", command) : tr("commandCopyFailed", command) });
+	} catch {
+		/* noop */
+	}
+	return ok;
+}
+
+/** Row / notification click: Hermes sessions open in the app, CLI rows copy their command. */
+async function openMonitorTarget(scope, target, snapshot) {
+	const t = asObject(target);
+	let open = t.open || null;
+	let row = t.row || null;
+	if (!open && t.sessionId && snapshot) {
+		row = asList(asObject(snapshot.live).running).find((r) => r && r.id === t.sessionId) || row;
+		open = row && row.open ? row.open : null;
+	}
+	const sessionId = t.sessionId || (row && row.id) || null;
+	const profile = t.profile || (row && row.profile) || null;
+	const hermes = open
+		? open.kind === "hermes-session"
+		: row
+			? !row.kind || row.kind === "hermes"
+			: t.source
+				? t.source === "hermes"
+				: Boolean(sessionId);
+	if (hermes && sessionId) {
+		try {
+			if (await openHermesSession(scope, sessionId, profile)) return "opened";
+		} catch {
+			/* fall through to the command */
+		}
+	}
+	if (open && open.command) return (await copyCommand(open.command)) ? "copied" : "failed";
+	return "none";
+}
+
+// ---- small UI pieces ----
+
+const STATE_STYLE = {
+	working: "var(--ui-green)",
+	waiting: "var(--ui-accent)",
+	needs_approval: "var(--ui-red)",
+	stalled: "var(--ui-yellow)",
+	long_tool: "var(--ui-orange)",
+	ended: "var(--ui-stroke-tertiary)",
+};
+
+function StateBadge({ state }) {
+	const t = usePluginI18n(ID);
+	return jsxs("span", {
+		className: "inline-flex shrink-0 items-center gap-1 text-[0.6875rem] font-medium text-(--ui-text-secondary)",
+		"data-state": state,
+		children: [
+			jsx("span", { className: "inline-block h-1.5 w-1.5 rounded-full", style: { background: STATE_STYLE[state] || STATE_STYLE.ended } }),
+			t(`state_${state}`),
+		],
+	});
+}
+
+/**
+ * Inline SVG sparkline. viewBox + preserveAspectRatio="none" makes it scale
+ * with its container, so a pane resize needs no ResizeObserver/measurement;
+ * non-scaling-stroke keeps the line crisp at any width. Theme vars only.
+ */
+function Sparkline({ values, points, height = 22, color = "var(--ui-accent)", max, label }) {
+	let xy = [];
+	if (Array.isArray(points) && points.length) {
+		const xs = points.map((p) => Number(p[0]));
+		const x0 = Math.min(...xs);
+		const span = Math.max(...xs) - x0 || 1;
+		xy = points.map((p) => [((Number(p[0]) - x0) / span) * 100, Number(p[1])]);
+	} else if (Array.isArray(values) && values.length) {
+		const n = values.length;
+		xy = values.map((v, i) => [n === 1 ? 50 : (i / (n - 1)) * 100, Number(v) || 0]);
+	}
+	if (xy.length < 2) return null;
+	const top = max != null ? max : Math.max(...xy.map((p) => p[1]), 0) || 1;
+	const y = (v) => (height - 1 - (Math.max(0, Math.min(top, v)) / top) * (height - 2)).toFixed(2);
+	const line = xy.map(([x, v], i) => `${i ? "L" : "M"}${x.toFixed(2)} ${y(v)}`).join(" ");
+	return jsx("svg", {
+		viewBox: `0 0 100 ${height}`,
+		preserveAspectRatio: "none",
+		width: "100%",
+		height,
+		role: "img",
+		"aria-label": label || "",
+		"data-sparkline": true,
+		style: { display: "block", overflow: "visible" },
+		children: [
+			jsx("path", { d: `${line} L100 ${height} L0 ${height} Z`, fill: color, fillOpacity: 0.12, stroke: "none" }, "a"),
+			jsx("path", { d: line, fill: "none", stroke: color, strokeWidth: 1.5, vectorEffect: "non-scaling-stroke", strokeLinejoin: "round" }, "l"),
+		],
+	});
+}
+
+function MiniBars({ values, height = 28, color = "var(--ui-accent)", label }) {
+	const list = asList(values).map((v) => Math.max(0, Number(v) || 0));
+	if (!list.length) return null;
+	const top = Math.max(...list) || 1;
+	const w = 100 / list.length;
+	return jsx("svg", {
+		viewBox: `0 0 100 ${height}`,
+		preserveAspectRatio: "none",
+		width: "100%",
+		height,
+		role: "img",
+		"aria-label": label || "",
+		style: { display: "block" },
+		children: list.map((v, i) => {
+			const h = Math.max(v > 0 ? 1 : 0, (v / top) * (height - 1));
+			return jsx("rect", { x: i * w + w * 0.15, y: height - h, width: w * 0.7, height: h, fill: color, rx: 0.6 }, i);
+		}),
+	});
+}
+
+function Section({ title, sub, children }) {
+	return jsxs("div", {
+		className: "flex flex-col gap-1.5",
+		style: { minWidth: 0 },
+		children: [
+			jsxs("div", {
+				className: "flex items-baseline justify-between gap-2",
+				children: [
+					jsx("span", { className: "text-xs font-semibold text-(--ui-text-primary)", children: title }),
+					sub ? jsx("span", { className: "text-[0.6875rem] text-(--ui-text-quaternary)", style: { overflowWrap: "anywhere" }, children: sub }) : null,
+				],
+			}),
+			children,
+		],
+	});
+}
+
+function Card({ children, onClick, title, tone }) {
+	const props = {
+		className: cn(
+			"flex w-full flex-col gap-1 rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-elevated) px-2.5 py-2 text-left",
+			onClick && "cursor-pointer hover:bg-(--chrome-action-hover) transition-colors",
+		),
+		style: { minWidth: 0, overflowWrap: "anywhere", borderLeft: tone ? `2px solid ${tone}` : undefined },
+		title,
+		children,
+	};
+	// jsxs: `children` is a static slot list, not a keyed collection.
+	return onClick ? jsxs("button", { ...props, type: "button", onClick }) : jsxs("div", props);
+}
+
+function Kpi({ label, value, sub }) {
+	return jsxs("div", {
+		className: "flex flex-col rounded-lg border border-(--ui-stroke-secondary) px-2 py-1.5",
+		style: { minWidth: "5.5rem", flex: "1 1 5.5rem" },
+		children: [
+			jsx("span", { className: "text-[0.625rem] text-(--ui-text-tertiary)", children: label }),
+			jsx("span", { className: "tabular-nums text-sm font-semibold text-(--ui-text-primary)", children: value }),
+			sub ? jsx("span", { className: "text-[0.625rem] text-(--ui-text-quaternary)", children: sub }) : null,
+		],
+	});
+}
+
+function MetaLine({ parts }) {
+	const shown = parts.filter((p) => p != null && p !== "" && p !== false);
+	if (!shown.length) return null;
+	return jsx("div", {
+		className: "flex flex-wrap gap-x-2 text-[0.6875rem] text-(--ui-text-tertiary)",
+		children: shown.map((p, i) => jsx("span", { className: "tabular-nums", children: p }, i)),
+	});
+}
+
+function Empty({ children }) {
+	return jsx("div", { className: "text-[0.6875rem] text-(--ui-text-quaternary)", children });
+}
+
+function MonitorNotice({ mon }) {
+	const t = usePluginI18n(ID);
+	const text = !mon.enabled
+		? t("monitorOff")
+		: mon.unsupported
+			? t("monitorUnsupported")
+			: mon.isError
+				? t("monitorError")
+				: t("loading");
+	return jsx("div", {
+		className: "rounded-lg border border-dashed border-(--ui-stroke-secondary) px-3 py-2 text-[0.6875rem] text-(--ui-text-tertiary)",
+		"data-monitor-notice": mon.unsupported ? "unsupported" : mon.enabled ? "pending" : "off",
+		children: text,
+	});
+}
+
+function SectionError({ snapshot, section }) {
+	const t = usePluginI18n(ID);
+	const err = asObject(snapshot && snapshot.errors)[section];
+	return err ? jsx(Empty, { children: t("sectionError", section) }) : null;
+}
+
+// ---- Live view ----
+
+function liveGroupKey(row) {
+	return !row.kind || row.kind === "hermes" ? `p:${row.profile || "default"}` : `s:${row.source_name || row.kind}`;
+}
+
+function LiveRow({ row, children, scope, snapshot, nowSec }) {
+	const t = usePluginI18n(ID);
+	const state = sessionState(row);
+	const badge = state !== "ended" && row.long_tool_call ? "long_tool" : state;
+	const activity = row.long_tool_call ? t("longToolCall", row.long_tool_call) : row.activity;
+	const hermes = row.open ? row.open.kind === "hermes-session" : !row.kind || row.kind === "hermes";
+	return jsxs("div", {
+		className: "flex flex-col gap-1",
+		style: { minWidth: 0 },
+		children: [
+			jsx(Card, {
+				tone: badge === "needs_approval" ? STATE_STYLE.needs_approval : undefined,
+				title: hermes ? t("openSessionTip") : row.open && row.open.command ? t("copyCommandTip", row.open.command) : undefined,
+				onClick: () => void openMonitorTarget(scope, { open: row.open, row, sessionId: row.id, profile: row.profile }, snapshot),
+				children: [
+					jsxs("div", {
+						className: "flex items-center gap-2",
+						style: { minWidth: 0 },
+						children: [
+							jsx(StateBadge, { state: badge }),
+							jsx("span", { className: "min-w-0 flex-1 truncate text-xs font-medium text-(--ui-text-primary)", children: row.title || t("untitled") }),
+							row.subagent ? jsx("span", { className: "text-[0.625rem] text-(--ui-text-quaternary)", children: t("subagent") }) : null,
+						],
+					}),
+					jsx(MetaLine, {
+						parts: [
+							row.model,
+							row.tokens != null ? t("tokensN", fmtTokens(row.tokens)) : null,
+							row.cost != null ? fmtUsd(row.cost) : null,
+							row.context_tokens != null ? t("contextN", fmtTokens(row.context_tokens)) : null,
+							row.last ? t("ago", fmtSpan(nowSec - Number(row.last))) : null,
+							row.account ? `@${row.account}` : null,
+						],
+					}),
+					activity ? jsx("div", { className: "truncate text-[0.6875rem] text-(--ui-text-quaternary)", title: activity, children: `↳ ${activity}` }) : null,
+				],
+			}),
+			children && children.length
+				? jsx("div", { className: "flex flex-col gap-1 pl-3", children })
+				: null,
+		],
+	});
+}
+
+function LiveView({ mon }) {
+	const t = usePluginI18n(ID);
+	const nowMs = useNow(15_000);
+	const snapshot = mon.snapshot;
+	const live = asObject(snapshot.live);
+	const nowSec = finiteNumber(live.now) ?? nowMs / 1000;
+	const counts = liveCounts(live);
+	const running = asList(live.running).filter((r) => r && sessionState(r) !== "ended");
+	const byParent = new Map();
+	for (const r of running) {
+		if (!r.subagent || !r.parent) continue;
+		if (!byParent.has(r.parent)) byParent.set(r.parent, []);
+		byParent.get(r.parent).push(r);
+	}
+	const rank = (r) => STATE_RANK[sessionState(r)] ?? 4;
+	const byAttention = (a, b) => rank(a) - rank(b) || (Number(b.last) || 0) - (Number(a.last) || 0);
+	const mains = running.filter((r) => !r.subagent || !running.some((p) => p.id === r.parent)).sort(byAttention);
+	const groups = new Map();
+	for (const r of mains) {
+		const key = liveGroupKey(r);
+		if (!groups.has(key)) {
+			groups.set(key, {
+				label: key.startsWith("p:") ? r.profile || "default" : r.source_name || r.kind,
+				sub: key.startsWith("p:") ? r.source_name || "Hermes" : t("cliSource"),
+				rows: [],
+			});
+		}
+		groups.get(key).rows.push(r);
+	}
+	const tokenSeries = asList(live.tokens).map(tokenTotal);
+	const attention = asList(live.attention).filter((a) => a && a.kind);
+	const countText = [
+		t("countWorking", counts.working || 0),
+		counts.needs_approval ? t("countApproval", counts.needs_approval) : null,
+		counts.your_turn ? t("countYourTurn", counts.your_turn) : null,
+		counts.stalled ? t("countStalled", counts.stalled) : null,
+	].filter(Boolean).join(" · ");
+	const cost60 = finiteNumber(live.cost_60m);
+	return jsxs("div", {
+		className: "flex flex-col gap-3",
+		"data-monitor-view": "live",
+		children: [
+			jsxs("div", {
+				className: "flex flex-wrap gap-1.5",
+				children: [
+					jsx(Kpi, { label: t("last1m"), value: fmtTokens(live.last_1m), sub: t("tokensPerMin") }),
+					jsx(Kpi, { label: t("last60m"), value: fmtTokens(live.last_60m), sub: cost60 != null ? t("costPerMin", fmtUsd(cost60 / 60)) : null }),
+					jsx(Kpi, { label: t("openSessions"), value: String(counts.open || 0), sub: countText }),
+				],
+			}),
+			tokenSeries.some((v) => v > 0)
+				? jsx(Section, {
+						title: t("tokensChart"),
+						sub: cost60 != null ? t("cost60m", fmtUsd(cost60)) : null,
+						children: jsx(Sparkline, { values: tokenSeries, height: 28, label: t("tokensChart") }),
+					})
+				: null,
+			attention.length
+				? jsx(Section, {
+						title: t("attentionTitle", attention.length),
+						children: jsx("div", {
+							className: "flex flex-col gap-1",
+							children: attention.map((a) =>
+								jsx(Card, {
+									tone: a.kind === "approval" ? STATE_STYLE.needs_approval : a.kind === "your_turn" ? STATE_STYLE.waiting : STATE_STYLE.stalled,
+									title: t("openSessionTip"),
+									onClick: () => void openMonitorTarget(mon.scope, { sessionId: a.session_id, profile: a.profile, source: a.source }, snapshot),
+									children: [
+										jsx("span", { className: "text-xs font-medium text-(--ui-text-primary)", children: tr(`attention_${a.kind}`, a.profile || tr("agent")) }),
+										jsx(MetaLine, { parts: [a.title || t("untitled"), a.detail, a.since ? t("ago", fmtSpan(nowSec - Number(a.since))) : null] }),
+									],
+								}, a.id || `${a.session_id}-${a.kind}`),
+							),
+						}),
+					})
+				: null,
+			groups.size
+				? [...groups.entries()].map(([key, g]) =>
+						jsx(Section, {
+							title: g.label,
+							sub: `${g.sub} · ${g.rows.length}`,
+							children: jsx("div", {
+								className: "flex flex-col gap-1.5",
+								children: g.rows.map((r) =>
+									jsx(LiveRow, {
+										row: r,
+										scope: mon.scope,
+										snapshot,
+										nowSec,
+										children: asList(byParent.get(r.id)).sort(byAttention).map((c) =>
+											jsx(LiveRow, { row: c, scope: mon.scope, snapshot, nowSec }, c.id),
+										),
+									}, r.id),
+								),
+							}),
+						}, key),
+					)
+				: jsx(Empty, { children: t("noOpenSessions") }),
+			jsx(SectionError, { snapshot, section: "live" }),
+		],
+	});
+}
+
+// ---- Health view ----
+
+const MODEL_STATUS_RANK = { failing: 0, account_exhausted: 1, degraded: 2, ok: 3, idle: 4 };
+
+function modelTone(status) {
+	if (status === "failing" || status === "account_exhausted") return "bad";
+	if (status === "degraded") return "warn";
+	if (status === "ok") return "good";
+	return "muted";
+}
+
+function HealthView({ mon }) {
+	const t = usePluginI18n(ID);
+	const nowMs = useNow(30_000);
+	const snapshot = mon.snapshot;
+	const health = asObject(snapshot.health);
+	const nowSec = finiteNumber(health.now) ?? nowMs / 1000;
+	const models = asList(health.models).filter(Boolean).slice().sort(
+		(a, b) => (MODEL_STATUS_RANK[a.status] ?? 5) - (MODEL_STATUS_RANK[b.status] ?? 5) || (Number(b.calls_24h) || 0) - (Number(a.calls_24h) || 0),
+	);
+	// Providers that are simply not set up here collapse into one muted line.
+	const allAccounts = asList(health.accounts).filter(Boolean);
+	const isNotSetUp = (a) => {
+		const reason = `${a.unavailable_code || ""} ${a.unavailable || ""}`.trim();
+		const creds = asList(a.credentials).filter(Boolean);
+		if (!reason) return false;
+		if (!creds.length) return true;
+		return /no-credentials|not-logged-in|opt-in|disabled|not-configured/i.test(reason) && !creds.some((c) => c.status === "ok");
+	};
+	const accounts = allAccounts.filter((a) => !isNotSetUp(a));
+	const notSetUp = allAccounts.filter((a) => !accounts.includes(a)).map((a) => providerMeta(a.provider).name);
+	const chains = asList(health.chains).filter(Boolean);
+	const speed = asList(health.speed).filter(Boolean);
+	return jsxs("div", {
+		className: "flex flex-col gap-3",
+		"data-monitor-view": "health",
+		children: [
+			jsx(Section, {
+				title: t("healthAccounts"),
+				children: accounts.length
+					? jsx("div", {
+							className: "flex flex-col gap-1.5",
+							children: accounts.map((a, i) =>
+								jsx(Card, {
+									children: [
+										jsxs("div", {
+											className: "flex items-center gap-2 text-xs font-medium text-(--ui-text-primary)",
+											children: [
+												jsx(ProviderBadge, { pid: a.provider }),
+												providerMeta(a.provider).name,
+												a.unavailable ? jsx("span", { className: "text-[0.6875rem] font-normal text-(--ui-text-tertiary)", children: t("unavailable", a.unavailable_code || a.unavailable) }) : null,
+											],
+										}),
+										...asList(a.credentials).filter(Boolean).map((c, j) => {
+											const until = isoToSeconds(c.exhausted_until);
+											const locked = Boolean(c.locked) || c.status === "exhausted";
+											return jsxs("div", {
+												className: "flex flex-wrap items-center gap-x-2 pl-7 text-[0.6875rem] text-(--ui-text-secondary)",
+												children: [
+													jsx("span", { className: "inline-block h-1.5 w-1.5 rounded-full", style: { background: toneColor(locked ? "bad" : c.status === "ok" ? "good" : "muted") } }),
+													jsx("span", { children: c.label || c.account_key || t("credentialN", j + 1) }),
+													jsx("span", { className: "text-(--ui-text-tertiary)", children: locked ? t("credLocked") : c.status || "—" }),
+													until && until > nowSec ? jsx("span", { className: "text-(--ui-text-quaternary)", children: t("unlocksIn", fmtSpan(until - nowSec)) }) : null,
+												],
+											}, `${i}-${j}`);
+										}),
+									],
+								}, `${a.provider}-${i}`),
+							),
+						})
+					: jsx(Empty, { children: t("none") }),
+			}),
+			notSetUp.length ? jsx(Empty, { children: t("notSetUp", notSetUp.length, notSetUp.join(", ")) }) : null,
+			jsx(Section, {
+				title: t("healthModels"),
+				sub: t("last24h"),
+				children: models.length
+					? jsx("div", {
+							className: "flex flex-col gap-1",
+							children: models.map((m, i) => {
+								const rate = finiteNumber(m.error_rate);
+								const cooldown = isoToSeconds(m.cooldown_until);
+								return jsx(Card, {
+									tone: modelTone(m.status) === "bad" ? toneColor("bad") : undefined,
+									children: [
+										jsxs("div", {
+											className: "flex items-center gap-2",
+											style: { minWidth: 0 },
+											children: [
+												jsx("span", { className: "inline-block h-1.5 w-1.5 shrink-0 rounded-full", style: { background: toneColor(modelTone(m.status)) } }),
+												jsx("span", { className: "min-w-0 flex-1 truncate text-xs font-medium text-(--ui-text-primary)", children: m.model }),
+												jsx("span", { className: "text-[0.6875rem] text-(--ui-text-tertiary)", children: t(`modelStatus_${m.status || "idle"}`) }),
+											],
+										}),
+										jsx(MetaLine, {
+											parts: [
+												providerMeta(m.provider).name,
+												m.calls_24h != null ? t("callsN", m.calls_24h) : null,
+												rate != null ? t("errorRate", (rate * 100).toFixed(rate < 0.1 ? 1 : 0)) : null,
+												m.errors_24h ? t("errorsN", m.errors_24h) : null,
+												cooldown && cooldown > nowSec ? t("cooldownFor", fmtSpan(cooldown - nowSec)) : null,
+												m.recovered ? t("recovered") : null,
+											],
+										}),
+										m.last_error && m.last_error.summary && (m.errors_24h || modelTone(m.status) !== "good")
+											? jsx("div", { className: "truncate text-[0.6875rem] text-(--ui-text-quaternary)", title: m.last_error.summary, children: `↳ ${m.last_error.summary}` })
+											: null,
+									],
+								}, `${m.provider}-${m.model}-${i}`);
+							}),
+						})
+					: jsx(Empty, { children: t("none") }),
+			}),
+			jsx(Section, {
+				title: t("healthChains"),
+				children: chains.length
+					? jsx("div", {
+							className: "flex flex-col gap-1",
+							children: chains.map((c, i) =>
+								jsx(Card, {
+									children: [
+										jsxs("div", {
+											className: "flex flex-wrap items-center gap-x-2 text-xs",
+											children: [
+												jsx("span", { className: "font-medium text-(--ui-text-primary)", children: c.profile }),
+												jsx("span", { className: "inline-block h-1.5 w-1.5 rounded-full", style: { background: toneColor(modelTone(c.status)) } }),
+												jsx("span", { className: "text-(--ui-text-secondary)", children: c.model }),
+											],
+										}),
+										asList(c.fallbacks).length
+											? asList(c.fallbacks).map((f, j) =>
+													jsx("div", {
+														className: "pl-3 text-[0.6875rem] text-(--ui-text-tertiary)",
+														style: { overflowWrap: "anywhere" },
+														children: `→ ${f.model} (${providerMeta(f.provider).name}) · ${
+															f.state === "skip"
+																? t("chainSkip", t(`skip_${f.reason}`))
+																: f.state === "risky"
+																	? t("chainRisky", ((finiteNumber(f.rate) || 0) * 100).toFixed(0))
+																	: t("chainOk")
+														}`,
+													}, j),
+												)
+											: jsx("div", { className: "pl-3 text-[0.6875rem] text-(--ui-text-quaternary)", children: t("noFallbacks") }),
+									],
+								}, `${c.profile}-${i}`),
+							),
+						})
+					: jsx(Empty, { children: t("none") }),
+			}),
+			speed.length
+				? jsx(Section, {
+						title: t("healthSpeed"),
+						children: jsx("div", {
+							className: "flex flex-col gap-0.5",
+							children: speed.map((s, i) =>
+								jsxs("div", {
+									className: "flex flex-wrap items-baseline justify-between gap-x-2 text-[0.6875rem]",
+									children: [
+										jsx("span", { className: "min-w-0 truncate text-(--ui-text-secondary)", children: `${s.model}${s.source && s.source !== "hermes" ? ` · ${s.source}` : ""}` }),
+										jsx("span", { className: "tabular-nums text-(--ui-text-tertiary)", children: t("speedLine", fmtSeconds(s.p50_s), fmtSeconds(s.p90_s), s.turns || 0) }),
+									],
+								}, `${s.source}-${s.model}-${i}`),
+							),
+						}),
+					})
+				: null,
+			jsx(SectionError, { snapshot, section: "health" }),
+		],
+	});
+}
+
+// ---- Usage view ----
+
+function BudgetBar({ label, spent, limit, projection }) {
+	const t = usePluginI18n(ID);
+	if (!(limit > 0)) return null;
+	const pct = (spent / limit) * 100;
+	const tone = pct >= 100 ? "bad" : pct >= 80 ? "warn" : "good";
+	return jsxs("div", {
+		className: "flex flex-col gap-1",
+		"data-budget": label,
+		children: [
+			jsxs("div", {
+				className: "flex items-center justify-between gap-2 text-xs",
+				children: [
+					jsx("span", { className: "text-(--ui-text-secondary)", children: label }),
+					jsx("span", { className: "tabular-nums font-medium", style: { color: toneColor(tone) }, children: `${fmtUsd(spent)} / ${fmtUsd(limit)} · ${Math.round(pct)}%` }),
+				],
+			}),
+			jsx(QuotaBar, { value: pct, tone }),
+			projection != null
+				? jsx("div", {
+						className: "text-[0.6875rem]",
+						style: { color: projection > limit ? toneColor("warn") : "var(--ui-text-quaternary)" },
+						children: t(projection > limit ? "projectionOver" : "projection", fmtUsd(projection)),
+					})
+				: null,
+		],
+	});
+}
+
+function TopList({ title, rows, onPick }) {
+	const list = rows.filter((r) => r && r.label);
+	if (!list.length) return null;
+	const top = Math.max(...list.map((r) => Number(r.cost) || 0)) || 1;
+	return jsx(Section, {
+		title,
+		children: jsx("div", {
+			className: "flex flex-col gap-1",
+			children: list.map((r, i) =>
+				jsxs(onPick && r.pick ? "button" : "div", {
+					type: onPick && r.pick ? "button" : undefined,
+					className: cn("flex flex-col gap-0.5 text-left", onPick && r.pick && "cursor-pointer rounded hover:bg-(--chrome-action-hover)"),
+					onClick: onPick && r.pick ? () => onPick(r.pick) : undefined,
+					children: [
+						jsxs("div", {
+							className: "flex items-baseline justify-between gap-2 text-[0.6875rem]",
+							children: [
+								jsx("span", { className: "min-w-0 truncate text-(--ui-text-secondary)", title: r.label, children: r.label }),
+								jsx("span", { className: "shrink-0 tabular-nums text-(--ui-text-tertiary)", children: r.sub ? `${fmtUsd(r.cost)} · ${r.sub}` : fmtUsd(r.cost) }),
+							],
+						}),
+						jsx("div", {
+							className: "h-1 w-full overflow-hidden rounded-full bg-(--ui-stroke-secondary)",
+							children: jsx("div", { className: "h-full rounded-full", style: { width: `${Math.max(2, ((Number(r.cost) || 0) / top) * 100)}%`, background: "var(--ui-accent)" } }),
+						}),
+					],
+				}, i),
+			),
+		}),
+	});
+}
+
+function UsageView({ mon }) {
+	const t = usePluginI18n(ID);
+	const nowMs = useNow(60_000);
+	const daily = useValue(budgetDailyAtom);
+	const monthly = useValue(budgetMonthlyAtom);
+	const snapshot = mon.snapshot;
+	const usage = asObject(snapshot.usage);
+	const month = asObject(usage.month);
+	const u = usageSummary(usage, nowMs);
+	const byCost = (a, b) => (Number(b.cost) || 0) - (Number(a.cost) || 0);
+	const models = asList(month.by_model).filter(Boolean).slice().sort(byCost).slice(0, 5)
+		.map((m) => ({ label: m.model, cost: m.cost, sub: fmtTokens(m.tokens) }));
+	const profiles = asList(month.by_profile).filter(Boolean).slice().sort(byCost).slice(0, 5)
+		.map((p) => ({ label: p.profile, cost: p.cost, sub: p.sessions != null ? t("sessionsN", p.sessions) : null }));
+	const sessions = asList(snapshot.top_sessions).filter(Boolean).slice(0, 10)
+		.map((s) => ({
+			label: s.title || t("untitled"),
+			cost: s.cost,
+			sub: [s.profile || s.source, fmtTokens(s.tokens)].filter(Boolean).join(" · "),
+			pick: { sessionId: s.id, profile: s.profile, row: { id: s.id, profile: s.profile, kind: !s.source || s.source === "hermes" ? "hermes" : s.source } },
+		}));
+	const weekTotal = u.last7.reduce((sum, d) => sum + d.cost, 0);
+	return jsxs("div", {
+		className: "flex flex-col gap-3",
+		"data-monitor-view": "usage",
+		children: [
+			jsxs("div", {
+				className: "flex flex-wrap gap-1.5",
+				children: [
+					jsx(Kpi, { label: t("costToday"), value: fmtUsd(u.today), sub: u.todayTokens != null ? t("tokensN", fmtTokens(u.todayTokens)) : null }),
+					jsx(Kpi, { label: t("costMonth"), value: fmtUsd(u.mtd), sub: t("projection", fmtUsd(u.projection)) }),
+				],
+			}),
+			daily > 0 || monthly > 0
+				? jsx(Section, {
+						title: t("budgetTitle"),
+						children: jsxs("div", {
+							className: "flex flex-col gap-2",
+							children: [
+								jsx(BudgetBar, { label: t("budgetDaily"), spent: u.today, limit: daily }),
+								jsx(BudgetBar, { label: t("budgetMonthly"), spent: u.mtd, limit: monthly, projection: u.projection }),
+							],
+						}),
+					})
+				: jsx(Empty, { children: t("budgetHint") }),
+			jsx(Section, {
+				title: t("last7Days"),
+				sub: fmtUsd(weekTotal),
+				children: jsxs("div", {
+					className: "flex flex-col gap-0.5",
+					children: [
+						jsx(MiniBars, { values: u.last7.map((d) => d.cost), label: t("last7Days") }),
+						jsxs("div", {
+							className: "flex justify-between text-[0.625rem] text-(--ui-text-quaternary)",
+							children: [jsx("span", { children: u.last7[0].day.slice(5) }), jsx("span", { children: u.last7[6].day.slice(5) })],
+						}),
+					],
+				}),
+			}),
+			jsx(TopList, { title: t("topModels"), rows: models }),
+			jsx(TopList, { title: t("topProfiles"), rows: profiles }),
+			jsx(TopList, { title: t("topSessions"), rows: sessions, onPick: (pick) => void openMonitorTarget(mon.scope, pick, snapshot) }),
+			jsx("div", { className: "text-[0.625rem] text-(--ui-text-quaternary)", children: t("costEstimateNote") }),
+			jsx(SectionError, { snapshot, section: "usage" }),
+		],
+	});
+}
+
+// ---- Kanban view ----
+
+const KANBAN_GROUPS = ["running", "blocked", "review", "failing"];
+
+function kanbanGroup(card) {
+	if (!card) return null;
+	if (card.status === "running") return "running";
+	if (card.status === "blocked") return "blocked";
+	if (card.status === "review") return "review";
+	if ((finiteNumber(card.consecutive_failures) || 0) > 0 && !["done", "archived"].includes(card.status)) return "failing";
+	return null;
+}
+
+function KanbanView({ mon }) {
+	const t = usePluginI18n(ID);
+	const snapshot = mon.snapshot;
+	const boards = asList(asObject(snapshot.kanban).boards).filter(Boolean);
+	return jsxs("div", {
+		className: "flex flex-col gap-3",
+		"data-monitor-view": "kanban",
+		children: [
+			boards.length
+				? boards.map((board, bi) => {
+						const grouped = Object.fromEntries(KANBAN_GROUPS.map((g) => [g, []]));
+						for (const card of asList(board.cards)) {
+							const g = kanbanGroup(card);
+							if (g) grouped[g].push(card);
+						}
+						const counts = asObject(board.counts);
+						const countLine = Object.entries(counts)
+							.filter(([k, v]) => v && k !== "archived")
+							.map(([k, v]) => `${t(`kanban_${k}`)} ${v}`)
+							.join(" · ");
+						const any = KANBAN_GROUPS.some((g) => grouped[g].length);
+						return jsx(Section, {
+							title: board.board || t("board"),
+							sub: countLine,
+							children: any
+								? jsx("div", {
+										className: "flex flex-col gap-2",
+										children: KANBAN_GROUPS.filter((g) => grouped[g].length).map((g) =>
+											jsxs("div", {
+												className: "flex flex-col gap-1",
+												"data-kanban-group": g,
+												children: [
+													jsx("span", { className: "text-[0.6875rem] font-medium text-(--ui-text-tertiary)", children: `${t(`kanbanGroup_${g}`)} · ${grouped[g].length}` }),
+													...grouped[g].map((card) =>
+														jsx(Card, {
+															tone: g === "failing" ? toneColor("bad") : g === "blocked" ? toneColor("warn") : undefined,
+															title: card.open && card.open.command ? t("copyCommandTip", card.open.command) : undefined,
+															onClick: card.open && card.open.command ? () => void copyCommand(card.open.command) : undefined,
+															children: [
+																jsx("span", { className: "text-xs font-medium text-(--ui-text-primary)", children: card.title || card.id }),
+																jsx(MetaLine, {
+																	parts: [
+																		card.assignee || t("unassigned"),
+																		card.block_kind === "needs_input" ? t("cardWhat_input") : null,
+																		finiteNumber(card.consecutive_failures) ? t("failuresN", card.consecutive_failures) : null,
+																		card.id,
+																	],
+																}),
+																card.last_failure_error && g === "failing"
+																	? jsx("div", { className: "truncate text-[0.6875rem] text-(--ui-text-quaternary)", title: card.last_failure_error, children: `↳ ${card.last_failure_error}` })
+																	: null,
+															],
+														}, card.id),
+													),
+												],
+											}, g),
+										),
+									})
+								: jsx(Empty, { children: t("kanbanQuiet") }),
+						}, `${board.board}-${bi}`);
+					})
+				: jsx(Empty, { children: t("noBoards") }),
+			jsx(SectionError, { snapshot, section: "kanban" }),
+		],
+	});
+}
+
+// ---- Quota view additions ----
+
+function ForecastLine({ forecast }) {
+	const t = usePluginI18n(ID);
+	if (!forecast) return null;
+	const rate = forecast.perHour;
+	const rateText = t("burnRate", `${rate >= 0 ? "+" : ""}${rate.toFixed(Math.abs(rate) < 10 ? 1 : 0)}`);
+	let text;
+	let color = "var(--ui-text-quaternary)";
+	if (rate <= 0) text = t("burnFlat");
+	else if (forecast.fills) {
+		text = `${rateText} · ${t("fillsIn", fmtSpan(forecast.inSeconds))}${forecast.marginSeconds != null ? ` · ${t("beforeReset", fmtSpan(forecast.marginSeconds))}` : ""}`;
+		color = forecast.soon ? toneColor("bad") : toneColor("warn");
+	} else text = `${rateText} · ${t("noFillBeforeReset")}`;
+	return jsx("div", { className: "text-[0.6875rem]", style: { color }, "data-forecast": forecast.fills ? "fills" : "ok", children: text });
+}
+
+function AccountHints({ providers }) {
+	const t = usePluginI18n(ID);
+	const hints = accountRoomHints(providers);
+	if (!hints.length) return null;
+	return jsx("div", {
+		className: "flex flex-col gap-1",
+		children: hints.slice(0, 3).map((h) =>
+			jsx("div", {
+				className: "rounded-lg border border-dashed border-(--ui-stroke-secondary) px-3 py-1.5 text-[0.6875rem] text-(--ui-text-secondary)",
+				"data-account-hint": true,
+				children: `${t("accountHint", h.full, h.used, h.room)} — ${t("accountHintBody", h.window, h.left, h.room)}`,
+			}, h.key),
+		),
+	});
+}
+
+// ---- status bar: working / your-turn chip (+ the notifier) ----
+
+function MonitorStatus() {
+	const t = usePluginI18n(ID);
+	const show = useValue(agentsChipAtom);
+	const showBar = useValue(showStatusBarAtom);
+	const { data } = useQuota();
+	const mon = useMonitor();
+	useMonitorNotifier(mon.scope, data, mon.snapshot);
+	if (!show || !showBar || !mon.snapshot) return null;
+	const counts = liveCounts(mon.snapshot.live);
+	if (!counts.open) return null;
+	const approval = Number(counts.needs_approval) || 0;
+	const label = [
+		t("chipWorking", counts.working || 0),
+		counts.your_turn ? t("chipYourTurn", counts.your_turn) : null,
+		approval ? t("chipApproval", approval) : null,
+	].filter(Boolean).join(" · ");
+	return jsx(QuotaTip, {
+		label: `${t("openSessions")}: ${counts.open}\n${label}\n${t("chipOpenLive")}`,
+		children: jsxs("button", {
+			type: "button",
+			"aria-label": `${label} · ${t("chipOpenLive")}`,
+			"data-agents-chip": true,
+			className: cn(
+				"inline-flex h-full items-center gap-1 px-1.5 text-[0.6875rem]",
+				"text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground transition-colors",
+			),
+			onClick: () => {
+				setPaneView("live");
+				if (typeof host.navigate === "function") host.navigate("/quota");
+			},
+			children: [
+				jsx("span", {
+					className: "inline-block h-1.5 w-1.5 rounded-full",
+					style: { background: approval ? STATE_STYLE.needs_approval : counts.working ? STATE_STYLE.working : STATE_STYLE.waiting },
+				}),
+				jsx("span", { className: "tabular-nums", children: label }),
+			],
+		}),
+	});
+}
+
+// ---- settings ----
+
+function SettingSwitch({ label, hint, checked, onChange }) {
+	return jsxs("div", {
+		className: "flex flex-col gap-1",
+		children: [
+			jsxs("div", {
+				className: "flex items-center justify-between gap-2",
+				children: [
+					jsx("span", { className: "text-xs text-(--ui-text-secondary)", children: label }),
+					jsx(Switch, { checked, onCheckedChange: onChange }),
+				],
+			}),
+			hint ? jsx("div", { className: "text-[0.625rem] text-(--ui-text-quaternary)", children: hint }) : null,
+		],
+	});
+}
+
+function BudgetInput({ label, kind }) {
+	const t = usePluginI18n(ID);
+	const value = useValue(kind === "monthly" ? budgetMonthlyAtom : budgetDailyAtom);
+	return jsxs("div", {
+		className: "flex items-center justify-between gap-2",
+		children: [
+			jsx("span", { className: "text-xs text-(--ui-text-secondary)", children: label }),
+			jsxs("div", {
+				className: "flex items-center gap-1",
+				children: [
+					jsx("span", { className: "text-[0.6875rem] text-(--ui-text-quaternary)", children: "$" }),
+					jsx(Input, {
+						type: "number",
+						min: 0,
+						step: 1,
+						value: value || "",
+						placeholder: t("budgetOff"),
+						"data-budget-input": kind,
+						onChange: (e) => setBudget(kind, e && e.target ? e.target.value : e),
+						onBlur: () => void syncBudgetToBackend(),
+						className: "h-6 w-20 text-right text-xs",
+					}),
+				],
+			}),
+		],
+	});
+}
+
+function MonitorSettings() {
+	const t = usePluginI18n(ID);
+	const enabled = useValue(monitorEnabledAtom);
+	const chip = useValue(agentsChipAtom);
+	const forecast = useValue(quotaForecastAtom);
+	const days = useValue(historyDaysAtom);
+	const liveEvery = useValue(liveIntervalAtom);
+	const notify = {};
+	for (const kind of NOTIFY_KINDS) notify[kind] = useValue(notifyAtoms[kind]);
+	return jsxs("div", {
+		className: "flex flex-col gap-3 border-t border-(--ui-stroke-secondary) pt-3",
+		"data-monitor-settings": true,
+		children: [
+			jsx("span", { className: "text-xs font-semibold text-(--ui-text-primary)", children: t("monitorSettingsTitle") }),
+			jsx(SettingSwitch, { label: t("monitorEnabledLabel"), hint: t("monitorEnabledHint"), checked: enabled, onChange: (v) => setStored(MONITOR_ENABLED_KEY, !!v, monitorEnabledAtom) }),
+			jsx(SettingSwitch, { label: t("agentsChipLabel"), checked: chip, onChange: (v) => setStored(AGENTS_CHIP_KEY, !!v, agentsChipAtom) }),
+			jsx(SettingSwitch, { label: t("quotaForecastLabel"), hint: t("quotaForecastHint"), checked: forecast, onChange: (v) => setStored(QUOTA_FORECAST_KEY, !!v, quotaForecastAtom) }),
+			jsxs("div", {
+				className: "flex items-center justify-between gap-2",
+				children: [
+					jsx("span", { className: "text-xs text-(--ui-text-secondary)", children: t("historyRangeLabel") }),
+					jsx(SegmentedControl, {
+						value: String(days),
+						onChange: (v) => setStored(HISTORY_DAYS_KEY, Number(v) === 7 ? 7 : 1, historyDaysAtom),
+						options: [
+							{ id: "1", label: t("historyDay") },
+							{ id: "7", label: t("historyWeek") },
+						],
+					}),
+				],
+			}),
+			jsxs("div", {
+				className: "flex items-center justify-between gap-2",
+				children: [
+					jsx("span", { className: "text-xs text-(--ui-text-secondary)", children: t("liveIntervalLabel") }),
+					jsx(SegmentedControl, {
+						value: String(liveEvery),
+						onChange: (v) => {
+							const n = Number(v);
+							setStored(LIVE_INTERVAL_KEY, LIVE_INTERVAL_OPTIONS.includes(n) ? n : LIVE_INTERVAL_DEFAULT, liveIntervalAtom);
+						},
+						options: LIVE_INTERVAL_OPTIONS.map((n) => ({ id: String(n), label: n < 60 ? `${n}s` : `${n / 60}m` })),
+					}),
+				],
+			}),
+			jsx("span", { className: "text-xs font-semibold text-(--ui-text-primary)", children: t("budgetTitle") }),
+			jsx(BudgetInput, { label: t("budgetDaily"), kind: "daily" }),
+			jsx(BudgetInput, { label: t("budgetMonthly"), kind: "monthly" }),
+			jsx("div", { className: "text-[0.625rem] text-(--ui-text-quaternary)", children: t("budgetSettingsHint") }),
+			jsx("span", { className: "text-xs font-semibold text-(--ui-text-primary)", children: t("notificationsTitle") }),
+			...NOTIFY_KINDS.map((kind) =>
+				jsx(SettingSwitch, {
+					label: t(`notify_${kind}`),
+					checked: notify[kind],
+					onChange: (v) => setStored(notifyKey(kind), !!v, notifyAtoms[kind]),
+				}, kind),
+			),
+			jsx("div", { className: "text-[0.625rem] text-(--ui-text-quaternary)", children: t("notificationsHint") }),
+		],
+	});
+}
+
+function MonitorTabs() {
+	const t = usePluginI18n(ID);
+	const view = useValue(paneViewAtom);
+	return jsx(SegmentedControl, {
+		value: view,
+		onChange: (v) => setPaneView(v),
+		className: "w-full",
+		options: MONITOR_VIEWS.map((id) => ({ id, label: t(`tab_${id}`) })),
+	});
+}
+
+function MonitorBody({ mon, view }) {
+	if (!mon.snapshot) return jsx(MonitorNotice, { mon });
+	if (view === "live") return jsx(LiveView, { mon });
+	if (view === "health") return jsx(HealthView, { mon });
+	if (view === "usage") return jsx(UsageView, { mon });
+	if (view === "kanban") return jsx(KanbanView, { mon });
+	return null;
+}
+
+// ---- locale bundles (en + tr) ---------------------------------------------
+// Module-level so handlers (notifications, clipboard toasts) can fall back to
+// English through `tr()` when no component is around.
+
+const I18N_EN = {
+	paneTitle: "Quota",
+	settingsTitle: "Quota · Settings",
+	chipTip: (pct, label, reset) =>
+		`Quota · lowest ${pct}% (${label})${reset ? ` · resets in ${reset}` : ""}`,
+	providerTip: (label, pct, reset) =>
+		`${label} · ${pct}%${reset ? ` · resets in ${reset}` : ""}`,
+	popoverReset: (reset) => `resets in ${reset}`,
+	refreshTip: "Refresh quota",
+	settingsTip: "Quota settings",
+	backTip: "Back to quota",
+	loading: "Loading…",
+	error: "Quota backend unavailable",
+	empty: "No quota data yet.",
+	emptyHint: "Quota data is being initialized automatically…",
+	unavailable: (reason) => `unavailable (${reason})`,
+	moreDetails: (n) => `+${n} more`,
+	noData: "no window data",
+	noDataSection: (n) => `No data (${n}) — click to expand`,
+	reset: (when) => `reset ${when}`,
+	fetched: (when) => `Checked ${when}`,
+	fetchedAge: (age, interval) => `${age} old · poll ${interval}s`,
+	versionSkew: (widget, backend) =>
+		`Widget v${widget} · backend v${backend} — reload desktop plugins (or restart the app) to line them up.`,
+	resetFormatLabel: "Reset format",
+	relative: "Relative",
+	absolute: "Absolute",
+	statusbarModeLabel: "Status bar mode",
+	statusbarModeAll: "All providers",
+	statusbarModeWorst: "Worst only",
+	paneDetailLabel: "Pane detail",
+	paneDetailClean: "Clean",
+	paneDetailCleanHint: "Just the percentage bars",
+	paneDetailDense: "Dense",
+	paneDetailDenseHint: "Windows, resets and detail lines",
+	showStatusBarLabel: "Show status bar indicator",
+	showStatusBarHint:
+		"The Hermes status bar must also be visible (⌘K → Toggle status bar).",
+	showDockedPaneLabel: "Show docked quota pane",
+	settingsButton: "Settings",
+	refreshIntervalLabel: "Refresh interval",
+	refreshIntervalHint: (seconds, min, max) =>
+		`Reads the cache every ${seconds}s (${min}–${max}s). Refreshes run in the background, so the cadence stays exact.`,
+	seconds: "s",
+	disabledProvidersLabel: "Enabled providers",
+	disableTooltip: "Disable this provider",
+	enableTooltip: "Enable this provider",
+
+	// ---- agent monitor ----
+	tab_quota: "Quota",
+	tab_live: "Live",
+	tab_health: "Health",
+	tab_usage: "Usage",
+	tab_kanban: "Kanban",
+	monitorOff: "The agent monitor is off — turn it on in Settings.",
+	monitorUnsupported:
+		"This gateway's quota plugin has no agent monitor yet — update it (./install.sh) to see live sessions, health, usage and kanban.",
+	monitorError: "Agent monitor unavailable right now.",
+	sectionError: (section) => `Couldn't read ${section} data this time.`,
+	monitorUpdated: (when, interval) => `Updated ${when} · poll ${interval}s`,
+	state_working: "working",
+	state_waiting: "your turn",
+	state_needs_approval: "needs approval",
+	state_stalled: "stalled?",
+	state_long_tool: "long tool call",
+	state_ended: "ended",
+	untitled: "(untitled session)",
+	subagent: "subagent",
+	agent: "Agent",
+	cliSource: "CLI",
+	tokensN: (n) => `${n} tokens`,
+	contextN: (n) => `ctx ${n}`,
+	ago: (span) => `${span} ago`,
+	longToolCall: (tool) => `long tool call running: ${tool}`,
+	openSessionTip: "Open this session",
+	copyCommandTip: (command) => `Copy: ${command}`,
+	commandCopied: (command) => `Copied: ${command}`,
+	commandCopyFailed: (command) => `Couldn't copy — run: ${command}`,
+	last1m: "Last minute",
+	last60m: "Last 60 min",
+	tokensPerMin: "tokens / min",
+	costPerMin: (cost) => `≈ ${cost} / min`,
+	cost60m: (cost) => `≈ ${cost} in 60 min`,
+	openSessions: "Open sessions",
+	countWorking: (n) => `${n} working`,
+	countApproval: (n) => `${n} awaiting approval`,
+	countYourTurn: (n) => `${n} your turn`,
+	countStalled: (n) => `${n} stalled?`,
+	tokensChart: "Tokens / minute · last 60 min",
+	attentionTitle: (n) => `Needs attention (${n})`,
+	noOpenSessions: "No open sessions.",
+	attention_approval: (who) => `${who} needs approval`,
+	attention_your_turn: (who) => `${who} finished — your turn`,
+	attention_stalled: (who) => `${who} may be stuck`,
+	attention_loop: (who) => `${who}: possible loop`,
+	attention_big_context: (who) => `${who}: large context`,
+	healthAccounts: "Accounts",
+	healthModels: "Models",
+	healthChains: "Fallback chains",
+	healthSpeed: "Model speed",
+	notSetUp: (n, names) => `Not set up here (${n}): ${names}`,
+	last24h: "last 24 h",
+	none: "Nothing to show.",
+	credentialN: (n) => `credential ${n}`,
+	credLocked: "limit reached",
+	unlocksIn: (span) => ` — unlocks in ${span}`,
+	modelStatus_ok: "ok",
+	modelStatus_idle: "idle",
+	modelStatus_degraded: "degraded",
+	modelStatus_failing: "failing",
+	modelStatus_account_exhausted: "account limit",
+	callsN: (n) => `${n} calls`,
+	errorRate: (pct) => `${pct}% errors`,
+	errorsN: (n) => `${n} errors`,
+	cooldownFor: (span) => `cooldown ${span}`,
+	recovered: "recovered",
+	chainOk: "usable",
+	chainSkip: (reason) => `skipped: ${reason}`,
+	chainRisky: (pct) => `risky (${pct}% errors)`,
+	skip_same_backend: "same backend as primary",
+	skip_no_credentials: "no credentials",
+	skip_locked: "all credentials locked",
+	skip_cooldown: "in cooldown",
+	skip_undefined: "unknown",
+	noFallbacks: "no fallbacks configured",
+	speedLine: (p50, p90, turns) => `median ${p50} · p90 ${p90} · ${turns} turns`,
+	costToday: "Today",
+	costMonth: "This month",
+	projection: (cost) => `month-end ≈ ${cost}`,
+	projectionOver: (cost) => `month-end ≈ ${cost} — over budget`,
+	budgetTitle: "Budget",
+	budgetDaily: "Daily",
+	budgetMonthly: "Monthly",
+	budgetHint: "Set a daily or monthly budget in Settings to track spend against it.",
+	budgetOff: "off",
+	budgetSettingsHint: "USD; empty or 0 = off. Costs are API-price estimates.",
+	last7Days: "Last 7 days",
+	topModels: "Top models · month",
+	topProfiles: "Top profiles · month",
+	topSessions: "Top sessions · 7 days",
+	sessionsN: (n) => `${n} sessions`,
+	costEstimateNote: "Costs are API-price estimates; a subscription is not billed per token.",
+	board: "Board",
+	noBoards: "No kanban boards.",
+	kanbanQuiet: "Nothing running, blocked, in review or failing.",
+	kanbanGroup_running: "Running",
+	kanbanGroup_blocked: "Blocked",
+	kanbanGroup_review: "Review",
+	kanbanGroup_failing: "Failing",
+	kanban_todo: "todo",
+	kanban_triage: "triage",
+	kanban_ready: "ready",
+	kanban_running: "running",
+	kanban_blocked: "blocked",
+	kanban_review: "review",
+	kanban_done: "done",
+	kanban_archived: "archived",
+	unassigned: "unassigned",
+	failuresN: (n) => `${n}× failed`,
+	cardWhat_input: "needs your input",
+	cardWhat_blocked: "blocked",
+	cardWhat_review: "is waiting for review",
+	cardWhat_failing: "failing",
+	burnRate: (rate) => `${rate}%/h`,
+	burnFlat: "no change in the last 2 h",
+	fillsIn: (span) => `full in ~${span}`,
+	beforeReset: (span) => `${span} before reset`,
+	noFillBeforeReset: "won't fill before reset",
+	accountHint: (full, used, room) => `${full} is at ${used}% · ${room} has room`,
+	accountHintBody: (window, left, room) => `${window}: ${left}% left on ${room}`,
+	chipWorking: (n) => `${n} working`,
+	chipYourTurn: (n) => `${n} your turn`,
+	chipApproval: (n) => `${n} approval`,
+	chipOpenLive: "Click to open Live",
+	notifyQuotaTitle: (pct) => `Quota at ${pct}%`,
+	notifyResetsIn: (span) => ` — resets in ${span}`,
+	notifySoonTitle: "Quota filling up soon",
+	notifySoonBody: (span) => `at this rate full in ~${span}, before it resets`,
+	notifyBudgetTitle: (label, pct) => `${label} budget at ${pct}%`,
+	notifyCardTitle: (what) => `Kanban: card ${what}`,
+	notifyModelTitle: (status, model) => `Model ${status}: ${model}`,
+	notifyLockedTitle: (provider) => `Account limit reached: ${provider}`,
+	monitorSettingsTitle: "Agent monitor",
+	monitorEnabledLabel: "Agent monitor",
+	monitorEnabledHint: "Live sessions, health, usage and kanban — one extra CLI read per refresh interval.",
+	agentsChipLabel: "Show working / your-turn chip in the status bar",
+	quotaForecastLabel: "Burn rate, forecast and history in the Quota view",
+	quotaForecastHint: "History is read every few minutes, only while the Quota view is open.",
+	historyRangeLabel: "History range",
+	liveIntervalLabel: "Live refresh",
+	historyDay: "24 h",
+	historyWeek: "7 days",
+	notificationsTitle: "Notifications",
+	notificationsHint: "Native notifications appear only while you're away from Hermes, each event once.",
+	notify_quota: "Quota 80% / 95%, filling soon, account hints",
+	notify_budget: "Budget 80% / 100%",
+	notify_kanban: "Kanban cards blocked, in review or failing",
+	notify_health: "Failing models and locked accounts",
+	notify_agents: "Agents needing approval, stuck, looping or with a large context",
+	notify_turns: "Agent finished — your turn",
+};
+
+const I18N_TR = {
+	paneTitle: "Kota",
+	settingsTitle: "Kota · Ayarlar",
+	chipTip: (pct, label, reset) =>
+		`Kota · en düşük %${pct} (${label})${reset ? ` · ${reset} sonra sıfırlanır` : ""}`,
+	providerTip: (label, pct, reset) =>
+		`${label} · %${pct}${reset ? ` · ${reset} sonra sıfırlanır` : ""}`,
+	popoverReset: (reset) => `${reset} sonra sıfırlanır`,
+	refreshTip: "Kotayı yenile",
+	settingsTip: "Kota ayarları",
+	backTip: "Kotaya dön",
+	loading: "Yükleniyor…",
+	error: "Kota arka ucu kullanılamıyor",
+	empty: "Henüz kota verisi yok.",
+	emptyHint: "Kota verisi otomatik hazırlanıyor…",
+	unavailable: (reason) => `kullanılamıyor (${reason})`,
+	moreDetails: (n) => `+${n} daha`,
+	noData: "pencere verisi yok",
+	noDataSection: (n) => `Veri yok (${n}) — açmak için tıkla`,
+	reset: (when) => `sıfırlanma ${when}`,
+	fetched: (when) => `Kontrol: ${when}`,
+	fetchedAge: (age, interval) => `${age} önce · ${interval} sn'de bir`,
+	versionSkew: (widget, backend) =>
+		`Widget v${widget} · arka uç v${backend} — eşitlemek için masaüstü eklentilerini yeniden yükle (ya da uygulamayı yeniden başlat).`,
+	resetFormatLabel: "Sıfırlanma biçimi",
+	relative: "Göreli",
+	absolute: "Mutlak",
+	statusbarModeLabel: "Durum çubuğu",
+	statusbarModeAll: "Tüm sağlayıcılar",
+	statusbarModeWorst: "Yalnız en düşük",
+	paneDetailLabel: "Panel ayrıntısı",
+	paneDetailClean: "Sade",
+	paneDetailCleanHint: "Yalnızca yüzde çubukları",
+	paneDetailDense: "Ayrıntılı",
+	paneDetailDenseHint: "Pencereler, sıfırlanmalar ve ayrıntı satırları",
+	showStatusBarLabel: "Durum çubuğu göstergesini göster",
+	showStatusBarHint:
+		"Hermes durum çubuğu da görünür olmalı (⌘K → Toggle status bar).",
+	showDockedPaneLabel: "Yan kota panelini göster",
+	settingsButton: "Ayarlar",
+	refreshIntervalLabel: "Yenileme aralığı",
+	refreshIntervalHint: (seconds, min, max) =>
+		`Önbelleği ${seconds} sn'de bir okur (${min}–${max} sn). Yenilemeler arka planda çalışır, aralık şaşmaz.`,
+	seconds: "sn",
+	disabledProvidersLabel: "Açık sağlayıcılar",
+	disableTooltip: "Bu sağlayıcıyı kapat",
+	enableTooltip: "Bu sağlayıcıyı aç",
+
+	tab_quota: "Kota",
+	tab_live: "Canlı",
+	tab_health: "Sağlık",
+	tab_usage: "Kullanım",
+	tab_kanban: "Kanban",
+	monitorOff: "Ajan izleme kapalı — Ayarlar'dan açabilirsin.",
+	monitorUnsupported:
+		"Bu gateway'deki kota eklentisinde ajan izleme yok — canlı oturumlar, sağlık, kullanım ve kanban için güncelle (./install.sh).",
+	monitorError: "Ajan izleme şu an kullanılamıyor.",
+	sectionError: (section) => `${section} verisi bu sefer okunamadı.`,
+	monitorUpdated: (when, interval) => `Güncellendi ${when} · ${interval} sn'de bir`,
+	state_working: "çalışıyor",
+	state_waiting: "sıra sende",
+	state_needs_approval: "onay bekliyor",
+	state_stalled: "takıldı mı?",
+	state_long_tool: "uzun araç çağrısı",
+	state_ended: "bitti",
+	untitled: "(başlıksız oturum)",
+	subagent: "alt ajan",
+	agent: "Ajan",
+	cliSource: "CLI",
+	tokensN: (n) => `${n} token`,
+	contextN: (n) => `bağlam ${n}`,
+	ago: (span) => `${span} önce`,
+	longToolCall: (tool) => `uzun araç çağrısı sürüyor: ${tool}`,
+	openSessionTip: "Bu oturumu aç",
+	copyCommandTip: (command) => `Kopyala: ${command}`,
+	commandCopied: (command) => `Kopyalandı: ${command}`,
+	commandCopyFailed: (command) => `Kopyalanamadı — çalıştır: ${command}`,
+	last1m: "Son 1 dk",
+	last60m: "Son 60 dk",
+	tokensPerMin: "token / dk",
+	costPerMin: (cost) => `≈ ${cost} / dk`,
+	cost60m: (cost) => `60 dk'da ≈ ${cost}`,
+	openSessions: "Açık oturum",
+	countWorking: (n) => `${n} çalışıyor`,
+	countApproval: (n) => `${n} onay bekliyor`,
+	countYourTurn: (n) => `${n} sıra sende`,
+	countStalled: (n) => `${n} takıldı mı?`,
+	tokensChart: "Token / dakika · son 60 dk",
+	attentionTitle: (n) => `İlgi bekliyor (${n})`,
+	noOpenSessions: "Açık oturum yok.",
+	attention_approval: (who) => `${who} onay bekliyor`,
+	attention_your_turn: (who) => `${who} bitirdi — sıra sende`,
+	attention_stalled: (who) => `${who} takılmış olabilir`,
+	attention_loop: (who) => `${who}: döngü olabilir`,
+	attention_big_context: (who) => `${who}: bağlam çok büyük`,
+	healthAccounts: "Hesaplar",
+	healthModels: "Modeller",
+	healthChains: "Yedek zincirleri",
+	healthSpeed: "Model hızı",
+	notSetUp: (n, names) => `Burada kurulu değil (${n}): ${names}`,
+	last24h: "son 24 saat",
+	none: "Gösterilecek bir şey yok.",
+	credentialN: (n) => `kimlik ${n}`,
+	credLocked: "limit doldu",
+	unlocksIn: (span) => ` — ${span} sonra açılır`,
+	modelStatus_ok: "iyi",
+	modelStatus_idle: "boşta",
+	modelStatus_degraded: "bozuk",
+	modelStatus_failing: "hata veriyor",
+	modelStatus_account_exhausted: "hesap limiti",
+	callsN: (n) => `${n} çağrı`,
+	errorRate: (pct) => `%${pct} hata`,
+	errorsN: (n) => `${n} hata`,
+	cooldownFor: (span) => `bekleme ${span}`,
+	recovered: "düzeldi",
+	chainOk: "kullanılabilir",
+	chainSkip: (reason) => `atlanır: ${reason}`,
+	chainRisky: (pct) => `riskli (%${pct} hata)`,
+	skip_same_backend: "ana modelle aynı arka uç",
+	skip_no_credentials: "kimlik bilgisi yok",
+	skip_locked: "tüm kimlikler kilitli",
+	skip_cooldown: "beklemede",
+	skip_undefined: "bilinmiyor",
+	noFallbacks: "yedek model tanımlı değil",
+	speedLine: (p50, p90, turns) => `medyan ${p50} · p90 ${p90} · ${turns} tur`,
+	costToday: "Bugün",
+	costMonth: "Bu ay",
+	projection: (cost) => `ay sonu ≈ ${cost}`,
+	projectionOver: (cost) => `ay sonu ≈ ${cost} — bütçeyi aşar`,
+	budgetTitle: "Bütçe",
+	budgetDaily: "Günlük",
+	budgetMonthly: "Aylık",
+	budgetHint: "Harcamayı izlemek için Ayarlar'dan günlük ya da aylık bütçe gir.",
+	budgetOff: "kapalı",
+	budgetSettingsHint: "USD; boş ya da 0 = kapalı. Maliyetler API fiyatı tahminidir.",
+	last7Days: "Son 7 gün",
+	topModels: "En çok harcayan modeller · ay",
+	topProfiles: "En çok harcayan profiller · ay",
+	topSessions: "En çok harcayan oturumlar · 7 gün",
+	sessionsN: (n) => `${n} oturum`,
+	costEstimateNote: "Maliyetler API fiyatı tahminidir; abonelikte token başına ödeme yapılmaz.",
+	board: "Pano",
+	noBoards: "Kanban panosu yok.",
+	kanbanQuiet: "Çalışan, bloklu, incelemede ya da hata veren kart yok.",
+	kanbanGroup_running: "Çalışıyor",
+	kanbanGroup_blocked: "Bloklu",
+	kanbanGroup_review: "İncelemede",
+	kanbanGroup_failing: "Hata veriyor",
+	kanban_todo: "yapılacak",
+	kanban_triage: "triaj",
+	kanban_ready: "hazır",
+	kanban_running: "çalışıyor",
+	kanban_blocked: "bloklu",
+	kanban_review: "incelemede",
+	kanban_done: "bitti",
+	kanban_archived: "arşiv",
+	unassigned: "atanmamış",
+	failuresN: (n) => `${n} kez hata`,
+	cardWhat_input: "girdi bekliyor",
+	cardWhat_blocked: "bloklandı",
+	cardWhat_review: "inceleme bekliyor",
+	cardWhat_failing: "hata verdi",
+	burnRate: (rate) => `%${rate}/sa`,
+	burnFlat: "son 2 saatte değişmedi",
+	fillsIn: (span) => `~${span} içinde dolar`,
+	beforeReset: (span) => `sıfırlanmaya ${span} kala`,
+	noFillBeforeReset: "sıfırlanmadan dolmaz",
+	accountHint: (full, used, room) => `${full} %${used} doldu · ${room} hesabında yer var`,
+	accountHintBody: (window, left, room) => `${window}: ${room} hesabında %${left} kaldı`,
+	chipWorking: (n) => `${n} çalışıyor`,
+	chipYourTurn: (n) => `${n} sıra sende`,
+	chipApproval: (n) => `${n} onay`,
+	chipOpenLive: "Canlı görünümü açmak için tıkla",
+	notifyQuotaTitle: (pct) => `Kota %${pct} doldu`,
+	notifyResetsIn: (span) => ` — ${span} sonra sıfırlanır`,
+	notifySoonTitle: "Kota yakında dolacak",
+	notifySoonBody: (span) => `bu hızla ~${span} içinde, sıfırlanmadan dolar`,
+	notifyBudgetTitle: (label, pct) => `${label} bütçe %${pct}`,
+	notifyCardTitle: (what) => `Kanban: kart ${what}`,
+	notifyModelTitle: (status, model) => `Model ${status}: ${model}`,
+	notifyLockedTitle: (provider) => `Hesap limiti doldu: ${provider}`,
+	monitorSettingsTitle: "Ajan izleme",
+	monitorEnabledLabel: "Ajan izleme",
+	monitorEnabledHint: "Canlı oturumlar, sağlık, kullanım ve kanban — her yenileme aralığında bir ek CLI okuması.",
+	agentsChipLabel: "Durum çubuğunda çalışıyor / sıra sende sayısını göster",
+	quotaForecastLabel: "Kota görünümünde tüketim hızı, tahmin ve geçmiş",
+	quotaForecastHint: "Geçmiş birkaç dakikada bir, yalnızca Kota görünümü açıkken okunur.",
+	historyRangeLabel: "Geçmiş aralığı",
+	liveIntervalLabel: "Canlı yenileme",
+	historyDay: "24 saat",
+	historyWeek: "7 gün",
+	notificationsTitle: "Bildirimler",
+	notificationsHint: "Sistem bildirimleri yalnızca Hermes'ten uzaktayken gelir; her olay bir kez.",
+	notify_quota: "Kota %80 / %95, yakında dolacak, hesap ipuçları",
+	notify_budget: "Bütçe %80 / %100",
+	notify_kanban: "Bloklanan, incelemeye düşen ya da hata veren kanban kartları",
+	notify_health: "Hata veren modeller ve kilitlenen hesaplar",
+	notify_agents: "Onay bekleyen, takılan, döngüye giren ya da bağlamı büyüyen ajanlar",
+	notify_turns: "Ajan bitirdi — sıra sende",
+};
 
 // ---- registration ---------------------------------------------------------
 
@@ -2047,56 +4105,7 @@ export default {
 		CTX = ctx;
 		applyStoredAll();
 		registerDockedPane();
-		ctx.i18n.register({
-			en: {
-				paneTitle: "Quota",
-				settingsTitle: "Quota · Settings",
-				chipTip: (pct, label, reset) =>
-					`Quota · lowest ${pct}% (${label})${reset ? ` · resets in ${reset}` : ""}`,
-				providerTip: (label, pct, reset) =>
-					`${label} · ${pct}%${reset ? ` · resets in ${reset}` : ""}`,
-				popoverReset: (reset) => `resets in ${reset}`,
-				refreshTip: "Refresh quota",
-				settingsTip: "Quota settings",
-				backTip: "Back to quota",
-				loading: "Loading…",
-				error: "Quota backend unavailable",
-				empty: "No quota data yet.",
-				emptyHint: "Quota data is being initialized automatically…",
-				unavailable: (reason) => `unavailable (${reason})`,
-				moreDetails: (n) => `+${n} more`,
-				noData: "no window data",
-				noDataSection: (n) => `No data (${n}) — click to expand`,
-				reset: (when) => `reset ${when}`,
-				fetched: (when) => `Checked ${when}`,
-				fetchedAge: (age, interval) => `${age} old · poll ${interval}s`,
-				versionSkew: (widget, backend) =>
-					`Widget v${widget} · backend v${backend} — reload desktop plugins (or restart the app) to line them up.`,
-				resetFormatLabel: "Reset format",
-				relative: "Relative",
-				absolute: "Absolute",
-				statusbarModeLabel: "Status bar mode",
-				statusbarModeAll: "All providers",
-				statusbarModeWorst: "Worst only",
-				paneDetailLabel: "Pane detail",
-				paneDetailClean: "Clean",
-				paneDetailCleanHint: "Just the percentage bars",
-				paneDetailDense: "Dense",
-				paneDetailDenseHint: "Windows, resets and detail lines",
-				showStatusBarLabel: "Show status bar indicator",
-				showStatusBarHint:
-					"The Hermes status bar must also be visible (⌘K → Toggle status bar).",
-				showDockedPaneLabel: "Show docked quota pane",
-				settingsButton: "Settings",
-				refreshIntervalLabel: "Refresh interval",
-				refreshIntervalHint: (seconds, min, max) =>
-					`Reads the cache every ${seconds}s (${min}–${max}s). Refreshes run in the background, so the cadence stays exact.`,
-				seconds: "s",
-				disabledProvidersLabel: "Enabled providers",
-				disableTooltip: "Disable this provider",
-				enableTooltip: "Enable this provider",
-			},
-		});
+		ctx.i18n.register({ en: I18N_EN, tr: I18N_TR });
 
 		// Single, static statusbar item. The StatusBar component re-renders itself
 		// via hooks (useQuota / useValue) — it never re-registers, so no feedback
@@ -2106,6 +4115,16 @@ export default {
 			area: STATUSBAR_AREAS.right,
 			order: 125,
 			render: () => jsx(StatusBar, {}),
+		});
+
+		// Agents chip (working / your turn) + the monitor notifier. Renders
+		// nothing until a monitor snapshot exists, so an older backend leaves
+		// the status bar exactly as it was.
+		ctx.register({
+			id: "agents",
+			area: STATUSBAR_AREAS.right,
+			order: 124,
+			render: () => jsx(MonitorStatus, {}),
 		});
 
 		// Route page (/quota).

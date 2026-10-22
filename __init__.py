@@ -7,7 +7,11 @@ Registers:
   * a ``usage_extra`` lifecycle hook that appends the same quota block to the
     /usage command output;
   * a ``/quota`` slash command for on-demand detail (triggers a refresh when
-    the cache is stale), plus a ``hermes quota`` CLI command.
+    the cache is stale), plus a ``hermes quota`` CLI command (with the
+    ``hermes quota monitor`` JSON views, see docs/monitor.md);
+  * read-only agent tools (quota status, model health, fallback chains,
+    budget, running counts, attention, recommend_model) when the Hermes
+    runtime supports ``register_tool``.
 
 The quota subsystem (fetchers + cache) lives entirely inside this plugin, so it
 survives ``hermes update`` — the only core change is the generic ``footer`` and
@@ -123,3 +127,10 @@ def register(ctx) -> None:
         setup_fn=commands.setup_argparse,
         handler_fn=commands._handle_cli,
     )
+    try:
+        from .quota_monitor.tools import register_tools
+        register_tools(ctx)
+    except Exception:
+        # The agent tools are optional: an older Hermes without register_tool, or any import problem, must not
+        # take the /quota command, the CLI or the widget down with it.
+        pass
