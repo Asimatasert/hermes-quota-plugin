@@ -415,7 +415,7 @@ class MonitorNotificationTest(unittest.TestCase):
         self.assertIn('spin', out[1]['codicon'])
         self.assertEqual(out[2]['label'], 'Quota · 1 approval · 1 active · ⚠ 8%')
         self.assertEqual(out[2]['codicon'], 'bell-dot')
-        self.assertEqual(out[3]['label'], 'Quota · 3 sıra sende')
+        self.assertEqual(out[3]['label'], 'Kota · 3 sıra sende')
 
     def test_pure_rules_function(self):
         expr = '''(() => {

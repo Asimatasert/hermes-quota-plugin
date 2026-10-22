@@ -338,7 +338,7 @@ class LiveAndNavTest(unittest.TestCase):
             'Quota · ctx 95% · 2 active',
             'Quota · 1 approval · ctx 91%',
             'Quota · 1 approval · 1 active · ⚠ 8%',
-            'Quota · bağlam %92',
+            'Kota · bağlam %92',
         ])
 
     def test_settings_controls_and_defaults(self):

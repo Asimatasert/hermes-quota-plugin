@@ -24,7 +24,6 @@ import {
 	atom,
 	cn,
 	ConfirmDialog,
-	fmtDayTime,
 	host,
 	Input,
 	icons,
@@ -40,6 +39,7 @@ import {
 	StatusDot,
 	Switch,
 	Tip,
+	useI18n,
 	useMutation,
 	usePluginI18n,
 	useQuery,
@@ -60,6 +60,127 @@ const WIDGET_VERSION = "2.10.1";
 
 // Module-level ctx handle (set in register). The data hook below needs it.
 let CTX = null;
+
+// ---- locale: app language → Intl --------------------------------------------
+//
+// Dates, numbers and money follow the APP language (display.language), never
+// the OS locale: `Intl.*(undefined)` / `toLocaleString([])` show English dates
+// in a Turkish UI. Components report the reactive `useI18n().locale` while they
+// render (useQT); code outside React falls back to the bundle's `_locale` key
+// through ctx.i18n.t, then to <html lang> (the app sets it with the language).
+
+const INTL_TAGS = {
+	en: "en-US",
+	tr: "tr-TR",
+	de: "de-DE",
+	es: "es-ES",
+	fr: "fr-FR",
+	ru: "ru-RU",
+	ja: "ja-JP",
+	zh: "zh-CN",
+	"zh-hant": "zh-TW",
+	// Western digits: the strings around these numbers (and the app) use them.
+	ar: "ar-u-nu-latn",
+};
+const RTL_LANGS = new Set(["ar", "fa", "he", "ur", "ps", "yi"]);
+let _renderLocale = null;
+
+function normLocale(value) {
+	return typeof value === "string" && value.trim() ? value.trim().replace(/_/g, "-").toLowerCase() : null;
+}
+
+/** The app's active language id ("tr", "zh-hant", …). */
+function appLocale() {
+	if (_renderLocale) return _renderLocale;
+	let id = null;
+	try {
+		const v = CTX && CTX.i18n && typeof CTX.i18n.t === "function" ? CTX.i18n.t("_locale") : null;
+		if (v && v !== "_locale") id = normLocale(v);
+	} catch {
+		/* older host */
+	}
+	if (!id || id === "en") {
+		try {
+			const lang = typeof document !== "undefined" && document.documentElement ? normLocale(document.documentElement.lang) : null;
+			if (lang) id = lang;
+		} catch {
+			/* no DOM */
+		}
+	}
+	return id || "en";
+}
+
+function noteRenderLocale(locale) {
+	const id = normLocale(locale);
+	if (id) _renderLocale = id;
+}
+
+/** BCP-47 tag for Intl (tr → tr-TR, zh-hant → zh-TW, ar → Western digits). */
+function intlTag(id = appLocale()) {
+	if (INTL_TAGS[id]) return INTL_TAGS[id];
+	if (/^zh-(tw|hk|mo|hant)/.test(id)) return INTL_TAGS["zh-hant"];
+	const base = id.split("-")[0];
+	if (base === "ar") return INTL_TAGS.ar;
+	try {
+		if (Intl.DateTimeFormat.supportedLocalesOf([id]).length) return id;
+	} catch {
+		/* malformed tag */
+	}
+	return INTL_TAGS[base] || "en-US";
+}
+
+function localeBase() {
+	return appLocale().split("-")[0];
+}
+
+function isEnLocale() {
+	return localeBase() === "en";
+}
+
+function isRtl() {
+	return RTL_LANGS.has(localeBase());
+}
+
+/** `dir` for the plugin's roots (the app also sets it on <html>). */
+function localeDir() {
+	return isRtl() ? "rtl" : "ltr";
+}
+
+/** A "leads to" arrow that points along the reading direction. */
+function arrowFwd() {
+	return isRtl() ? "←" : "→";
+}
+
+const _intlCache = new Map();
+function intl(kind, options = {}) {
+	const tag = intlTag();
+	const key = `${kind}|${tag}|${JSON.stringify(options)}`;
+	let f = _intlCache.get(key);
+	if (!f) {
+		try {
+			f = new Intl[kind](tag, options);
+		} catch {
+			f = new Intl[kind]("en-US", options);
+		}
+		_intlCache.set(key, f);
+	}
+	return f;
+}
+
+/** usePluginI18n + the reactive app locale for the formatters below. */
+function useQT() {
+	let locale = null;
+	if (typeof useI18n === "function") {
+		try {
+			const i18n = useI18n();
+			locale = i18n && i18n.locale;
+		} catch {
+			locale = null;
+		}
+	}
+	if (locale) noteRenderLocale(locale);
+	return usePluginI18n(ID);
+}
 
 // ---- persisted settings (ctx.storage + useValue atoms) -------------------
 
@@ -531,6 +652,8 @@ function balanceFractionDigits(raw) {
 }
 
 function balanceText(balance, locale) {
+	// `.map(balanceText)` passes an index here: only a real tag overrides.
+	if (typeof locale !== "string" && !Array.isArray(locale)) locale = intlTag();
 	const raw = String(balance.total_balance).trim();
 	// Prefer the endpoint's own decimal string: Number() silently rounds past
 	// 2^53 (9007199254740993.00 came back as ...992) and to 17 significant
@@ -597,7 +720,7 @@ function balanceText(balance, locale) {
 		return `${formatted} ${currency}`;
 	}
 	const n = Number(raw);
-	const format = (value) => new Intl.NumberFormat(undefined, {
+	const format = (value) => new Intl.NumberFormat(locale, {
 		style: "currency", currency: balance.currency,
 		minimumFractionDigits: 2, maximumFractionDigits: balanceFractionDigits(raw),
 	}).format(value);
@@ -621,7 +744,7 @@ function checkedDateTime(iso) {
 	if (!iso) return "";
 	const dt = new Date(iso);
 	if (!Number.isFinite(dt.getTime())) return "";
-	return new Intl.DateTimeFormat(undefined, {
+	return intl("DateTimeFormat", {
 		year: "numeric", month: "short", day: "2-digit",
 		hour: "2-digit", minute: "2-digit", second: "2-digit", timeZoneName: "short",
 	}).format(dt);
@@ -638,13 +761,10 @@ function absoluteReset(resetIso) {
 		const tomorrow = new Date(now);
 		tomorrow.setDate(now.getDate() + 1);
 		const isTomorrow = dt.toDateString() === tomorrow.toDateString();
-		const time = dt.toLocaleTimeString([], {
-			hour: "2-digit",
-			minute: "2-digit",
-		});
-		if (sameDay) return `today ${time}`;
-		if (isTomorrow) return `tomorrow ${time}`;
-		return fmtDayTime.format(dt);
+		const time = intl("DateTimeFormat", { hour: "2-digit", minute: "2-digit" }).format(dt);
+		if (sameDay) return tr("resetToday", time);
+		if (isTomorrow) return tr("resetTomorrow", time);
+		return intl("DateTimeFormat", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }).format(dt);
 	} catch {
 		return "";
 	}
@@ -658,15 +778,9 @@ function relativeCountdown(resetIso, nowMs = Date.now()) {
 		const target = dt.getTime();
 		if (isNaN(target)) return "";
 		const diff = target - nowMs;
-		if (diff <= 0) return "resetting…";
+		if (diff <= 0) return tr("resetting");
 		const totalMin = Math.floor(diff / 60_000);
-		const days = Math.floor(totalMin / 1440);
-		const hours = Math.floor((totalMin % 1440) / 60);
-		const mins = totalMin % 60;
-		if (days > 0) return `${days}d ${hours}h`;
-		if (hours > 0) return `${hours}h ${mins}m`;
-		if (mins > 0) return `${mins}m`;
-		return "<1m";
+		return totalMin > 0 ? spanText(totalMin) : tr("spanLt1m");
 	} catch {
 		return "";
 	}
@@ -698,9 +812,9 @@ function useNow(intervalMs = 30_000) {
 /** Compact age label for the "data is N old" footer line. */
 function formatAgeSeconds(seconds) {
 	if (!Number.isFinite(seconds)) return "";
-	if (seconds < 60) return `${Math.round(seconds)}s`;
-	if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
-	return `${Math.floor(seconds / 3600)}h`;
+	if (seconds < 60) return tr("spanS", Math.round(seconds));
+	if (seconds < 3600) return tr("spanM", Math.floor(seconds / 60));
+	return tr("spanH", Math.floor(seconds / 3600));
 }
 
 // ---- update self-check (like Hermes's own) ---------------------------------
@@ -786,19 +900,19 @@ function UpdateBanner({ update }) {
 	return jsxs("button", {
 		type: "button",
 		className: cn(
-			"flex w-full items-center justify-between gap-2 rounded px-3 py-2 text-left text-[0.6875rem]",
+			"flex w-full items-center justify-between gap-2 rounded px-3 py-2 text-[0.6875rem]",
 			"text-(--ui-text-secondary) transition-colors",
 		),
 		// Inline: `bg-(--chrome-action)` is not in the host's prebuilt CSS.
-		style: { marginTop: 8, border: `1px solid ${tint("var(--ui-accent)", 35)}`, background: tint("var(--ui-accent)", 10) },
+		style: { marginTop: 8, textAlign: "start", border: `1px solid ${tint("var(--ui-accent)", 35)}`, background: tint("var(--ui-accent)", 10) },
 		onClick: () =>
 			host.openExternal?.("https://github.com/rarf/hermes-quota-plugin"),
 		children: [
 			jsx("span", {
 				className: "font-medium",
-				children: "⬆ Update available — run ./install.sh to get it",
+				children: tr("updateAvailable"),
 			}),
-			jsx("span", { className: "text-(--ui-text-tertiary)", children: "↗" }),
+			jsx("span", { className: "text-(--ui-text-tertiary)", children: isRtl() ? "↖" : "↗" }),
 		],
 	});
 }
@@ -1179,7 +1293,7 @@ function QuotaChipWithBar() {
 	const alert = mergeChipAlerts(providers.filter(([pid]) => isProviderEnabled(pid)).map(([pid, p]) => alerts(pid, p)));
 	const tone = toneForRemaining(worst);
 	const tip = makeWorstTip(worstLabel, worst, data && data.providers, stale);
-	const valueText = worstLabel + " " + (worstProvider?.display_accounts ? codexValue(worst) : worst + "%");
+	const valueText = worstLabel + " " + (worstProvider?.display_accounts ? codexValue(worst) : fmtPct(worst));
 	const button = jsxs("button", {
 		type: "button",
 		"aria-label": valueText + chipAlertAria(alert) + " · " + tr("chipQuotaOpen"),
@@ -1187,7 +1301,7 @@ function QuotaChipWithBar() {
 			"qm-sb-chip inline-flex items-center gap-1.5 px-1.5 py-0.5 rounded cursor-pointer hover:bg-(--chrome-action-hover) transition-colors",
 		style: CHIP_NOWRAP,
 		children: [
-			jsx(Ring, { value: worst, tone, size: 13, stroke: 2, label: `${worst}%` }),
+			jsx(Ring, { value: worst, tone, size: 13, stroke: 2, label: fmtPct(worst) }),
 			jsx("span", {
 				className: "text-[0.6875rem] text-(--ui-text-secondary)",
 				children: valueText,
@@ -1209,7 +1323,7 @@ function providerEntries(providers) {
 	return Object.entries(providers || {}).flatMap(([pid, p]) => {
 		const accounts = pid === "openai-codex" && p && Array.isArray(p.accounts)
 			? p.accounts.filter(asProvider) : [];
-		return accounts.length ? accounts.map((a, i) => [pid, { ...a, account_label: codexDisplayLabel(a.label) || `Account ${i + 1}` }]) : [[pid, pid === "openai-codex" && p ? { ...p, account_label: codexDisplayLabel(p.account_label) } : p]];
+		return accounts.length ? accounts.map((a, i) => [pid, { ...a, account_label: codexDisplayLabel(a.label) || tr("accountN", i + 1) }]) : [[pid, pid === "openai-codex" && p ? { ...p, account_label: codexDisplayLabel(p.account_label) } : p]];
 	});
 }
 
@@ -1223,7 +1337,7 @@ function codexRemaining(account) {
 }
 
 function codexValue(remaining) {
-	return remaining == null ? "unknown" : remaining === 0 ? "limit reached" : remaining < 1 ? "<1%" : `${Math.round(remaining)}%`;
+	return remaining == null ? tr("valueUnknown") : remaining === 0 ? tr("credLocked") : remaining < 1 ? `<${fmtPct(1)}` : fmtPct(Math.round(remaining));
 }
 
 function useCodexStale(data, untrusted = false) {
@@ -1255,17 +1369,17 @@ function codexAccountsTip(provider) {
 		const remaining = codexRemaining(account);
 		const marker = index === provider.display_selected_index ? "●" : "○";
 		const error = account.unavailable_reason ? ` · ${account.unavailable_reason}` : "";
-		const value = codexValue(remaining) + (remaining > 0 ? " left" : "");
+		const value = remaining > 0 ? tr("valueLeft", codexValue(remaining)) : codexValue(remaining);
 		const planText = account.plan ? ` · ${account.plan}` : "";
-		lines.push(`${marker} ${account.account_label || `Account ${index + 1}`}${planText} · ${value}${provider.display_stale ? " · stale" : ""}${error}`);
+		lines.push(`${marker} ${account.account_label || tr("accountN", index + 1)}${planText} · ${value}${provider.display_stale ? ` · ${tr("stale")}` : ""}${error}`);
 		// Keep historical/model-specific details in the pane, not in this summary.
 		if (provider.display_stale || account.unavailable_reason) continue;
 		const windows = asWindowList(account.windows).filter((w) => ["Session", "Weekly"].includes(w.label));
 		for (const w of windows) {
 			const r = codexRemaining({ windows: [w] });
-			const value = codexValue(r) + (r > 0 ? " left" : "");
+			const value = r > 0 ? tr("valueLeft", codexValue(r)) : codexValue(r);
 			const countdown = relativeCountdown(w.reset_at);
-			const reset = countdown === "resetting…" ? countdown : countdown ? `resets in ${countdown}` : "";
+			const reset = countdown === tr("resetting") ? countdown : countdown ? tr("popoverReset", countdown) : "";
 			// A single window already has its remaining value in the account line.
 			lines.push(`  ${w.label}${windows.length > 1 ? ` · ${value}` : ""}${reset ? ` · ${reset}` : ""}`);
 		}
@@ -1278,7 +1392,7 @@ function ProviderChip({ pid, provider, alert = null }) {
 	const r = provider && provider.unavailable_reason ? null : provider?.display_accounts ? cachedRemaining : worstWindow(provider);
 	const staleValue = Boolean(provider?.display_accounts && provider.display_stale && r != null);
 	const facts = accountFacts(provider);
-	const value = provider?.display_accounts ? codexValue(r) : provider && provider.unavailable_reason ? "unavailable" : r != null ? `${r}%` : facts.balances.length ? facts.balances.map(balanceText).join(" · ") : facts.available === true ? "available" : facts.available === false ? "unavailable" : "—";
+	const value = provider?.display_accounts ? codexValue(r) : provider && provider.unavailable_reason ? tr("valueUnavailable") : r != null ? fmtPct(r) : facts.balances.length ? facts.balances.map((b) => balanceText(b)).join(" · ") : facts.available === true ? tr("valueAvailable") : facts.available === false ? tr("valueUnavailable") : "—";
 	const tone = provider?.display_accounts ? (provider.display_stale ? "muted" : toneForRemaining(r)) : providerTone(provider);
 	const dot = toneColor(tone);
 	const label = providerDisplayName(pid, provider);
@@ -1287,7 +1401,7 @@ function ProviderChip({ pid, provider, alert = null }) {
 		"button",
 		{
 			type: "button",
-			"aria-label": `${label} ${value}${staleValue ? " · stale" : ""}${chipAlertAria(alert)} · ${tr("chipQuotaOpen")}`,
+			"aria-label": `${label} ${value}${staleValue ? ` · ${tr("stale")}` : ""}${chipAlertAria(alert)} · ${tr("chipQuotaOpen")}`,
 			className: cn(
 				"qm-sb-chip inline-flex h-full items-center gap-1 px-1.5 text-[0.6875rem]",
 				"text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground transition-colors",
@@ -1297,7 +1411,7 @@ function ProviderChip({ pid, provider, alert = null }) {
 				// A percentage gets Agent Bar's mini ring; balance/availability-only
 				// providers keep the plain dot.
 				r != null
-					? jsx(Ring, { value: r, tone, size: 13, stroke: 2, label: `${r}%` })
+					? jsx(Ring, { value: r, tone, size: 13, stroke: 2, label: fmtPct(r) })
 					: jsx("span", { className: "inline-block h-1.5 w-1.5 rounded-full", style: { background: dot } }),
 				jsx("span", { children: label }),
 				jsx("span", { className: "tabular-nums", style: staleValue ? { textDecoration: "line-through" } : undefined, children: value }),
@@ -1310,7 +1424,7 @@ function ProviderChip({ pid, provider, alert = null }) {
 
 // Keep other providers' window details; Codex uses its compact account summary.
 function makeWorstTip(worstLabel, worst, providersObj, stale = false) {
-	if (!providersObj) return `Quota · lowest ${worst}% (${worstLabel})`;
+	if (!providersObj) return tr("chipTip", worst, worstLabel, "");
 	const blocks = [];
 	let hasCodex = false;
 	for (const [pid, p] of statusEntries(providersObj, stale)) {
@@ -1319,10 +1433,10 @@ function makeWorstTip(worstLabel, worst, providersObj, stale = false) {
 		const lines = p?.display_accounts ? [makeProviderTip(pid, p)] : providerWindowLines(pid, p);
 		if (lines.length) blocks.push(lines.join("\n"));
 	}
-	if (blocks.length === 0) return `Quota · lowest ${worst}% (${worstLabel})`;
+	if (blocks.length === 0) return tr("chipTip", worst, worstLabel, "");
 	if (hasCodex && blocks.length === 1) return blocks[0];
 
-	return `Quota breakdown:\n${blocks.join("\n")}${hasCodex ? "" : `\n${tr("chipQuotaOpen")}`}`;
+	return `${tr("quotaBreakdown")}\n${blocks.join("\n")}${hasCodex ? "" : `\n${tr("chipQuotaOpen")}`}`;
 }
 
 // Build a rich multiline tip for a single provider: lists ALL its windows
@@ -1330,19 +1444,19 @@ function makeWorstTip(worstLabel, worst, providersObj, stale = false) {
 function makeProviderTip(pid, provider) {
 	if (provider?.display_accounts) return codexAccountsTip(provider);
 	const name = providerDisplayName(pid, provider);
-	if (!provider) return `${name}: unavailable`;
+	if (!provider) return tr("providerUnavailable", name);
 	const details = asList(provider && provider.details);
 	if (provider.unavailable_reason) {
 		// Preserve actionable diagnostics alongside the reason code.
-		const lines = [`${name}: unavailable (${provider.unavailable_reason})`, ...details];
+		const lines = [tr("providerUnavailableReason", name, provider.unavailable_reason), ...details];
 		lines.push(tr("chipQuotaOpen"));
 		return lines.join("\n");
 	}
 	const lines = providerWindowLines(pid, provider);
 	const facts = accountFacts(provider);
-	lines.push(...facts.balances.map((b) => `Account balance: ${balanceText(b)}`));
-	if (facts.available != null) lines.push(`API calls available: ${facts.available ? "yes" : "no"}`);
-	if (provider.plan) lines.unshift(`Plan: ${provider.plan}`);
+	lines.push(...facts.balances.map((b) => tr("accountBalanceLine", balanceText(b))));
+	if (facts.available != null) lines.push(tr("apiCallsAvailable", facts.available));
+	if (provider.plan) lines.unshift(tr("planLine", provider.plan));
 	lines.unshift(name);
 	if (details.length) lines.push(...details);
 	lines.push(tr("chipQuotaOpen"));
@@ -1358,7 +1472,7 @@ function providerWindowLines(pid, provider) {
 		const r = remainingPct(w);
 		const reset = w.reset_at ? formatReset(w.reset_at, "relative") : "";
 		out.push(
-			`  ${w.label || "window"} · ${r == null ? "—" : `${r}% left`}${reset ? ` · resets ${reset}` : ""}`,
+			`  ${w.label || tr("windowFallback")} · ${r == null ? "—" : tr("valueLeft", fmtPct(r))}${reset ? ` · ${tr("resetsAt", reset)}` : ""}`,
 		);
 	}
 	return out;
@@ -1539,6 +1653,7 @@ const SOURCE_COLORS = { "claude-code": "var(--ui-orange)", "copilot-cli": "var(-
 const SOURCE_NAMES = { "claude-code": "Claude Code", "copilot-cli": "Copilot CLI", hermes: "Hermes" };
 
 function sourceLabel(key) {
+	if (key === "total") return tr("seriesTotal");
 	return SOURCE_NAMES[key] || (PROVIDER_META[baseProviderId(key)] ? providerMeta(key).name : key);
 }
 
@@ -1674,7 +1789,7 @@ function QuotaBar({ value, tone }) {
 
 /** One quota window as a ring tile: % left in the centre, label + reset under it. */
 function WindowTile({ w, size, dense, resetFormat }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const r = remainingPct(w);
 	const tone = toneForRemaining(r);
 	const label = w.label || "window";
@@ -1682,16 +1797,16 @@ function WindowTile({ w, size, dense, resetFormat }) {
 	const full = w.reset_at ? t("reset", formatReset(w.reset_at, resetFormat)) : "";
 	return jsxs("div", {
 		"data-window": label,
-		title: [label, r == null ? "—" : `${r}% ${t("left")}`, full].filter(Boolean).join(" · "),
+		title: [label, r == null ? "—" : `${fmtPct(r)} ${t("left")}`, full].filter(Boolean).join(" · "),
 		style: { ...UI.col, alignItems: "center", gap: 3 },
 		children: [
 			jsx(Ring, {
 				value: r,
 				tone,
 				size,
-				label: `${label} ${r == null ? "—" : `${r}% ${t("left")}`}`,
+				label: `${label} ${r == null ? "—" : `${fmtPct(r)} ${t("left")}`}`,
 				children: [
-					jsx("span", { style: { fontSize: Math.round(size * 0.26), fontWeight: 650, color: "var(--ui-text-primary)", ...UI.num }, children: r == null ? "—" : `${r}%` }, "v"),
+					jsx("span", { style: { fontSize: Math.round(size * 0.26), fontWeight: 650, color: "var(--ui-text-primary)", ...UI.num }, children: r == null ? "—" : fmtPct(r) }, "v"),
 					r == null ? null : jsx("span", { style: { fontSize: Math.max(8, Math.round(size * 0.17)), color: "var(--ui-text-tertiary)" }, children: t("left") }, "l"),
 				],
 			}),
@@ -1705,7 +1820,7 @@ function WindowTile({ w, size, dense, resetFormat }) {
 // tiles — one per window — then forecasts, the used-% history chart and detail
 // lines. Unavailable providers render as a muted compact card.
 function ProviderRow({ id, provider, monitor, page = false }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const resetFormat = useValue(resetFormatAtom);
 	// 'dense' = every window, reset time and detail line; 'clean' = just the
 	// rings, except OpenRouter's essential key/wallet scope details.
@@ -1739,7 +1854,7 @@ function ProviderRow({ id, provider, monitor, page = false }) {
 				}),
 				shown.length
 					? jsx("div", {
-							style: { ...UI.col, gap: 2, paddingLeft: 28, ...UI.faint },
+							style: { ...UI.col, gap: 2, paddingInlineStart: 28, ...UI.faint },
 							children: [
 								...shown.map((d, i) => jsx("div", { children: d }, `${id}-u-${i}`)),
 								hidden > 0 ? jsx("div", { children: t("moreDetails", hidden) }, `${id}-u-more`) : null,
@@ -1804,13 +1919,13 @@ function ProviderRow({ id, provider, monitor, page = false }) {
 				jsxs("div", {
 					key: `balance-${b.currency}`,
 					children: [
-						jsx("div", { style: UI.meta, children: "Account balance" }),
+						jsx("div", { style: UI.meta, children: t("accountBalance") }),
 						jsx("div", { style: { ...UI.num, fontWeight: 600, color: "var(--ui-text-primary)", fontSize: "1.25rem", lineHeight: 1.3 }, children: balanceText(b) }),
 					],
 				}),
 			),
 			facts.available != null
-				? jsx("div", { style: UI.secondary, children: `API calls available: ${facts.available ? "yes" : "no"}` })
+				? jsx("div", { style: UI.secondary, children: t("apiCallsAvailable", facts.available) })
 				: null,
 			windows.length
 				? jsx("div", {
@@ -1833,7 +1948,7 @@ function ProviderRow({ id, provider, monitor, page = false }) {
 									: { ...UI.col, gap: 0 },
 								children: [
 									jsx("span", { style: { ...UI.meta, color: "var(--ui-text-secondary)", ...UI.ellipsis }, children: w.label || "window" }),
-									jsx("div", { style: page ? { minWidth: 0, textAlign: "right" } : { minWidth: 0 }, children: jsx(ForecastLine, { forecast }) }),
+									jsx("div", { style: page ? { minWidth: 0, textAlign: "end" } : { minWidth: 0 }, children: jsx(ForecastLine, { forecast }) }),
 								],
 							}, `${id}-f-${i}`),
 						),
@@ -1876,7 +1991,7 @@ function SettingRow({ label, hint, children, block = false }) {
 				? jsx("div", {
 						style: block
 							? { minWidth: 0 }
-							: { flexShrink: 0, display: "flex", alignItems: "center", gap: 4, marginLeft: "auto", maxWidth: "100%" },
+							: { flexShrink: 0, display: "flex", alignItems: "center", gap: 4, marginInlineStart: "auto", maxWidth: "100%" },
 						children,
 					})
 				: null,
@@ -1903,7 +2018,7 @@ function SettingsCard({ icon, title, children, footer }) {
 }
 
 function ResetFormatControl() {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const resetFormat = useValue(resetFormatAtom);
 	return jsx(SettingRow, {
 		label: t("resetFormatLabel"),
@@ -1926,7 +2041,7 @@ function SdkIcon({ name, className, fallback = "•" }) {
 }
 
 function ShowStatusBarControl() {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const show = useValue(showStatusBarAtom);
 	return jsx(SettingRow, {
 		label: t("showStatusBarLabel"),
@@ -1936,7 +2051,7 @@ function ShowStatusBarControl() {
 }
 
 function ShowDockedPaneControl() {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const show = useValue(showDockedPaneAtom);
 	return jsx(SettingRow, {
 		label: t("showDockedPaneLabel"),
@@ -1945,7 +2060,7 @@ function ShowDockedPaneControl() {
 }
 
 function RefreshIntervalControl() {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const seconds = useValue(refreshIntervalAtom);
 	return jsx(SettingRow, {
 		label: t("refreshIntervalLabel"),
@@ -1966,7 +2081,7 @@ function RefreshIntervalControl() {
 }
 
 function StatusbarModeControl() {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const mode = useValue(statusbarModeAtom);
 	return jsx(SettingRow, {
 		label: t("statusbarModeLabel"),
@@ -1983,7 +2098,7 @@ function StatusbarModeControl() {
 
 // Cherry-picker: toggle list of providers
 function DisabledProvidersControl() {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const { data } = useQuota();
 	const disabled = useValue(disabledProvidersAtom);
 	const allProviders =
@@ -2033,7 +2148,7 @@ function DisabledProvidersControl() {
 }
 
 function PaneDetailControl() {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const paneDetail = useValue(paneDetailAtom);
 	return jsx(SettingRow, {
 		label: t("paneDetailLabel"),
@@ -2050,7 +2165,7 @@ function PaneDetailControl() {
 }
 
 function QuotaSettings() {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	return jsxs("div", {
 		"data-quota-settings": true,
 		style: { ...UI.col, gap: 10, paddingBottom: 4 },
@@ -2094,7 +2209,7 @@ function lowestLeft(providers) {
 		if (!isProviderEnabled(pid) || !isConfigured(p)) continue;
 		for (const w of asWindowList(p.windows)) {
 			const r = remainingPct(w);
-			if (r != null && (lowest == null || r < lowest.left)) lowest = { left: r, label: `${providerDisplayName(pid, p)} · ${w.label || "window"}` };
+			if (r != null && (lowest == null || r < lowest.left)) lowest = { left: r, label: `${providerDisplayName(pid, p)} · ${w.label || tr("windowFallback")}` };
 		}
 	}
 	return lowest;
@@ -2102,7 +2217,7 @@ function lowestLeft(providers) {
 
 /** Agent Bar's summary strip: agent states, the tightest quota, spend today. */
 function SummaryStrip({ snapshot, providers }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const counts = liveCounts(snapshot && snapshot.live);
 	const low = lowestLeft(providers);
 	const today = finiteNumber(asObject(asObject(asObject(snapshot && snapshot.usage).today).totals).cost);
@@ -2146,7 +2261,7 @@ function IconButton({ title, onClick, disabled, children }) {
 }
 
 function QuotaPane({ page = false } = {}) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const qc = useQueryClient();
 	const [view, setView] = useState("list"); // 'list' | 'settings'
 	const { data, isError, isLoading } = useQuota();
@@ -2204,7 +2319,7 @@ function QuotaPane({ page = false } = {}) {
 	// The route page centres one column (settings a little narrower); the
 	// docked pane keeps the full 300px.
 	const column = page
-		? { width: "100%", maxWidth: view === "settings" ? SETTINGS_MAX_WIDTH : PAGE_MAX_WIDTH, marginLeft: "auto", marginRight: "auto", boxSizing: "border-box" }
+		? { width: "100%", maxWidth: view === "settings" ? SETTINGS_MAX_WIDTH : PAGE_MAX_WIDTH, marginInline: "auto", boxSizing: "border-box" }
 		: { width: "100%" };
 
 	let body;
@@ -2287,6 +2402,8 @@ function QuotaPane({ page = false } = {}) {
 	return jsxs("div", {
 		className: "flex h-full flex-col",
 		"data-quota-layout": page ? "page" : "pane",
+		dir: localeDir(),
+		lang: intlTag(),
 		style: { minHeight: 0, minWidth: 0, overflow: "auto", boxSizing: "border-box", gap: 8, padding: page ? "14px 20px 10px" : "10px 12px 8px" },
 		children: [
 			jsxs("div", {
@@ -2306,7 +2423,7 @@ function QuotaPane({ page = false } = {}) {
 								? jsx(IconButton, {
 										title: t("backTip"),
 										onClick: () => setView("list"),
-										children: jsx(SdkIcon, { name: "ArrowLeft", className: "h-3.5 w-3.5", fallback: "‹" }),
+										children: jsx(SdkIcon, { name: isRtl() ? "ArrowRight" : "ArrowLeft", className: "h-3.5 w-3.5", fallback: isRtl() ? "›" : "‹" }),
 									})
 								: [
 										jsx(IconButton, {
@@ -2460,17 +2577,44 @@ function setBudget(kind, value) {
 }
 
 // Module-level translator for handlers/notifications (no component around).
+// Resolves like the SDK (active language → English → key) but against the
+// language components render with, so a locale switch never shows one frame
+// of the previous language in strings built outside a `t` (tooltips, spans).
 function tr(key, ...args) {
-	try {
-		if (CTX && CTX.i18n && typeof CTX.i18n.t === "function") {
-			const v = CTX.i18n.t(key, ...args);
-			if (v != null && v !== key) return v;
-		}
-	} catch {
-		/* fall back to English */
-	}
-	const v = I18N_EN[key];
+	const id = appLocale();
+	const table = I18N_BUNDLES[id] || I18N_BUNDLES[id.split("-")[0]] || null;
+	let v = table ? table[key] : undefined;
+	if (v == null) v = I18N_EN[key];
 	return typeof v === "function" ? v(...args) : v != null ? v : key;
+}
+
+/** "3d 4h" / "3h 12m" / "12m" in the active language, from whole minutes. */
+function spanText(totalMin) {
+	const days = Math.floor(totalMin / 1440);
+	const hours = Math.floor((totalMin % 1440) / 60);
+	const mins = totalMin % 60;
+	if (days > 0) return tr("spanDH", days, hours);
+	if (hours > 0) return tr("spanHM", hours, mins);
+	return tr("spanM", mins);
+}
+
+/** Spend is USD everywhere: keep the bare "$" ("US$" / "$US" in ar, fr). */
+function usdSymbol(text) {
+	return text.replace(/US\s?\$|\$\s?US/g, "$");
+}
+
+/** Fixed-decimals number in the app locale ("1.5" / "1,5"). */
+function fmtNum(value, digits = 0) {
+	const n = finiteNumber(value);
+	if (n == null) return "—";
+	return intl("NumberFormat", { minimumFractionDigits: digits, maximumFractionDigits: digits }).format(n);
+}
+
+/** Percent in the app locale: "42%", "%42" (tr), "42 %" (de, fr). */
+function fmtPct(value) {
+	const n = Number(value);
+	if (isEnLocale() || !Number.isFinite(n)) return `${value}%`;
+	return intl("NumberFormat", { style: "percent", maximumFractionDigits: 1 }).format(n / 100);
 }
 
 // ---- formatting ----
@@ -2485,6 +2629,10 @@ function fmtTokens(value) {
 	const n = finiteNumber(value);
 	if (n == null) return "—";
 	const abs = Math.abs(n);
+	if (!isEnLocale()) {
+		// "1,2 Mio." / "12 B" / "1.2万": the locale's own short units.
+		return intl("NumberFormat", { notation: "compact", maximumFractionDigits: abs >= 1e3 && abs < 1e4 ? 1 : abs >= 1e6 && abs < 1e7 ? 1 : 0 }).format(Math.round(n));
+	}
 	if (abs >= 1e6) return `${(n / 1e6).toFixed(abs >= 1e7 ? 0 : 1)}M`;
 	if (abs >= 1e3) return `${(n / 1e3).toFixed(abs >= 1e4 ? 0 : 1)}k`;
 	return String(Math.round(n));
@@ -2494,6 +2642,10 @@ function fmtUsd(value) {
 	const n = finiteNumber(value);
 	if (n == null) return "—";
 	const abs = Math.abs(n);
+	if (!isEnLocale()) {
+		const digits = abs >= 1000 ? 0 : 2;
+		return usdSymbol(intl("NumberFormat", { style: "currency", currency: "USD", currencyDisplay: "narrowSymbol", minimumFractionDigits: digits, maximumFractionDigits: digits }).format(n));
+	}
 	const text = abs >= 1000 ? Math.round(abs).toLocaleString("en-US") : abs.toFixed(2);
 	return `${n < 0 ? "-" : ""}$${text}`;
 }
@@ -2501,20 +2653,14 @@ function fmtUsd(value) {
 function fmtSpan(seconds) {
 	const s = finiteNumber(seconds);
 	if (s == null) return "";
-	if (s < 60) return "<1m";
-	const totalMin = Math.floor(s / 60);
-	const days = Math.floor(totalMin / 1440);
-	const hours = Math.floor((totalMin % 1440) / 60);
-	const mins = totalMin % 60;
-	if (days > 0) return `${days}d ${hours}h`;
-	if (hours > 0) return `${hours}h ${mins}m`;
-	return `${mins}m`;
+	if (s < 60) return tr("spanLt1m");
+	return spanText(Math.floor(s / 60));
 }
 
 function fmtSeconds(value) {
 	const s = finiteNumber(value);
 	if (s == null) return "—";
-	return s < 60 ? `${s < 10 ? s.toFixed(1) : Math.round(s)}s` : fmtSpan(s);
+	return s < 60 ? tr("spanS", s < 10 ? fmtNum(s, 1) : Math.round(s)) : fmtSpan(s);
 }
 
 function isoToSeconds(value) {
@@ -3140,7 +3286,7 @@ const STATE_STYLE = {
 };
 
 function StateBadge({ state }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	return jsx(Pill, {
 		"data-state": state,
 		color: state === "ended" ? "var(--ui-text-tertiary)" : STATE_STYLE[state] || STATE_STYLE.ended,
@@ -3197,7 +3343,7 @@ function Section({ title, sub, children }) {
 						style: { fontSize: "0.625rem", fontWeight: 650, letterSpacing: "0.06em", textTransform: "uppercase", color: "var(--ui-text-tertiary)", ...UI.ellipsis },
 						children: title,
 					}),
-					sub ? jsx("span", { style: { ...UI.faint, ...UI.num, textAlign: "right", overflowWrap: "anywhere" }, children: sub }) : null,
+					sub ? jsx("span", { style: { ...UI.faint, ...UI.num, textAlign: "end", overflowWrap: "anywhere" }, children: sub }) : null,
 				],
 			}),
 			children,
@@ -3223,11 +3369,12 @@ function Row({ children, onClick, title, tone }) {
 		gap: 2,
 		width: "100%",
 		padding: "7px 10px",
-		textAlign: "left",
+		textAlign: "start",
 		boxSizing: "border-box",
 		overflowWrap: "anywhere",
-		background: tone ? `linear-gradient(90deg, ${tint(tone, 10)}, transparent 55%)` : "transparent",
-		boxShadow: tone ? `inset 2px 0 0 ${tone}` : undefined,
+		// The accent stripe sits on the inline-start edge (right in RTL).
+		background: tone ? `linear-gradient(${isRtl() ? "270deg" : "90deg"}, ${tint(tone, 10)}, transparent 55%)` : "transparent",
+		boxShadow: tone ? `inset ${isRtl() ? -2 : 2}px 0 0 ${tone}` : undefined,
 		border: 0,
 		color: "inherit",
 	};
@@ -3268,7 +3415,7 @@ function Empty({ children }) {
 }
 
 function MonitorNotice({ mon }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const text = !mon.enabled
 		? t("monitorOff")
 		: mon.unsupported
@@ -3285,7 +3432,7 @@ function MonitorNotice({ mon }) {
 }
 
 function SectionError({ snapshot, section }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const err = asObject(snapshot && snapshot.errors)[section];
 	return err ? jsx(Empty, { children: t("sectionError", section) }) : null;
 }
@@ -3301,7 +3448,7 @@ function liveGroupKey(row) {
 }
 
 function LiveRow({ row, children, scope, snapshot, nowSec, ctxPct = null, warn = CONTEXT_WARN_DEFAULT }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const state = sessionState(row);
 	const ctxLevel = contextLevel(ctxPct, warn);
 	const badge = state !== "ended" && row.long_tool_call ? "long_tool" : state;
@@ -3371,14 +3518,14 @@ function LiveRow({ row, children, scope, snapshot, nowSec, ctxPct = null, warn =
 				],
 			}),
 			children && children.length
-				? jsx("div", { style: { ...UI.col, marginLeft: 13, paddingLeft: 6, borderLeft: "1px solid var(--ui-stroke-secondary)" }, children })
+				? jsx("div", { style: { ...UI.col, marginInlineStart: 13, paddingInlineStart: 6, borderInlineStart: "1px solid var(--ui-stroke-secondary)" }, children })
 				: null,
 		],
 	});
 }
 
 function LiveView({ mon }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const nowMs = useNow(15_000);
 	const snapshot = mon.snapshot;
 	const live = asObject(snapshot.live);
@@ -3422,7 +3569,7 @@ function LiveView({ mon }) {
 	);
 	const clock = (sec) => {
 		const d = new Date(Number(sec) * 1000);
-		return Number.isFinite(d.getTime()) ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
+		return Number.isFinite(d.getTime()) ? intl("DateTimeFormat", { hour: "2-digit", minute: "2-digit" }).format(d) : "";
 	};
 	const tickLabels = minutes.length > 4 ? [0, 1, 2, 3].map((q) => clock(minutes[Math.round((q / 3) * (minutes.length - 1))].t)) : [];
 	const messages = asList(live.activity).map((a) => (Number(a && a.assistant) || 0) + (Number(a && a.tool) || 0) + (Number(a && a.user) || 0));
@@ -3483,7 +3630,7 @@ function LiveView({ mon }) {
 											],
 										}),
 										jsx("div", {
-											style: { ...UI.meta, ...UI.ellipsis, paddingLeft: 12 },
+											style: { ...UI.meta, ...UI.ellipsis, paddingInlineStart: 12 },
 											title: a.title || undefined,
 											children: [a.title || t("untitled"), a.detail && a.detail !== "finished" ? a.detail : null].filter(Boolean).join(" · "),
 										}),
@@ -3537,7 +3684,7 @@ function toneText(tone) {
 }
 
 function HealthView({ mon }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const nowMs = useNow(30_000);
 	const snapshot = mon.snapshot;
 	const health = asObject(snapshot.health);
@@ -3595,7 +3742,7 @@ function HealthView({ mon }) {
 											const locked = Boolean(c.locked) || c.status === "exhausted";
 											const tone = locked ? "bad" : c.status === "ok" ? "good" : "muted";
 											return jsxs("div", {
-												style: { ...UI.row, gap: 6, paddingLeft: 26 },
+												style: { ...UI.row, gap: 6, paddingInlineStart: 26 },
 												children: [
 													jsx(Dot, { color: toneColor(tone), size: 6 }),
 													jsx("span", { style: { ...UI.secondary, flex: "1 1 auto", ...UI.ellipsis }, children: c.label || c.account_key || t("credentialN", j + 1) }),
@@ -3632,12 +3779,12 @@ function HealthView({ mon }) {
 											],
 										}),
 										jsx("div", {
-											style: { paddingLeft: 12 },
+											style: { paddingInlineStart: 12 },
 											children: jsx(MetaLine, {
 												parts: [
 													providerMeta(m.provider).name,
 													m.calls_24h != null ? t("callsN", m.calls_24h) : null,
-													rate != null ? t("errorRate", (rate * 100).toFixed(rate < 0.1 ? 1 : 0)) : null,
+													rate != null ? t("errorRate", fmtNum(rate * 100, rate < 0.1 ? 1 : 0)) : null,
 													m.errors_24h ? t("errorsN", m.errors_24h) : null,
 													cooldown && cooldown > nowSec ? t("cooldownFor", fmtSpan(cooldown - nowSec)) : null,
 													m.recovered ? t("recovered") : null,
@@ -3645,7 +3792,7 @@ function HealthView({ mon }) {
 											}),
 										}),
 										m.last_error && m.last_error.summary && (m.errors_24h || tone !== "good")
-											? jsx("div", { style: { ...UI.faint, ...UI.ellipsis, paddingLeft: 12 }, title: m.last_error.summary, children: `↳ ${m.last_error.summary}` })
+											? jsx("div", { style: { ...UI.faint, ...UI.ellipsis, paddingInlineStart: 12 }, title: m.last_error.summary, children: `${isRtl() ? "↲" : "↳"} ${m.last_error.summary}` })
 											: null,
 									],
 								}, `${m.provider}-${m.model}-${i}`);
@@ -3672,22 +3819,22 @@ function HealthView({ mon }) {
 											? asList(c.fallbacks).map((f, j) => {
 													const tone = f.state === "skip" ? "muted" : f.state === "risky" ? "warn" : "good";
 													return jsxs("div", {
-														style: { display: "flex", flexWrap: "wrap", alignItems: "center", gap: "2px 6px", paddingLeft: 12, minWidth: 0 },
+														style: { display: "flex", flexWrap: "wrap", alignItems: "center", gap: "2px 6px", paddingInlineStart: 12, minWidth: 0 },
 														children: [
-															jsx("span", { style: { ...UI.meta, overflowWrap: "anywhere" }, children: `→ ${f.model} (${providerMeta(f.provider).name})` }),
+															jsx("span", { style: { ...UI.meta, overflowWrap: "anywhere" }, children: `${arrowFwd()} ${f.model} (${providerMeta(f.provider).name})` }),
 															jsx(Pill, {
 																color: toneText(tone),
 																children:
 																	f.state === "skip"
 																		? t("chainSkip", t(`skip_${f.reason}`))
 																		: f.state === "risky"
-																			? t("chainRisky", ((finiteNumber(f.rate) || 0) * 100).toFixed(0))
+																			? t("chainRisky", fmtNum((finiteNumber(f.rate) || 0) * 100, 0))
 																			: t("chainOk"),
 															}),
 														],
 													}, j);
 												})
-											: jsx("div", { style: { ...UI.faint, paddingLeft: 12 }, children: t("noFallbacks") }),
+											: jsx("div", { style: { ...UI.faint, paddingInlineStart: 12 }, children: t("noFallbacks") }),
 									],
 								}, `${c.profile}-${i}`),
 							),
@@ -3720,7 +3867,7 @@ function HealthView({ mon }) {
 // ---- Usage view ----
 
 function BudgetBar({ label, spent, limit, projection }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	if (!(limit > 0)) return null;
 	const pct = (spent / limit) * 100;
 	const tone = pct >= 100 ? "bad" : pct >= 80 ? "warn" : "good";
@@ -3732,7 +3879,7 @@ function BudgetBar({ label, spent, limit, projection }) {
 				style: { display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 8, flexWrap: "wrap" },
 				children: [
 					jsx("span", { style: UI.text, children: label }),
-					jsx("span", { style: { ...UI.num, fontSize: "0.75rem", fontWeight: 600, color: tone === "good" ? "var(--ui-text-primary)" : toneColor(tone) }, children: `${fmtUsd(spent)} / ${fmtUsd(limit)} · ${Math.round(pct)}%` }),
+					jsx("span", { style: { ...UI.num, fontSize: "0.75rem", fontWeight: 600, color: tone === "good" ? "var(--ui-text-primary)" : toneColor(tone) }, children: `${fmtUsd(spent)} / ${fmtUsd(limit)} · ${fmtPct(Math.round(pct))}` }),
 				],
 			}),
 			jsx(QuotaBar, { value: pct, tone }),
@@ -3758,7 +3905,7 @@ function TopList({ title, rows, onPick, color = "var(--ui-accent)" }) {
 				jsxs(onPick && r.pick ? "button" : "div", {
 					type: onPick && r.pick ? "button" : undefined,
 					className: onPick && r.pick ? "cursor-pointer rounded hover:bg-(--chrome-action-hover)" : undefined,
-					style: { ...UI.col, gap: 3, textAlign: "left", border: 0, padding: 0, background: "transparent", color: "inherit", width: "100%" },
+					style: { ...UI.col, gap: 3, textAlign: "start", border: 0, padding: 0, background: "transparent", color: "inherit", width: "100%" },
 					onClick: onPick && r.pick ? () => onPick(r.pick) : undefined,
 					children: [
 						jsxs("div", {
@@ -3781,7 +3928,7 @@ function TopList({ title, rows, onPick, color = "var(--ui-accent)" }) {
 }
 
 function UsageView({ mon }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const nowMs = useNow(60_000);
 	const daily = useValue(budgetDailyAtom);
 	const monthly = useValue(budgetMonthlyAtom);
@@ -3816,7 +3963,7 @@ function UsageView({ mon }) {
 	const palette = seriesPalette(keys);
 	const weekday = (day) => {
 		const d = new Date(`${day}T12:00:00`);
-		return Number.isFinite(d.getTime()) ? d.toLocaleDateString([], { weekday: "short" }) : day.slice(5);
+		return Number.isFinite(d.getTime()) ? intl("DateTimeFormat", { weekday: "short" }).format(d) : day.slice(5);
 	};
 	const avg = weekTotal / 7;
 	return jsxs(ViewStack, {
@@ -3880,7 +4027,7 @@ function kanbanGroup(card) {
 }
 
 function KanbanView({ mon }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const snapshot = mon.snapshot;
 	const boards = asList(asObject(snapshot.kanban).boards).filter(Boolean);
 	return jsxs(ViewStack, {
@@ -3950,10 +4097,10 @@ function KanbanView({ mon }) {
 // ---- Quota view additions ----
 
 function ForecastLine({ forecast }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	if (!forecast) return null;
 	const rate = forecast.perHour;
-	const rateText = t("burnRate", `${rate >= 0 ? "+" : ""}${rate.toFixed(Math.abs(rate) < 10 ? 1 : 0)}`);
+	const rateText = t("burnRate", `${rate >= 0 ? "+" : ""}${fmtNum(rate, Math.abs(rate) < 10 ? 1 : 0)}`);
 	let text;
 	let color = "var(--ui-text-tertiary)";
 	if (rate <= 0) text = t("burnFlat");
@@ -3965,7 +4112,7 @@ function ForecastLine({ forecast }) {
 }
 
 function AccountHints({ providers }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const hints = accountRoomHints(providers);
 	if (!hints.length) return null;
 	return jsx("div", {
@@ -4170,7 +4317,7 @@ function useQuotaChipAlerts() {
 }
 
 function ChipAlert({ alert }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	if (!alert) return null;
 	return jsxs("span", {
 		"data-chip-alert": true,
@@ -4212,6 +4359,14 @@ function fmtUsdShort(value) {
 	if (n == null) return "—";
 	const abs = Math.abs(n);
 	const sign = n < 0 ? "-" : "";
+	if (!isEnLocale()) {
+		const digits = abs >= 9_950 ? 0 : abs >= 999.5 ? 1 : abs >= 99.995 ? 0 : 2;
+		return usdSymbol(intl("NumberFormat", {
+			style: "currency", currency: "USD", currencyDisplay: "narrowSymbol",
+			notation: abs >= 999.5 ? "compact" : "standard",
+			minimumFractionDigits: digits, maximumFractionDigits: digits,
+		}).format(n));
+	}
 	if (abs >= 9_950) return `${sign}$${Math.round(abs / 1000)}k`;
 	if (abs >= 999.5) return `${sign}$${(abs / 1000).toFixed(1)}k`;
 	if (abs >= 99.995) return `${sign}$${Math.round(abs)}`;
@@ -4271,6 +4426,7 @@ function ChipPopover({ tip, card, kind, width = 300, children }) {
 						align: "end",
 						sideOffset: 6,
 						"data-chip-card": kind,
+						dir: localeDir(),
 						style: { width, maxWidth: "calc(100vw - 16px)", padding: 0 },
 						children: card(() => setOpen(false)),
 					}, "card")
@@ -4301,7 +4457,7 @@ function ChipCard({ kind, title, sub, link, onLink, children }) {
 					className: "qm-sb-row cursor-pointer rounded hover:bg-(--chrome-action-hover) transition-colors",
 					style: { border: 0, background: "transparent", padding: "3px 8px", fontSize: "0.6875rem", fontWeight: 600, color: "var(--ui-accent)" },
 					onClick: onLink,
-					children: `${link} →`,
+					children: `${link} ${arrowFwd()}`,
 				}),
 			}),
 		],
@@ -4316,7 +4472,7 @@ function openMonitorTab(view) {
 // ---- agents chip + card ----
 
 function AgentCardRow({ row, nowSec, onPick }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const state = sessionState(row);
 	const action = agentRowAction(row);
 	const who = !row.kind || row.kind === "hermes" ? row.profile || "default" : row.source_name || row.kind;
@@ -4327,7 +4483,7 @@ function AgentCardRow({ row, nowSec, onPick }) {
 		className: "qm-sb-row cursor-pointer rounded hover:bg-(--chrome-action-hover) transition-colors",
 		title: action === "open" ? t("openSessionTip") : action === "copy" ? t("copyCommandTip", row.open.command) : undefined,
 		onClick: () => onPick(row),
-		style: { ...UI.row, gap: 8, width: "100%", padding: "4px 6px", border: 0, background: "transparent", color: "inherit", textAlign: "left", boxSizing: "border-box" },
+		style: { ...UI.row, gap: 8, width: "100%", padding: "4px 6px", border: 0, background: "transparent", color: "inherit", textAlign: "start", boxSizing: "border-box" },
 		children: [
 			jsx(Dot, { color: STATE_STYLE[state] || STATE_STYLE.ended, size: 6, halo: state === "working" }),
 			jsxs("span", {
@@ -4345,7 +4501,7 @@ function AgentCardRow({ row, nowSec, onPick }) {
 const AGENT_CARD_ROWS = 5;
 
 function AgentsCard({ snapshot, scope, close }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const live = asObject(snapshot && snapshot.live);
 	const nowSec = finiteNumber(live.now) ?? Date.now() / 1000;
 	const counts = liveCounts(live);
@@ -4387,7 +4543,7 @@ function AgentsCard({ snapshot, scope, close }) {
 }
 
 function MonitorStatus() {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const show = useValue(agentsChipAtom);
 	const showBar = useValue(showStatusBarAtom);
 	const spark = useValue(chipSparkAtom);
@@ -4546,7 +4702,7 @@ function contextGuard({ usage, focusedStoredId, live, warn = CONTEXT_WARN_DEFAUL
 
 /** Chip text: the focused chat's % (+ others), else "2 sessions ≥ 80%". */
 function contextChipText(g, t) {
-	if (g.focus && g.focus.level) return `${Math.round(g.focus.pct)}%${g.others.length ? ` +${g.others.length}` : ""}`;
+	if (g.focus && g.focus.level) return `${fmtPct(Math.round(g.focus.pct))}${g.others.length ? ` +${g.others.length}` : ""}`;
 	return t("ctxChipOthers", g.others.length, g.warn);
 }
 
@@ -4584,8 +4740,8 @@ function ContextPct({ pct, level, title, size = 12 }) {
 		title,
 		style: { display: "inline-flex", alignItems: "center", gap: 3, flexShrink: 0, ...UI.num },
 		children: [
-			jsx(Ring, { value, color: contextColor(level), size, stroke: 2, label: `${value}%` }, "ring"),
-			jsx("span", { style: { fontSize: "0.6875rem", fontWeight: level ? 650 : 500, color: level ? contextColor(level) : "var(--ui-text-tertiary)" }, children: `${value}%` }, "pct"),
+			jsx(Ring, { value, color: contextColor(level), size, stroke: 2, label: fmtPct(value) }, "ring"),
+			jsx("span", { style: { fontSize: "0.6875rem", fontWeight: level ? 650 : 500, color: level ? contextColor(level) : "var(--ui-text-tertiary)" }, children: fmtPct(value) }, "pct"),
 		],
 	});
 }
@@ -4603,7 +4759,7 @@ const CARD_BUTTON = {
 };
 
 function CompressControls({ stage, setStage, topic, setTopic, disabled, reason, close }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const hint = reason === "busy" ? t("ctxBusy") : reason === "no_session" ? t("ctxNoSession") : null;
 	const run = () => {
 		const r = compressFocused(topic);
@@ -4682,7 +4838,7 @@ function CompressControls({ stage, setStage, topic, setTopic, disabled, reason, 
 }
 
 function ContextOtherRow({ item, onPick }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const r = item.row;
 	const pct = Math.round(item.pct);
 	return jsxs("button", {
@@ -4691,9 +4847,9 @@ function ContextOtherRow({ item, onPick }) {
 		className: "qm-sb-row cursor-pointer rounded hover:bg-(--chrome-action-hover) transition-colors",
 		title: t("openSessionTip"),
 		onClick: () => onPick(r),
-		style: { ...UI.row, gap: 8, width: "100%", padding: "4px 6px", border: 0, background: "transparent", color: "inherit", textAlign: "left", boxSizing: "border-box" },
+		style: { ...UI.row, gap: 8, width: "100%", padding: "4px 6px", border: 0, background: "transparent", color: "inherit", textAlign: "start", boxSizing: "border-box" },
 		children: [
-			jsx(Ring, { value: pct, color: contextColor(item.level), size: 18, stroke: 3, label: `${pct}%` }, "ring"),
+			jsx(Ring, { value: pct, color: contextColor(item.level), size: 18, stroke: 3, label: fmtPct(pct) }, "ring"),
 			jsxs("span", {
 				style: { ...UI.col, flex: "1 1 auto", gap: 1 },
 				children: [
@@ -4704,13 +4860,13 @@ function ContextOtherRow({ item, onPick }) {
 					}),
 				],
 			}, "text"),
-			jsx("span", { style: { ...UI.num, fontSize: "0.75rem", fontWeight: 650, color: contextColor(item.level), flexShrink: 0 }, children: `${pct}%` }, "pct"),
+			jsx("span", { style: { ...UI.num, fontSize: "0.75rem", fontWeight: 650, color: contextColor(item.level), flexShrink: 0 }, children: fmtPct(pct) }, "pct"),
 		],
 	});
 }
 
 function ContextCard({ snapshot, scope, close, stage: initialStage = "idle", topic: initialTopic = "" }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const warn = useValue(contextWarnAtom);
 	const usage = useValue(hostAtom("focusedUsage"));
 	const storedId = useValue(hostAtom("focusedStoredSessionId"));
@@ -4748,8 +4904,8 @@ function ContextCard({ snapshot, scope, close, stage: initialStage = "idle", top
 								color: contextColor(f && f.level),
 								size: 46,
 								stroke: 4,
-								label: pct == null ? "—" : `${pct}%`,
-								children: jsx("span", { style: { fontSize: 11, fontWeight: 650, color: "var(--ui-text-primary)", ...UI.num }, children: pct == null ? "—" : `${pct}%` }),
+								label: pct == null ? "—" : fmtPct(pct),
+								children: jsx("span", { style: { fontSize: 11, fontWeight: 650, color: "var(--ui-text-primary)", ...UI.num }, children: pct == null ? "—" : fmtPct(pct) }),
 							}, "ring"),
 							jsxs("div", {
 								style: { ...UI.col, gap: 2, flex: "1 1 auto" },
@@ -4760,7 +4916,7 @@ function ContextCard({ snapshot, scope, close, stage: initialStage = "idle", top
 												"data-ctx-tokens": true,
 												style: { ...UI.meta, ...UI.num, color: "var(--ui-text-secondary)" },
 												title: f.estimated ? t("ctxEstimated") : undefined,
-												children: [`${f.estimated ? "≈ " : ""}${t("ctxTokensOf", fmtTokens(f.used), fmtTokens(f.max))}`, f.estimated ? jsx("span", { style: { ...UI.tiny, marginLeft: 4 }, children: `(${t("ctxEstimated")})` }, "e") : null],
+												children: [`${f.estimated ? "≈ " : ""}${t("ctxTokensOf", fmtTokens(f.used), fmtTokens(f.max))}`, f.estimated ? jsx("span", { style: { ...UI.tiny, marginInlineStart: 4 }, children: `(${t("ctxEstimated")})` }, "e") : null],
 											}, "tok")
 										: jsx("span", { style: UI.meta, children: f ? "" : t(storedId || runtimeId ? "ctxNoUsage" : "ctxNoSession") }, "tok"),
 									f && f.compressions != null ? jsx("span", { "data-ctx-compressions": f.compressions, style: { ...UI.tiny, ...UI.num }, children: t("ctxCompressions", f.compressions) }, "c") : null,
@@ -4789,7 +4945,7 @@ function ContextCard({ snapshot, scope, close, stage: initialStage = "idle", top
 }
 
 function ContextChip() {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const show = useValue(contextChipAtom);
 	const showBar = useValue(showStatusBarAtom);
 	const warn = useValue(contextWarnAtom);
@@ -4817,7 +4973,7 @@ function ContextChip() {
 		),
 		style: { ...CHIP_NOWRAP, gap: 4 },
 		children: [
-			jsx(Ring, { value: Math.round(ringPct), color, size: 11, stroke: 2, label: `${Math.round(ringPct)}%` }, "ring"),
+			jsx(Ring, { value: Math.round(ringPct), color, size: 11, stroke: 2, label: fmtPct(Math.round(ringPct)) }, "ring"),
 			jsx("span", { className: "tabular-nums", "data-ctx-text": true, style: { color, fontWeight: 600 }, children: text }, "text"),
 		],
 	});
@@ -4833,14 +4989,14 @@ function ContextChip() {
 // ---- quota card ----
 
 function QuotaCardWindow({ w, nowMs }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const r = remainingPct(w);
 	const tone = toneForRemaining(r);
 	const label = w.label || "window";
 	const reset = w.reset_at ? relativeCountdown(w.reset_at, nowMs) : "";
 	return jsxs("div", {
 		"data-card-window": label,
-		title: [label, r == null ? "—" : `${r}% ${t("left")}`, reset ? t("popoverReset", reset) : ""].filter(Boolean).join(" · "),
+		title: [label, r == null ? "—" : `${fmtPct(r)} ${t("left")}`, reset ? t("popoverReset", reset) : ""].filter(Boolean).join(" · "),
 		style: { ...UI.col, alignItems: "center", gap: 2, width: 84 },
 		children: [
 			jsx(Ring, {
@@ -4848,8 +5004,8 @@ function QuotaCardWindow({ w, nowMs }) {
 				tone,
 				size: 32,
 				stroke: 3,
-				label: `${label} ${r == null ? "—" : `${r}% ${t("left")}`}`,
-				children: jsx("span", { style: { fontSize: 9, fontWeight: 650, color: "var(--ui-text-primary)", ...UI.num }, children: r == null ? "—" : `${r}%` }),
+				label: `${label} ${r == null ? "—" : `${fmtPct(r)} ${t("left")}`}`,
+				children: jsx("span", { style: { fontSize: 9, fontWeight: 650, color: "var(--ui-text-primary)", ...UI.num }, children: r == null ? "—" : fmtPct(r) }),
 			}),
 			jsx("span", { style: { ...UI.tiny, color: "var(--ui-text-secondary)", textAlign: "center", lineHeight: 1.2, maxWidth: "100%", ...UI.ellipsis }, children: label }),
 			reset ? jsx("span", { style: { ...UI.tiny, ...UI.num, lineHeight: 1.1 }, children: `↻ ${reset}` }) : null,
@@ -4858,7 +5014,7 @@ function QuotaCardWindow({ w, nowMs }) {
 }
 
 function QuotaCard({ close }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const { data } = useQuota();
 	const mon = useMonitor();
 	const forecastOn = useValue(quotaForecastAtom);
@@ -4895,7 +5051,7 @@ function QuotaCard({ close }) {
 								className: "qm-sb-row cursor-pointer rounded hover:bg-(--chrome-action-hover) transition-colors",
 								onClick: toQuota,
 								title: t("cardOpenQuota"),
-								style: { ...UI.row, gap: 6, border: 0, background: "transparent", padding: "1px 2px", color: "inherit", textAlign: "left", width: "100%" },
+								style: { ...UI.row, gap: 6, border: 0, background: "transparent", padding: "1px 2px", color: "inherit", textAlign: "start", width: "100%" },
 								children: [
 									jsx(ProviderBadge, { pid }),
 									jsx("span", { style: { ...UI.text, fontWeight: 600, ...UI.ellipsis, flex: "1 1 auto" }, children: providerDisplayName(pid, p) }),
@@ -4946,7 +5102,7 @@ function MiniStat({ label, value, color }) {
 }
 
 function CostCard({ snapshot, close }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const daily = useValue(budgetDailyAtom);
 	const monthly = useValue(budgetMonthlyAtom);
 	const nowMs = useNow(60_000);
@@ -4989,7 +5145,7 @@ function CostCard({ snapshot, close }) {
 }
 
 function CostChip() {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const showBar = useValue(showStatusBarAtom);
 	const stored = useValue(costChipAtom);
 	const daily = useValue(budgetDailyAtom);
@@ -5041,31 +5197,31 @@ function SettingSwitch({ label, hint, checked, onChange }) {
 }
 
 function AgentsChipControl() {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const chip = useValue(agentsChipAtom);
 	return jsx(SettingSwitch, { label: t("agentsChipLabel"), checked: chip, onChange: (v) => setStored(AGENTS_CHIP_KEY, !!v, agentsChipAtom) });
 }
 
 function ChipSparkControl() {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const on = useValue(chipSparkAtom);
 	return jsx(SettingSwitch, { label: t("chipSparkLabel"), checked: on, onChange: (v) => setStored(CHIP_SPARK_KEY, !!v, chipSparkAtom) });
 }
 
 function ChipFlashControl() {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const on = useValue(chipFlashAtom);
 	return jsx(SettingSwitch, { label: t("chipFlashLabel"), hint: t("chipFlashHint"), checked: on, onChange: (v) => setStored(CHIP_FLASH_KEY, !!v, chipFlashAtom) });
 }
 
 function QuotaAlertsControl() {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const on = useValue(quotaAlertsAtom);
 	return jsx(SettingSwitch, { label: t("quotaAlertsLabel"), hint: t("quotaAlertsHint", QUOTA_CHIP_ALERT_USED), checked: on, onChange: (v) => setStored(QUOTA_ALERTS_KEY, !!v, quotaAlertsAtom) });
 }
 
 function CostChipControl() {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const stored = useValue(costChipAtom);
 	const daily = useValue(budgetDailyAtom);
 	const monthly = useValue(budgetMonthlyAtom);
@@ -5078,13 +5234,13 @@ function CostChipControl() {
 }
 
 function ContextChipControl() {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const on = useValue(contextChipAtom);
 	return jsx(SettingSwitch, { label: t("contextChipLabel"), hint: t("contextChipHint"), checked: on, onChange: (v) => setStored(CONTEXT_CHIP_KEY, !!v, contextChipAtom) });
 }
 
 function ContextWarnControl() {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const warn = useValue(contextWarnAtom);
 	return jsx(SettingRow, {
 		label: t("contextWarnLabel"),
@@ -5096,19 +5252,19 @@ function ContextWarnControl() {
 				const n = Number(v);
 				setStored(CONTEXT_WARN_KEY, CONTEXT_WARN_OPTIONS.includes(n) ? n : CONTEXT_WARN_DEFAULT, contextWarnAtom);
 			},
-			options: CONTEXT_WARN_OPTIONS.map((n) => ({ id: String(n), label: `${n}%` })),
+			options: CONTEXT_WARN_OPTIONS.map((n) => ({ id: String(n), label: fmtPct(n) })),
 		}),
 	});
 }
 
 function NavBadgeControl() {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const navBadgeOn = useValue(navBadgeAtom);
 	return jsx(SettingSwitch, { label: t("navBadgeLabel"), hint: t("navBadgeHint"), checked: navBadgeOn, onChange: (v) => setStored(NAV_BADGE_KEY, !!v, navBadgeAtom) });
 }
 
 function BudgetInput({ label, kind }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const value = useValue(kind === "monthly" ? budgetMonthlyAtom : budgetDailyAtom);
 	return jsx(SettingRow, {
 		label,
@@ -5130,7 +5286,7 @@ function BudgetInput({ label, kind }) {
 }
 
 function MonitorSettings() {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const enabled = useValue(monitorEnabledAtom);
 	const accountsTab = useValue(accountsTabAtom);
 	const forecast = useValue(quotaForecastAtom);
@@ -5168,7 +5324,7 @@ function MonitorSettings() {
 								const n = Number(v);
 								setStored(LIVE_INTERVAL_KEY, LIVE_INTERVAL_OPTIONS.includes(n) ? n : LIVE_INTERVAL_DEFAULT, liveIntervalAtom);
 							},
-							options: LIVE_INTERVAL_OPTIONS.map((n) => ({ id: String(n), label: n < 60 ? `${n}s` : `${n / 60}m` })),
+							options: LIVE_INTERVAL_OPTIONS.map((n) => ({ id: String(n), label: n < 60 ? t("spanS", n) : t("spanM", n / 60) })),
 						}),
 					}, "live"),
 				],
@@ -5202,28 +5358,33 @@ function MonitorSettings() {
 // pane untruncated), the active one filled with the accent. Own markup (not
 // SegmentedControl) because the labels need tighter padding than core's control.
 function MonitorTabs() {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const view = useValue(paneViewAtom);
 	const accountsOn = useValue(accountsTabAtom);
 	const views = MONITOR_VIEWS.filter((id) => id !== "accounts" || accountsOn);
 	return jsx("div", {
 		role: "tablist",
 		"data-tabs": views.join(","),
-		style: { display: "flex", gap: 2, padding: 2, borderRadius: 7, background: "var(--ui-bg-tertiary)", minWidth: 0 },
+		// Long labels (German, Russian) wrap onto a second row in the 300px
+		// pane instead of truncating to "Konting…".
+		style: { display: "flex", flexWrap: "wrap", gap: 2, padding: 2, borderRadius: 7, background: "var(--ui-bg-tertiary)", minWidth: 0 },
 		children: views.map((id) => {
 			const active = id === view;
+			const label = t(`tab_${id}`);
 			return jsx("button", {
 				type: "button",
 				role: "tab",
 				"aria-selected": active,
 				"data-tab": id,
+				title: label,
 				className: active ? undefined : "hover:text-foreground transition-colors",
 				onClick: () => setPaneView(id),
 				style: {
-					flex: "1 1 auto",
+					flex: "1 0 auto",
 					minWidth: 0,
+					maxWidth: "100%",
 					height: 22,
-					padding: "0 3px",
+					padding: "0 4px",
 					border: 0,
 					borderRadius: 5,
 					fontSize: "0.6875rem",
@@ -5235,7 +5396,7 @@ function MonitorTabs() {
 					background: active ? "var(--ui-accent)" : "transparent",
 					color: active ? "var(--dt-midground-foreground, var(--ui-bg-editor))" : "var(--ui-text-secondary)",
 				},
-				children: t(`tab_${id}`),
+				children: label,
 			}, id);
 		}),
 	});
@@ -5550,7 +5711,7 @@ function createAccountsController(initial) {
 // ---- Accounts view (React) ----
 
 function AccountRing({ windows, size = 30 }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const w = mostUsedWindow(windows);
 	const left = w ? Math.max(0, Math.min(100, Math.round(100 - w.used))) : null;
 	return jsx(Ring, {
@@ -5566,7 +5727,7 @@ function AccountRing({ windows, size = 30 }) {
 const ACCOUNT_STATUS_COLOR = { active: "var(--ui-green)", cooldown: "var(--ui-yellow)", exhausted: "var(--ui-red)" };
 
 function AccountStatus({ row, nowSec }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const until = finiteNumber(row.status_until);
 	const left = until != null && until > nowSec ? fmtSpan(until - nowSec) : "";
 	const title = row.status === "cooldown" && asList(row.cooldown_models).length
@@ -5599,7 +5760,7 @@ function MoveButton({ label, glyph, disabled, onClick }) {
 }
 
 function AccountRow({ ctl, pool, row, index, count, firstActive, nowSec, page }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const key = poolKey(pool);
 	const can = ctl.canReorder(key);
 	const drag = ctl.state.drag && ctl.state.drag.key === key ? ctl.state.drag : null;
@@ -5669,7 +5830,7 @@ function AccountRow({ ctl, pool, row, index, count, firstActive, nowSec, page })
 				style: { ...UI.tiny, width: 8, flexShrink: 0, letterSpacing: "-2px", color: can ? "var(--ui-text-tertiary)" : "var(--ui-text-quaternary)", userSelect: "none" },
 				children: "⋮⋮",
 			}, "grip"),
-			jsx("span", { style: { ...UI.tiny, ...UI.num, width: 12, flexShrink: 0, textAlign: "right" }, children: String(index + 1) }, "n"),
+			jsx("span", { style: { ...UI.tiny, ...UI.num, width: 12, flexShrink: 0, textAlign: "end" }, children: String(index + 1) }, "n"),
 			jsx(AccountRing, { windows: row.windows, size: page ? 32 : 28 }, "ring"),
 			jsxs("div", {
 				style: { ...UI.col, gap: 3, flex: "1 1 auto" },
@@ -5704,7 +5865,7 @@ function AccountRow({ ctl, pool, row, index, count, firstActive, nowSec, page })
 }
 
 function StrategyControl({ ctl, pool, profile, page }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const value = ctl.strategyFor(pool, profile);
 	const supported = asList(ctl.env.data && ctl.env.data.strategies).filter((s) => STRATEGY_IDS.includes(s));
 	const blocked = Boolean(ctl.blocked());
@@ -5728,7 +5889,7 @@ function StrategyControl({ ctl, pool, profile, page }) {
 }
 
 function StrategyLegend({ ids, page }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	return jsx("div", {
 		"data-strategy-legend": true,
 		style: { display: "grid", gridTemplateColumns: page ? "repeat(2, minmax(0, 1fr))" : "1fr", gap: "2px 12px", paddingTop: 4 },
@@ -5742,7 +5903,7 @@ function StrategyLegend({ ids, page }) {
 }
 
 function StrategySection({ ctl, pool, page }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const users = asList(pool.used_by);
 	const values = users.map((u) => ctl.strategyFor(pool, u));
 	const counts = {};
@@ -5770,7 +5931,7 @@ function StrategySection({ ctl, pool, page }) {
 }
 
 function PoolCard({ ctl, pool, nowSec, page }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const key = poolKey(pool);
 	const rows = ctl.rows(key);
 	const firstActive = rows.find((r) => r.status === "active");
@@ -5792,7 +5953,7 @@ function PoolCard({ ctl, pool, nowSec, page }) {
 					pool.shared
 						? jsx(Pill, { color: "var(--ui-purple)", "data-pool-kind": "shared", title: t("accountsSharedTip", users.join(", ")), children: t("accountsSharedPool", users.length) }, "k")
 						: jsx(Pill, { color: "var(--ui-cyan)", "data-pool-kind": "own", children: t("accountsOwnPool", pool.owner) }, "k"),
-					page ? jsx("span", { style: { ...UI.faint, marginLeft: "auto" }, children: t("accountsCount", rows.length) }, "c") : null,
+					page ? jsx("span", { style: { ...UI.faint, marginInlineStart: "auto" }, children: t("accountsCount", rows.length) }, "c") : null,
 				],
 			}, "head"),
 			providerWin && !anyRowQuota
@@ -5854,7 +6015,7 @@ function ModelChip({ provider, model, tone, title }) {
 }
 
 function ProfileChain({ prof }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const fbs = asList(prof.fallbacks);
 	const m = asObject(prof.model);
 	return jsxs("div", {
@@ -5865,7 +6026,7 @@ function ProfileChain({ prof }) {
 				jsxs("span", {
 					style: { display: "inline-flex", alignItems: "center", gap: 4, minWidth: 0 },
 					children: [
-						jsx("span", { "aria-hidden": true, style: UI.faint, children: "→" }, "a"),
+						jsx("span", { "aria-hidden": true, style: UI.faint, children: arrowFwd() }, "a"),
 						jsx(ModelChip, { provider: fb.provider, model: fb.model, title: t("accountsFallbackTip", i + 1) + (fb.custom_route ? ` · ${t("accountsCustomRoute")}` : "") }, "c"),
 					],
 				}, `fb${i}`),
@@ -5875,7 +6036,7 @@ function ProfileChain({ prof }) {
 }
 
 function AccessCell({ access, strategy }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	if (!access) return jsx("span", { style: UI.faint, children: "—" });
 	return jsxs("span", {
 		style: { display: "inline-flex", flexWrap: "wrap", alignItems: "center", gap: 3 },
@@ -5887,7 +6048,7 @@ function AccessCell({ access, strategy }) {
 }
 
 function ProfileMatrix({ ctl, data, page }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const providers = [...new Set(asList(data.pools).map((p) => p.provider))];
 	const profiles = asList(data.profiles);
 	const strategyOf = (prof, provider) => {
@@ -5915,9 +6076,9 @@ function ProfileMatrix({ ctl, data, page }) {
 					jsx("thead", {
 						children: jsxs("tr", {
 							children: [
-								jsx("th", { style: { ...UI.tiny, textAlign: "left", padding: "7px 10px", fontWeight: 600 }, children: t("accountsProfileCol") }, "p"),
-								...providers.map((p) => jsx("th", { style: { ...UI.tiny, textAlign: "left", padding: "7px 8px", fontWeight: 600, whiteSpace: "nowrap" }, children: providerMeta(p).name }, p)),
-								jsx("th", { style: { ...UI.tiny, textAlign: "left", padding: "7px 10px", fontWeight: 600 }, children: t("accountsChainCol") }, "chain"),
+								jsx("th", { style: { ...UI.tiny, textAlign: "start", padding: "7px 10px", fontWeight: 600 }, children: t("accountsProfileCol") }, "p"),
+								...providers.map((p) => jsx("th", { style: { ...UI.tiny, textAlign: "start", padding: "7px 8px", fontWeight: 600, whiteSpace: "nowrap" }, children: providerMeta(p).name }, p)),
+								jsx("th", { style: { ...UI.tiny, textAlign: "start", padding: "7px 10px", fontWeight: 600 }, children: t("accountsChainCol") }, "chain"),
 							],
 						}),
 					}, "h"),
@@ -6000,7 +6161,7 @@ function openHermesSettings(path) {
 }
 
 function UnavailableRow({ item, nowSec, used = false }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const name = providerDisplayName(item.provider, { account_label: item.account_label });
 	const retry = finiteNumber(item.retry_at);
 	const reasonText = item.kind === "signin" && isKeyRoute(item)
@@ -6041,7 +6202,7 @@ function UnavailableRow({ item, nowSec, used = false }) {
 					jsx(ProviderBadge, { pid: item.provider }, "b"),
 					jsx("span", { style: { ...UI.text, fontWeight: 600, ...UI.ellipsis }, children: name }, "n"),
 					jsx(Pill, { color, "data-unavailable-kind": item.kind, children: t(`accountsKind_${item.kind}`) }, "k"),
-					used ? jsx("span", { style: { ...UI.tiny, marginLeft: "auto", flexShrink: 0 }, title: t("accountsUsedTip"), children: t("accountsUsed") }, "u") : null,
+					used ? jsx("span", { style: { ...UI.tiny, marginInlineStart: "auto", flexShrink: 0 }, title: t("accountsUsedTip"), children: t("accountsUsed") }, "u") : null,
 				],
 			}, "h"),
 			jsx("span", { style: { ...UI.meta, lineHeight: 1.4 }, children: reasonText + (retryText ? ` · ${retryText}` : "") }, "r"),
@@ -6051,7 +6212,7 @@ function UnavailableRow({ item, nowSec, used = false }) {
 }
 
 function AccountsConfirm({ ctl }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const c = ctl.state.confirm;
 	let title = "";
 	let description = "";
@@ -6088,7 +6249,7 @@ function AccountsConfirm({ ctl }) {
 			"data-confirm": "strategy",
 			style: { ...UI.col, gap: 8, fontSize: "0.75rem" },
 			children: [
-				jsx("span", { style: UI.text, children: `${t(`strategy_${c.from}`)} → ${t(`strategy_${c.to}`)}` }, "chg"),
+				jsx("span", { style: UI.text, children: `${t(`strategy_${c.from}`)} ${arrowFwd()} ${t(`strategy_${c.to}`)}` }, "chg"),
 				jsx("span", { style: UI.secondary, children: t(`strategyHint_${c.to}`) }, "hint"),
 				jsx("code", { style: { ...UI.tiny, fontFamily: "var(--dt-font-mono)", overflowWrap: "anywhere", color: "var(--ui-text-secondary)" }, children: accountsOfficialCommand(c) }, "cmd"),
 			],
@@ -6108,7 +6269,7 @@ function AccountsConfirm({ ctl }) {
 }
 
 function AccountsView({ page = false, initialState = null, accountsOverride = null }) {
-	const t = usePluginI18n(ID);
+	const t = useQT();
 	const qc = useQueryClient();
 	const live = useAccounts(!accountsOverride);
 	const acc = accountsOverride || live;
@@ -6217,6 +6378,300 @@ function AccountsView({ page = false, initialState = null, accountsOverride = nu
 // ---- locale bundles (en + tr) ---------------------------------------------
 // Module-level so handlers (notifications, clipboard toasts) can fall back to
 // English through `tr()` when no component is around.
+
+// ---- registration ---------------------------------------------------------
+
+let _paneDisposer = null;
+
+function clearDockedPane() {
+	if (!_paneDisposer) return;
+	try {
+		_paneDisposer();
+	} catch {
+		/* noop */
+	}
+	_paneDisposer = null;
+}
+
+function registerDockedPane() {
+	clearDockedPane();
+	if (!CTX || !showDockedPaneAtom.get()) return;
+	try {
+		_paneDisposer = CTX.register({
+			id: "pane",
+			area: PANES_AREA,
+			title: tr("paneTitle"),
+			data: {
+				placement: "right",
+				dock: { pane: "workspace", pos: "right" },
+				width: "300px",
+			},
+			render: () => jsx(QuotaPane, { page: false }),
+		});
+	} catch {
+		_paneDisposer = null;
+	}
+}
+
+// ---- sidebar nav badge -----------------------------------------------------
+//
+// The core `sidebar.nav` row only takes a label and a codicon name, so the
+// live detail rides in the label ("Quota · 2 active · ⚠ 8%") and the codicon
+// spins while an agent works. Re-registering the same id replaces the row in
+// place; it is only redone when the text actually changes.
+
+const NAV_BADGE_KEY = "navBadge";
+const navBadgeAtom = atom(true);
+const NAV_LOW_QUOTA_PCT = 15;
+
+function navCounts() {
+	const counts = { working: 0, approval: 0, yourTurn: 0, stalled: 0 };
+	try {
+		const busy = host.state.busyBySession.get() || {};
+		counts.working = Object.values(busy).filter(Boolean).length;
+	} catch {
+		/* older host */
+	}
+	try {
+		let newest = null;
+		for (const [, data] of queryClient.getQueriesData({ queryKey: [...MONITOR_QUERY_KEY, "snapshot"] })) {
+			const snap = asMonitorPayload(data);
+			if (snap && snap.live && (!newest || (snap.generated_at || 0) > (newest.generated_at || 0))) newest = snap;
+		}
+		const c = newest && newest.live && newest.live.counts;
+		if (c) {
+			counts.working = Math.max(counts.working, Number(c.working) || 0);
+			counts.approval = Number(c.needs_approval) || 0;
+			counts.yourTurn = Number(c.your_turn) || 0;
+			counts.stalled = Number(c.stalled) || 0;
+		}
+	} catch {
+		/* no snapshot yet */
+	}
+	return counts;
+}
+
+function navLowestQuota() {
+	let lowest = null;
+	try {
+		for (const [, data] of queryClient.getQueriesData({ queryKey: QUOTA_QUERY_KEY })) {
+			const providers = data && data.providers;
+			if (!providers || typeof providers !== "object") continue;
+			for (const [pid, rec] of Object.entries(providers)) {
+				if (!isProviderEnabled(pid) || !rec || rec.unavailable_reason) continue;
+				for (const w of rec.windows || []) {
+					if (typeof w.used_percent !== "number" || !Number.isFinite(w.used_percent)) continue;
+					const left = Math.max(0, Math.round(100 - w.used_percent));
+					if (lowest == null || left < lowest) lowest = left;
+				}
+			}
+		}
+	} catch {
+		/* no quota data yet */
+	}
+	return lowest;
+}
+
+/** Label + icon for the nav row; pure, so tests can pin the format. */
+function navBadge(counts, lowestLeft, t, focusCtxPct = null) {
+	const parts = [];
+	if (counts.approval) parts.push(t("navApproval", counts.approval));
+	if (counts.working) parts.push(t("navWorking", counts.working));
+	else if (counts.yourTurn) parts.push(t("navYourTurn", counts.yourTurn));
+	if (counts.stalled && parts.length < 2) parts.push(t("navStalled", counts.stalled));
+	if (lowestLeft != null && lowestLeft <= NAV_LOW_QUOTA_PCT) parts.push(`⚠ ${fmtPct(lowestLeft)}`);
+	// A nearly full focused chat outranks everything but an approval; the label
+	// then stays at three parts in total ("Quota · 2 active · ctx 92%").
+	const ctxPct = finiteNumber(focusCtxPct);
+	if (ctxPct != null && Math.round(ctxPct) >= CONTEXT_DANGER) {
+		parts.splice(counts.approval ? 1 : 0, 0, t("navContext", Math.round(ctxPct)));
+		parts.splice(2);
+	}
+	return {
+		label: [t("navLabel"), ...parts.slice(0, 3)].join(" · "),
+		codicon: counts.approval ? "bell-dot" : counts.working ? "sync codicon-modifier-spin" : "pulse",
+	};
+}
+
+function navFocusContextPct() {
+	const f = focusedContext(readHostState("focusedUsage", null));
+	return f ? f.pct : null;
+}
+
+function startNavBadge(ctx) {
+	let last = "";
+	const update = () => {
+		const next = navBadgeAtom.get()
+			? navBadge(navCounts(), navLowestQuota(), tr, navFocusContextPct())
+			: { label: tr("navLabel"), codicon: "pulse" };
+		const sig = `${next.label}|${next.codicon}`;
+		if (sig === last) return;
+		last = sig;
+		ctx.register({
+			id: "nav",
+			area: SIDEBAR_NAV_AREA,
+			order: 80,
+			data: { codicon: next.codicon, label: next.label, path: "/quota" },
+		});
+	};
+	update();
+	let pending = null;
+	const schedule = () => {
+		if (pending) return;
+		pending = setTimeout(() => {
+			pending = null;
+			update();
+		}, 250);
+	};
+	const offs = [];
+	try {
+		offs.push(host.state.busyBySession.listen(schedule));
+	} catch {
+		/* older host */
+	}
+	for (const name of ["focusedUsage", "focusedStoredSessionId"]) {
+		try {
+			const a = host.state[name];
+			if (a && typeof a.listen === "function") offs.push(a.listen(schedule));
+		} catch {
+			/* older host */
+		}
+	}
+	try {
+		offs.push(navBadgeAtom.listen(schedule));
+	} catch {
+		/* noop */
+	}
+	// The label is registered text, not a component: rebuild it in the new
+	// language (the 250 ms debounce runs after the app has applied it).
+	try {
+		if (ctx.i18n && typeof ctx.i18n.onLocaleChange === "function") offs.push(ctx.i18n.onLocaleChange(schedule));
+	} catch {
+		/* older host */
+	}
+	try {
+		offs.push(
+			queryClient.getQueryCache().subscribe((event) => {
+				const key = event && event.query && event.query.queryKey;
+				if (Array.isArray(key) && key[0] === "quota") schedule();
+			}),
+		);
+	} catch {
+		/* noop */
+	}
+	if (typeof ctx.onDispose !== "function") return;
+	ctx.onDispose(() => {
+		if (pending) clearTimeout(pending);
+		for (const off of offs) {
+			try {
+				off();
+			} catch {
+				/* noop */
+			}
+		}
+	});
+}
+
+export default {
+	id: ID,
+	name: "Quota Widget",
+	defaultEnabled: true,
+	register(ctx) {
+		CTX = ctx;
+		applyStoredAll();
+		registerDockedPane();
+		ctx.i18n.register(I18N_BUNDLES);
+		// Registered-once text (pane title; the nav row has its own listener)
+		// follows a language switch. The render-time locale is dropped so code
+		// outside React re-reads the new one until components render again.
+		try {
+			if (typeof ctx.i18n.onLocaleChange === "function") {
+				let paneTitle = tr("paneTitle");
+				ctx.i18n.onLocaleChange(() => {
+					_renderLocale = null;
+					setTimeout(() => {
+						const next = tr("paneTitle");
+						if (next !== paneTitle && _paneDisposer) {
+							paneTitle = next;
+							registerDockedPane();
+						}
+					}, 0);
+				});
+			}
+		} catch {
+			/* older host */
+		}
+
+		// Single, static statusbar item. The StatusBar component re-renders itself
+		// via hooks (useQuota / useValue) — it never re-registers, so no feedback
+		// loop. Order 125 keeps it left of the default right-side items.
+		ctx.register({
+			id: "statusbar",
+			area: STATUSBAR_AREAS.right,
+			order: 125,
+			render: () => jsx(StatusBar, {}),
+		});
+
+		// Agents chip (working / your turn) + the monitor notifier. Renders
+		// nothing until a monitor snapshot exists, so an older backend leaves
+		// the status bar exactly as it was.
+		ctx.register({
+			id: "agents",
+			area: STATUSBAR_AREAS.right,
+			order: 124,
+			render: () => jsx(MonitorStatus, {}),
+		});
+
+		// Context guard chip, left of the agents chip. Hidden unless some
+		// chat's context is at/over the warn threshold (the core bar already
+		// shows the focused chat's usage, so a calm chip would duplicate it).
+		ctx.register({
+			id: "context",
+			area: STATUSBAR_AREAS.right,
+			order: 123,
+			render: () => jsx(ContextChip, {}),
+		});
+
+		// Spend-today chip, right of the quota chips. Off unless a budget is
+		// set (or the user switched it on); reads the same monitor snapshot.
+		ctx.register({
+			id: "cost",
+			area: STATUSBAR_AREAS.right,
+			order: 126,
+			render: () => jsx(CostChip, {}),
+		});
+
+		// Chip keyframes (attention flash) + focus ring, scoped `qm-sb-`.
+		const styleEl = ensureStatusbarStyles();
+		try {
+			ctx.onDispose?.(() => styleEl?.remove?.());
+		} catch {
+			/* older host */
+		}
+
+		// Route page (/quota).
+		ctx.register({
+			id: "page",
+			area: ROUTES_AREA,
+			data: { path: "/quota" },
+			render: () => jsx(QuotaPane, { page: true }),
+		});
+
+		// Sidebar nav row, with live counts in its label (see startNavBadge).
+		applyStoredBoolean(NAV_BADGE_KEY, navBadgeAtom, true);
+		startNavBadge(ctx);
+	},
+};
+
+// =============================================================================
+// ---- i18n bundles -----------------------------------------------------------
+// =============================================================================
+//
+// One bundle per app language (apps/desktop/src/i18n/languages.ts) plus `tr`
+// (a backend language pack). Resolution: active language → en → key, so every
+// bundle carries every en key (tests/test_widget_i18n.py). Function values keep
+// en's argument order; word order and plurals are per language. `_locale` is
+// the language id, read through ctx.i18n.t by code outside React.
 
 const I18N_EN = {
 	paneTitle: "Quota",
@@ -6603,6 +7058,35 @@ const I18N_EN = {
 	notifyContextTitle: (pct) => `Context ${pct}% full`,
 	notifyContextBody: "compress it (/compress) or start a new chat",
 	navContext: (pct) => `ctx ${pct}%`,
+	// ---- locale-aware formatting + status-bar tooltips ----
+	_locale: "en",
+	navLabel: "Quota",
+	resetToday: (time) => `today ${time}`,
+	resetTomorrow: (time) => `tomorrow ${time}`,
+	resetting: "resetting…",
+	spanDH: (d, h) => `${d}d ${h}h`,
+	spanHM: (h, m) => `${h}h ${m}m`,
+	spanM: (m) => `${m}m`,
+	spanH: (h) => `${h}h`,
+	spanS: (s) => `${s}s`,
+	spanLt1m: "<1m",
+	updateAvailable: "⬆ Update available — run ./install.sh to get it",
+	accountN: (n) => `Account ${n}`,
+	valueUnknown: "unknown",
+	valueLeft: (v) => `${v} left`,
+	stale: "stale",
+	valueUnavailable: "unavailable",
+	valueAvailable: "available",
+	quotaBreakdown: "Quota breakdown:",
+	providerUnavailable: (name) => `${name}: unavailable`,
+	providerUnavailableReason: (name, reason) => `${name}: unavailable (${reason})`,
+	accountBalance: "Account balance",
+	accountBalanceLine: (v) => `Account balance: ${v}`,
+	apiCallsAvailable: (ok) => `API calls available: ${ok ? "yes" : "no"}`,
+	planLine: (plan) => `Plan: ${plan}`,
+	windowFallback: "window",
+	resetsAt: (when) => `resets ${when}`,
+	seriesTotal: "total",
 };
 
 const I18N_TR = {
@@ -6928,7 +7412,7 @@ const I18N_TR = {
 	historyRangeLabel: "Geçmiş aralığı",
 	liveIntervalLabel: "Canlı yenileme",
 	navBadgeLabel: "Kenar menüde canlı sayılar",
-	navBadgeHint: "Quota menüsünün yanında çalışan ajanları, onay bekleyenleri, azalan kotayı ve dolmak üzere olan sohbet bağlamını gösterir.",
+	navBadgeHint: "Kota menüsünün yanında çalışan ajanları, onay bekleyenleri, azalan kotayı ve dolmak üzere olan sohbet bağlamını gösterir.",
 	navWorking: (n) => `${n} aktif`,
 	navYourTurn: (n) => `${n} sıra sende`,
 	navApproval: (n) => `${n} onay`,
@@ -6989,262 +7473,3388 @@ const I18N_TR = {
 	notifyContextTitle: (pct) => `Bağlam %${pct} dolu`,
 	notifyContextBody: "sıkıştır (/compress) ya da yeni sohbet aç",
 	navContext: (pct) => `bağlam %${pct}`,
+	// ---- locale-aware formatting + status-bar tooltips ----
+	_locale: "tr",
+	navLabel: "Kota",
+	resetToday: (time) => `bugün ${time}`,
+	resetTomorrow: (time) => `yarın ${time}`,
+	resetting: "sıfırlanıyor…",
+	spanDH: (d, h) => `${d}g ${h}sa`,
+	spanHM: (h, m) => `${h}sa ${m}dk`,
+	spanM: (m) => `${m}dk`,
+	spanH: (h) => `${h}sa`,
+	spanS: (s) => `${s}sn`,
+	spanLt1m: "<1dk",
+	updateAvailable: "⬆ Güncelleme var — almak için ./install.sh çalıştır",
+	accountN: (n) => `Hesap ${n}`,
+	valueUnknown: "bilinmiyor",
+	valueLeft: (v) => `${v} kaldı`,
+	stale: "eski",
+	valueUnavailable: "kullanılamıyor",
+	valueAvailable: "kullanılabilir",
+	quotaBreakdown: "Kota dökümü:",
+	providerUnavailable: (name) => `${name}: kullanılamıyor`,
+	providerUnavailableReason: (name, reason) => `${name}: kullanılamıyor (${reason})`,
+	accountBalance: "Hesap bakiyesi",
+	accountBalanceLine: (v) => `Hesap bakiyesi: ${v}`,
+	apiCallsAvailable: (ok) => `API çağrıları: ${ok ? "kullanılabilir" : "kullanılamıyor"}`,
+	planLine: (plan) => `Plan: ${plan}`,
+	windowFallback: "pencere",
+	resetsAt: (when) => `sıfırlanma ${when}`,
+	seriesTotal: "toplam",
 };
 
-// ---- registration ---------------------------------------------------------
-
-let _paneDisposer = null;
-
-function clearDockedPane() {
-	if (!_paneDisposer) return;
+/** Plural pick for bundle functions: `forms` keyed by Intl.PluralRules category. */
+function plural(lang, n, forms) {
+	let cat = "other";
 	try {
-		_paneDisposer();
+		cat = new Intl.PluralRules(lang).select(Number(n));
 	} catch {
-		/* noop */
+		/* no PluralRules */
 	}
-	_paneDisposer = null;
+	const form = forms[cat] != null ? forms[cat] : forms.other;
+	return typeof form === "function" ? form(n) : form;
 }
 
-function registerDockedPane() {
-	clearDockedPane();
-	if (!CTX || !showDockedPaneAtom.get()) return;
-	try {
-		_paneDisposer = CTX.register({
-			id: "pane",
-			area: PANES_AREA,
-			title: "quota",
-			data: {
-				placement: "right",
-				dock: { pane: "workspace", pos: "right" },
-				width: "300px",
-			},
-			render: () => jsx(QuotaPane, { page: false }),
-		});
-	} catch {
-		_paneDisposer = null;
-	}
+/** Russian noun after a number: 1 сеанс, 2 сеанса, 5 сеансов. */
+function ruN(n, one, few, many) {
+	return `${n} ${plural("ru", n, { one, few, many, other: few })}`;
 }
 
-// ---- sidebar nav badge -----------------------------------------------------
-//
-// The core `sidebar.nav` row only takes a label and a codicon name, so the
-// live detail rides in the label ("Quota · 2 active · ⚠ 8%") and the codicon
-// spins while an agent works. Re-registering the same id replaces the row in
-// place; it is only redone when the text actually changes.
-
-const NAV_BADGE_KEY = "navBadge";
-const navBadgeAtom = atom(true);
-const NAV_LOW_QUOTA_PCT = 15;
-
-function navCounts() {
-	const counts = { working: 0, approval: 0, yourTurn: 0, stalled: 0 };
-	try {
-		const busy = host.state.busyBySession.get() || {};
-		counts.working = Object.values(busy).filter(Boolean).length;
-	} catch {
-		/* older host */
-	}
-	try {
-		let newest = null;
-		for (const [, data] of queryClient.getQueriesData({ queryKey: [...MONITOR_QUERY_KEY, "snapshot"] })) {
-			const snap = asMonitorPayload(data);
-			if (snap && snap.live && (!newest || (snap.generated_at || 0) > (newest.generated_at || 0))) newest = snap;
-		}
-		const c = newest && newest.live && newest.live.counts;
-		if (c) {
-			counts.working = Math.max(counts.working, Number(c.working) || 0);
-			counts.approval = Number(c.needs_approval) || 0;
-			counts.yourTurn = Number(c.your_turn) || 0;
-			counts.stalled = Number(c.stalled) || 0;
-		}
-	} catch {
-		/* no snapshot yet */
-	}
-	return counts;
+/** Arabic count + noun: 1 and 2 use the dual words, 3–10 the plural, else singular. */
+function arN(n, one, two, few, other) {
+	return plural("ar", n, { one, two, few: `${n} ${few}`, many: `${n} ${other}`, other: `${n} ${other}`, zero: `${n} ${other}` });
 }
 
-function navLowestQuota() {
-	let lowest = null;
-	try {
-		for (const [, data] of queryClient.getQueriesData({ queryKey: QUOTA_QUERY_KEY })) {
-			const providers = data && data.providers;
-			if (!providers || typeof providers !== "object") continue;
-			for (const [pid, rec] of Object.entries(providers)) {
-				if (!isProviderEnabled(pid) || !rec || rec.unavailable_reason) continue;
-				for (const w of rec.windows || []) {
-					if (typeof w.used_percent !== "number" || !Number.isFinite(w.used_percent)) continue;
-					const left = Math.max(0, Math.round(100 - w.used_percent));
-					if (lowest == null || left < lowest) lowest = left;
-				}
-			}
-		}
-	} catch {
-		/* no quota data yet */
-	}
-	return lowest;
-}
+const I18N_DE = {
+	paneTitle: "Kontingent",
+	settingsTitle: "Kontingent · Einstellungen",
+	chipTip: (pct, label, reset) =>
+		`Kontingent · niedrigster Wert ${pct}\u00a0% (${label})${reset ? ` · Reset in ${reset}` : ""}`,
+	providerTip: (label, pct, reset) =>
+		`${label} · ${pct}\u00a0%${reset ? ` · Reset in ${reset}` : ""}`,
+	popoverReset: (reset) => `Reset in ${reset}`,
+	refreshTip: "Kontingent aktualisieren",
+	settingsTip: "Kontingent-Einstellungen",
+	backTip: "Zurück zum Kontingent",
+	loading: "Wird geladen…",
+	error: "Kontingent-Backend nicht verfügbar",
+	empty: "Noch keine Kontingentdaten.",
+	emptyHint: "Kontingentdaten werden automatisch vorbereitet…",
+	unavailable: (reason) => `nicht verfügbar (${reason})`,
+	moreDetails: (n) => `+${n} weitere`,
+	noData: "keine Fensterdaten",
+	noDataSection: (n) => `Keine Daten (${n}) — zum Aufklappen klicken`,
+	reset: (when) => `Reset ${when}`,
+	fetched: (when) => `Geprüft ${when}`,
+	fetchedAge: (age, interval) => `vor ${age} · Abfrage alle ${interval}\u00a0s`,
+	versionSkew: (widget, backend) =>
+		`Widget v${widget} · Backend v${backend} — Desktop-Plugins neu laden (oder die App neu starten), um beide anzugleichen.`,
+	resetFormatLabel: "Reset-Format",
+	relative: "Relativ",
+	absolute: "Absolut",
+	statusbarModeLabel: "Statusleisten-Modus",
+	statusbarModeAll: "Alle Anbieter",
+	statusbarModeWorst: "Nur der niedrigste",
+	paneDetailLabel: "Detailgrad",
+	paneDetailClean: "Schlicht",
+	paneDetailCleanHint: "Nur die Ringe",
+	paneDetailDense: "Ausführlich",
+	paneDetailDenseHint: "Fenster, Resets und Detailzeilen",
+	showStatusBarLabel: "Anzeige in der Statusleiste",
+	showStatusBarHint:
+		"Die Hermes-Statusleiste muss ebenfalls sichtbar sein (⌘K → Toggle status bar).",
+	showDockedPaneLabel: "Angedocktes Kontingent-Panel anzeigen",
+	settingsButton: "Einstellungen",
+	refreshIntervalLabel: "Aktualisierungsintervall",
+	refreshIntervalHint: (seconds, min, max) =>
+		`Liest den Cache alle ${seconds}\u00a0s (${min}–${max}\u00a0s). Aktualisierungen laufen im Hintergrund, der Takt bleibt exakt.`,
+	seconds: "s",
+	disabledProvidersLabel: "Aktive Anbieter",
+	disableTooltip: "Diesen Anbieter deaktivieren",
+	enableTooltip: "Diesen Anbieter aktivieren",
 
-/** Label + icon for the nav row; pure, so tests can pin the format. */
-function navBadge(counts, lowestLeft, t, focusCtxPct = null) {
-	const parts = [];
-	if (counts.approval) parts.push(t("navApproval", counts.approval));
-	if (counts.working) parts.push(t("navWorking", counts.working));
-	else if (counts.yourTurn) parts.push(t("navYourTurn", counts.yourTurn));
-	if (counts.stalled && parts.length < 2) parts.push(t("navStalled", counts.stalled));
-	if (lowestLeft != null && lowestLeft <= NAV_LOW_QUOTA_PCT) parts.push(`⚠ ${lowestLeft}%`);
-	// A nearly full focused chat outranks everything but an approval; the label
-	// then stays at three parts in total ("Quota · 2 active · ctx 92%").
-	const ctxPct = finiteNumber(focusCtxPct);
-	if (ctxPct != null && Math.round(ctxPct) >= CONTEXT_DANGER) {
-		parts.splice(counts.approval ? 1 : 0, 0, t("navContext", Math.round(ctxPct)));
-		parts.splice(2);
-	}
-	return {
-		label: ["Quota", ...parts.slice(0, 3)].join(" · "),
-		codicon: counts.approval ? "bell-dot" : counts.working ? "sync codicon-modifier-spin" : "pulse",
-	};
-}
+	tab_quota: "Kontingent",
+	tab_live: "Live",
+	tab_health: "Zustand",
+	tab_usage: "Nutzung",
+	tab_kanban: "Kanban",
+	tab_accounts: "Konten",
+	accountsTabLabel: "Konten-Tab",
+	accountsTabHint: "Zugangsdaten-Pools, Kontoreihenfolge, Pool-Strategie, Fallbacks und fehlende Anmeldungen. Ausblenden, wenn Sie Konten nie ändern.",
+	accountsExplainer: "Hermes wählt Zugangsdaten aus dem Pool eines Anbieters. Profile ohne eigene Anmeldung teilen den Pool des Standardprofils, seine Reihenfolge gilt also für alle; die Strategie wird pro Profil festgelegt. Änderungen laufen nach Ihrer Bestätigung über die Hermes-CLI.",
+	accountsPoolsTitle: "Zugangsdaten-Pools",
+	accountsPoolsSub: (n) => `${n} ${n === 1 ? "Pool" : "Pools"}`,
+	accountsNoPools: "Noch keine Zugangsdaten im Pool. Melden Sie sich unten an oder führen Sie `hermes auth add <provider>` aus.",
+	accountsSharedPool: (n) => `geteilt · ${n} Profile`,
+	accountsSharedTip: (list) => `Verwendet von: ${list}`,
+	accountsOwnPool: (owner) => `eigener Pool · ${owner}`,
+	accountsCount: (n) => `${n} ${n === 1 ? "Konto" : "Konten"}`,
+	accountsProviderQuota: (label, used) => `Anbieter-Kontingent (aktives Konto): ${label} ${used}\u00a0% genutzt`,
+	accountsListAria: (name) => `${name}-Konten in der Reihenfolge, in der Hermes sie probiert`,
+	accountsRowAria: (n, label) => `${n}. ${label}. Alt+Pfeil hoch / Alt+Pfeil runter zum Verschieben`,
+	accountsRingLabel: (label, left) => `${label}: ${left}\u00a0% übrig`,
+	accountsRingNone: "Kein Kontingentwert für dieses Konto",
+	accountsTriedFirst: "zuerst probiert",
+	accountsTriedFirstTip: "Erstes verfügbares Konto dieser Reihenfolge — fill_first nutzt es, bis es aufgebraucht ist.",
+	accountsTypeOauth: "OAuth",
+	accountsTypeKey: "API-Schlüssel",
+	accountsTypeOther: "andere",
+	accountsSourceTip: "Woher Hermes diese Zugangsdaten hat",
+	accountsStatus_active: "aktiv",
+	accountsStatus_cooldown: "Abkühlung",
+	accountsStatus_exhausted: "aufgebraucht",
+	accountsStatusUntil: (status, left) => `${status} · ${left}`,
+	accountsCooldownModels: (models) => `In Abkühlung: ${models}`,
+	accountsMoveUp: (label) => `${label} nach oben`,
+	accountsMoveDown: (label) => `${label} nach unten`,
+	accountsDragHint: "Zeile ziehen oder ▲▼ / Alt+↑↓ nutzen, um das zuerst probierte Konto zu ändern.",
+	accountsNotWritable: "Dieser Pool lässt sich hier nicht umsortieren (einer Zeile fehlt die Pool-ID).",
+	accountsSingle: "Ein Konto — nichts zu sortieren. Weitere mit `hermes auth add <provider>` hinzufügen.",
+	accountsBlocked_loading: "Kontodaten werden aktualisiert… Änderungen pausieren, bis sie aktuell sind.",
+	accountsBlocked_stale: "Kontodaten sind veraltet — vor Änderungen aktualisieren.",
+	accountsBlocked_busy: "Änderung wird angewendet…",
+	accountsBlocked_confirm: "Bestätigen oder verwerfen Sie zuerst die ausstehende Änderung.",
+	accountsSharedWarning: (owner, others) => `Geteilter Pool von „${owner}“: Umsortieren ändert auch ${others || "kein anderes Profil"}.`,
+	accountsStrategyTitle: "Strategie pro Profil",
+	strategy_fill_first: "Zuerst auffüllen",
+	strategy_round_robin: "Reihum",
+	strategy_least_used: "Am wenigsten genutzt",
+	strategy_random: "Zufällig",
+	strategyShort_fill_first: "Auffüllen",
+	strategyShort_round_robin: "Reihum",
+	strategyShort_least_used: "Wenigste",
+	strategyShort_random: "Zufall",
+	strategyHint_fill_first: "Das erste Konto nutzen, bis es aufgebraucht ist, dann das nächste (Reihenfolge zählt).",
+	strategyHint_round_robin: "Konten gleichmäßig abwechseln (Reihenfolge entscheidet nur bei Gleichstand).",
+	strategyHint_least_used: "Immer das am wenigsten genutzte Konto wählen.",
+	strategyHint_random: "Ein zufälliges Konto wählen.",
+	accountsProfilesTitle: "Profile",
+	accountsProfilesSub: "Pool-Zugriff · Strategie · Modell → Fallbacks",
+	accountsProfileCol: "Profil",
+	accountsChainCol: "Modell → Fallbacks",
+	accountsRootTag: "Root",
+	accountsAccess_own: "eigen",
+	accountsAccess_shared: "geteilt",
+	accountsPrimaryTip: "Hauptmodell",
+	accountsFallbackTip: (n) => `Fallback #${n}`,
+	accountsCustomRoute: "eigener Endpunkt",
+	accountsNoModel: "kein Modell gesetzt",
+	accountsFallbackCopyTip: "Kopieren — Hermes bearbeitet die Fallback-Kette nur in seiner interaktiven Auswahl (oder unter Einstellungen ▸ Modell ▸ Fallbacks für das dort gewählte Profil).",
+	accountsFallbackEdit: "Fallback-Befehl kopieren",
+	accountsFallbackNote: "Die Fallback-Reihenfolge ist hier schreibgeschützt: Hermes kann sie nicht nicht-interaktiv umsortieren. Befehl kopieren und im Terminal ausführen.",
+	accountsSigninTitle: "Nicht angemeldet",
+	accountsSigninSub: (n) => `${n} brauchen Aufmerksamkeit`,
+	accountsAllSignedIn: "Bei jedem Anbieter, den der Kontingent-Cache kennt, sind Sie angemeldet.",
+	accountsOtherUnavailable: (n) => `${n} vorübergehend nicht verfügbar`,
+	accountsMoreSignin: (n) => `${n} weitere ohne Anmeldung`,
+	accountsUsed: "in Gebrauch",
+	accountsUsedTip: "Das Modell oder ein Fallback eines Profils nutzt diesen Anbieter",
+	accountsKind_signin: "nicht angemeldet",
+	accountsKind_reauth: "neu anmelden",
+	accountsKind_optin: "aus",
+	accountsKind_rate_limited: "Ratenlimit",
+	accountsKind_error: "nicht verfügbar",
+	accountsReason_signin: (reason, tool) => tool ? `Keine Anmeldung gefunden (${reason}). Mit ${tool} anmelden.` : `Keine Anmeldung gefunden (${reason}).`,
+	accountsReason_reauth: (reason) => `Die gespeicherte Anmeldung funktioniert nicht mehr (${reason}).`,
+	accountsReason_optin: (reason, tool) => `Im Kontingent-Plugin ausgeschaltet (${reason}). Einschalten, um ${tool || "diesen Anbieter"} zu lesen.`,
+	accountsReason_rate_limited: () => "Der Anbieter drosselt Kontingentabfragen. Keine Anmeldung nötig.",
+	accountsReason_error: (reason) => `Letzte Abfrage fehlgeschlagen (${reason}). Wird bei der nächsten Aktualisierung wiederholt.`,
+	accountsRetryIn: (left) => `erneut in ${left}`,
+	accountsRetrySoon: "erneut bei der nächsten Aktualisierung",
+	accountsSigninAction: "Anmelden",
+	accountsAddKeyAction: "API-Schlüssel hinzufügen",
+	accountsReason_key: (reason) => `Kein API-Schlüssel gefunden (${reason}).`,
+	accountsReauthAction: "Neu anmelden",
+	accountsOptinAction: "Einschalten",
+	accountsCopyTip: "Diesen Befehl kopieren und im Terminal ausführen (Anmeldungen öffnen einen Browser und laufen daher nicht von hier)",
+	accountsLimits: "Hermes kennt keine Kontozuweisung pro Profil: Ein Profil nutzt den geteilten Pool, sofern es keine eigene Anmeldung hat (`hermes -p <profile> auth add <provider>`). Die Reihenfolge gehört zum Pool, die Strategie zum Profil. Hier werden keine Zugangsdaten zwischen Profilen verschoben oder kopiert.",
+	accountsConfirmOrderTitle: (name) => `Kontoreihenfolge von ${name} ändern?`,
+	accountsConfirmOrderShared: (owner, n) => `Dies ist der geteilte Pool von „${owner}“. Die neue Reihenfolge gilt für alle ${n} Profile, die ihn nutzen.`,
+	accountsConfirmOrderOwn: (owner) => `Nur „${owner}“ nutzt diesen Pool.`,
+	accountsConfirmBefore: "Jetzt",
+	accountsConfirmAfter: "Danach",
+	accountsConfirmFirst: (label) => `Mit fill_first zuerst probiert: ${label}.`,
+	accountsConfirmProfiles: (list) => `Betrifft: ${list}`,
+	accountsConfirmStrategyTitle: (profile, name) => `${name}-Strategie von ${profile} ändern?`,
+	accountsConfirmStrategyDesc: (profile) => `Nur „${profile}“ ändert sich; andere Profile behalten ihre Strategie.`,
+	accountsConfirmApply: "Anwenden",
+	accountsConfirmBusy: "Wird angewendet…",
+	accountsConfirmCancel: "Abbrechen",
+	accountsSavedOrder: (name) => `Kontoreihenfolge von ${name} gespeichert`,
+	accountsSavedStrategy: (profile, s) => `${profile}: Strategie auf ${s} gesetzt`,
+	accountsWriteUnsupported: "Das Kontingent-Plugin des Gateways ist älter und kann Konten noch nicht ändern — bitte aktualisieren.",
+	accountsUnsupported: "Das Kontingent-Plugin dieses Gateways ist älter als die Kontenansicht — Backend aktualisieren.",
+	accountsError: "Kontodaten konnten nicht gelesen werden.",
+	monitorOff: "Der Agent-Monitor ist aus — in den Einstellungen einschalten.",
+	monitorUnsupported:
+		"Das Kontingent-Plugin dieses Gateways hat noch keinen Agent-Monitor — aktualisieren (./install.sh), um Live-Sessions, Zustand, Nutzung und Kanban zu sehen.",
+	monitorError: "Agent-Monitor gerade nicht verfügbar.",
+	sectionError: (section) => `${section}-Daten konnten diesmal nicht gelesen werden.`,
+	monitorUpdated: (when, interval) => `Aktualisiert ${when} · Abfrage alle ${interval}\u00a0s`,
+	state_working: "arbeitet",
+	state_waiting: "Sie sind dran",
+	state_needs_approval: "braucht Genehmigung",
+	state_stalled: "hängt?",
+	state_long_tool: "langer Tool-Aufruf",
+	state_ended: "beendet",
+	untitled: "(Session ohne Titel)",
+	subagent: "Subagent",
+	agent: "Agent",
+	cliSource: "CLI",
+	tokensN: (n) => `${n} Tokens`,
+	contextN: (n) => `Kontext ${n}`,
+	ago: (span) => `vor ${span}`,
+	longToolCall: (tool) => `langer Tool-Aufruf läuft: ${tool}`,
+	openSessionTip: "Diese Session öffnen",
+	copyCommandTip: (command) => `Kopieren: ${command}`,
+	commandCopied: (command) => `Kopiert: ${command}`,
+	commandCopyFailed: (command) => `Kopieren fehlgeschlagen — ausführen: ${command}`,
+	last1m: "Letzte Minute",
+	last60m: "Letzte 60 Min.",
+	tokensPerMin: "Tokens / Min.",
+	costPerMin: (cost) => `≈ ${cost} / Min.`,
+	cost60m: (cost) => `≈ ${cost} in 60 Min.`,
+	openSessions: "Offene Sessions",
+	countWorking: (n) => `${n} arbeiten`,
+	countApproval: (n) => `${n} warten auf Genehmigung`,
+	countYourTurn: (n) => `${n} warten auf Sie`,
+	countStalled: (n) => `${n} hängen?`,
+	tokensChart: "Tokens / Minute",
+	attentionTitle: (n) => `Braucht Aufmerksamkeit (${n})`,
+	noOpenSessions: "Keine offenen Sessions.",
+	attention_approval: (who) => `${who} braucht eine Genehmigung`,
+	attention_your_turn: (who) => `${who} ist fertig — Sie sind dran`,
+	attention_stalled: (who) => `${who} hängt möglicherweise`,
+	attention_loop: (who) => `${who}: mögliche Schleife`,
+	attention_big_context: (who) => `${who}: großer Kontext`,
+	healthAccounts: "Konten",
+	healthModels: "Modelle",
+	healthChains: "Fallback-Ketten",
+	healthSpeed: "Modellgeschwindigkeit",
+	notSetUp: (n, names) => `Hier nicht eingerichtet (${n}): ${names}`,
+	last24h: "letzte 24 Std.",
+	none: "Nichts anzuzeigen.",
+	credentialN: (n) => `Zugangsdaten ${n}`,
+	credLocked: "Limit erreicht",
+	unlocksIn: (span) => ` — frei in ${span}`,
+	modelStatus_ok: "ok",
+	modelStatus_idle: "inaktiv",
+	modelStatus_degraded: "beeinträchtigt",
+	modelStatus_failing: "fehlerhaft",
+	modelStatus_account_exhausted: "Kontolimit",
+	callsN: (n) => `${n} Aufrufe`,
+	errorRate: (pct) => `${pct}\u00a0% Fehler`,
+	errorsN: (n) => `${n} Fehler`,
+	cooldownFor: (span) => `Abkühlung ${span}`,
+	recovered: "erholt",
+	chainOk: "nutzbar",
+	chainSkip: (reason) => `übersprungen: ${reason}`,
+	chainRisky: (pct) => `riskant (${pct}\u00a0% Fehler)`,
+	skip_same_backend: "gleiches Backend wie das Hauptmodell",
+	skip_no_credentials: "keine Zugangsdaten",
+	skip_locked: "alle Zugangsdaten gesperrt",
+	skip_cooldown: "in Abkühlung",
+	skip_undefined: "unbekannt",
+	noFallbacks: "keine Fallbacks konfiguriert",
+	speedLine: (p50, p90, turns) => `Median ${p50} · p90 ${p90} · ${turns} Runden`,
+	costToday: "Heute",
+	costMonth: "Dieser Monat",
+	projection: (cost) => `Monatsende ≈ ${cost}`,
+	projectionOver: (cost) => `Monatsende ≈ ${cost} — über Budget`,
+	budgetTitle: "Budget",
+	budgetDaily: "Täglich",
+	budgetMonthly: "Monatlich",
+	budgetHint: "Legen Sie in den Einstellungen ein Tages- oder Monatsbudget fest, um die Ausgaben daran zu messen.",
+	budgetOff: "aus",
+	budgetSettingsHint: "USD; leer oder 0 = aus. Kosten sind Schätzungen nach API-Preisen.",
+	last7Days: "Letzte 7 Tage",
+	topModels: "Top-Modelle · Monat",
+	topProfiles: "Top-Profile · Monat",
+	topSessions: "Top-Sessions · 7 Tage",
+	sessionsN: (n) => `${n} ${n === 1 ? "Session" : "Sessions"}`,
+	costEstimateNote: "Kosten sind Schätzungen nach API-Preisen; ein Abo wird nicht pro Token abgerechnet.",
+	board: "Board",
+	noBoards: "Keine Kanban-Boards.",
+	kanbanQuiet: "Nichts läuft, ist blockiert, in Prüfung oder schlägt fehl.",
+	kanbanGroup_running: "Läuft",
+	kanbanGroup_blocked: "Blockiert",
+	kanbanGroup_review: "Prüfung",
+	kanbanGroup_failing: "Fehlerhaft",
+	kanban_todo: "offen",
+	kanban_triage: "Triage",
+	kanban_ready: "bereit",
+	kanban_running: "läuft",
+	kanban_blocked: "blockiert",
+	kanban_review: "Prüfung",
+	kanban_done: "erledigt",
+	kanban_archived: "archiviert",
+	unassigned: "nicht zugewiesen",
+	failuresN: (n) => `${n}× fehlgeschlagen`,
+	cardWhat_input: "braucht Ihre Eingabe",
+	cardWhat_blocked: "blockiert",
+	cardWhat_review: "wartet auf Prüfung",
+	cardWhat_failing: "schlägt fehl",
+	burnRate: (rate) => `${rate}\u00a0%/Std.`,
+	burnFlat: "keine Änderung in den letzten 2 Std.",
+	fillsIn: (span) => `voll in ~${span}`,
+	beforeReset: (span) => `${span} vor dem Reset`,
+	noFillBeforeReset: "wird vor dem Reset nicht voll",
+	accountHint: (full, used, room) => `${full} liegt bei ${used}\u00a0% · ${room} hat Luft`,
+	accountHintBody: (window, left, room) => `${window}: ${left}\u00a0% übrig bei ${room}`,
+	chipWorking: (n) => `${n} arbeiten`,
+	chipYourTurn: (n) => `${n} warten auf Sie`,
+	chipApproval: (n) => `${n} Genehmigung`,
+	chipOpenLive: "Klicken, um Live zu öffnen",
+	// ---- status bar chips + cards ----
+	chipOpenList: "Klicken für die Session-Liste",
+	chipQuotaOpen: "Klicken für die Kontingent-Karte (mit Link zum Kontingent-Panel)",
+	chipCostOpen: "Klicken für Ausgabendetails",
+	chipFullIn: (span) => `voll ~${span}`,
+	cardOpenLive: "Live öffnen",
+	cardOpenQuota: "Kontingent öffnen",
+	cardOpenUsage: "Nutzung öffnen",
+	cardOpen: "öffnen",
+	cardCopy: "kopieren",
+	tokensPerMinN: (n) => `${n} Tokens/Min.`,
+	quotaCardTitle: "Kontingentfenster",
+	checkedAgo: (age) => `geprüft vor ${age}`,
+	costCardTitle: "Ausgaben",
+	monthEnd: "Monatsende",
+	topModelsToday: "Top-Modelle · heute",
+	costChipAria: (cost) => `heute ${cost} ausgegeben`,
+	costOfDaily: (pct) => `${pct}\u00a0% des Tagesbudgets`,
+	costOfMonthly: (pct) => `${pct}\u00a0% des Monatsbudgets`,
+	quotaAlertsLabel: "Reset-Countdown und Zeit bis voll im Kontingent-Chip",
+	quotaAlertsHint: (pct) => `Nur wenn ein Fenster zu ${pct}\u00a0%+ genutzt ist oder die Prognose es vor dem Reset füllt.`,
+	chipSparkLabel: "Tokens-pro-Minute-Verlauf im Agenten-Chip",
+	chipFlashLabel: "Agenten-Chip blinken lassen, wenn eine Session Sie braucht",
+	chipFlashHint: "Einmal pro Session, die neu auf Sie oder eine Genehmigung wartet. Folgt „Bewegung reduzieren“.",
+	costChipLabel: "Chip „Ausgaben heute“",
+	costChipHint: "Eingefärbt nach Ihrem Budget (80\u00a0% Warnung, 100\u00a0% überschritten). Standard: an, sobald ein Budget gesetzt ist.",
+	notifyQuotaTitle: (pct) => `Kontingent bei ${pct}\u00a0%`,
+	notifyResetsIn: (span) => ` — Reset in ${span}`,
+	notifySoonTitle: "Kontingent bald aufgebraucht",
+	notifySoonBody: (span) => `bei diesem Tempo voll in ~${span}, vor dem Reset`,
+	notifyBudgetTitle: (label, pct) => `${label} Budget bei ${pct}\u00a0%`,
+	notifyCardTitle: (what) => `Kanban: Karte ${what}`,
+	notifyModelTitle: (status, model) => `Modell ${status}: ${model}`,
+	notifyLockedTitle: (provider) => `Kontolimit erreicht: ${provider}`,
+	monitorSettingsTitle: "Agent-Monitor",
+	monitorEnabledLabel: "Agent-Monitor",
+	monitorEnabledHint: "Live-Sessions, Zustand, Nutzung und Kanban — ein zusätzlicher CLI-Aufruf pro Aktualisierungsintervall.",
+	agentsChipLabel: "Chip „arbeitet / Sie sind dran“ in der Statusleiste",
+	quotaForecastLabel: "Verbrauchsrate, Prognose und Verlauf in der Kontingentansicht",
+	quotaForecastHint: "Der Verlauf wird alle paar Minuten gelesen, nur solange die Kontingentansicht offen ist.",
+	historyRangeLabel: "Verlaufszeitraum",
+	liveIntervalLabel: "Live-Aktualisierung",
+	navBadgeLabel: "Live-Zahlen in der Seitenleiste",
+	navBadgeHint: "Zeigt arbeitende Agenten, Genehmigungen, ein knappes Kontingent und einen fast vollen Chat-Kontext neben dem Menüeintrag „Kontingent“.",
+	navWorking: (n) => `${n} aktiv`,
+	navYourTurn: (n) => `${n} warten`,
+	navApproval: (n) => `${n} Genehmigung`,
+	navStalled: (n) => `${n} hängt`,
+	historyDay: "24 Std.",
+	historyWeek: "7 Tage",
+	notificationsTitle: "Benachrichtigungen",
+	notificationsHint: "Systembenachrichtigungen erscheinen nur, wenn Sie nicht in Hermes sind — jedes Ereignis einmal.",
+	notify_quota: "Kontingent 80\u00a0% / 95\u00a0%, bald voll, Kontohinweise",
+	notify_budget: "Budget 80\u00a0% / 100\u00a0%",
+	notify_kanban: "Kanban-Karten blockiert, in Prüfung oder fehlerhaft",
+	notify_health: "Fehlerhafte Modelle und gesperrte Konten",
+	notify_agents: "Agenten, die Genehmigung brauchen, hängen, in einer Schleife sind oder großen Kontext haben",
+	notify_turns: "Agent fertig — Sie sind dran",
+	// ---- Agent Bar layout ----
+	left: "übrig",
+	historyCaption: "Verlauf genutzt %",
+	summaryLowest: (pct) => `niedrigster Wert ${pct}\u00a0% übrig`,
+	summaryToday: (cost) => `${cost} heute`,
+	messagesChart: "Nachrichten / Minute",
+	dailyChart: "Tageskosten",
+	dailyAvg: (cost) => `≈ ${cost} / Tag`,
+	budgetSub: "geschätzte API-Kosten",
+	settingsGroupStatusBar: "Statusleiste & Seitenleiste",
+	settingsGroupQuota: "Kontingentansicht",
+	subagentsN: (n) => (n === 1 ? "1 Subagent läuft" : `${n} Subagenten laufen`),
+	// ---- context guard ----
+	ctxChipOthers: (n, w) => `${n} ${n === 1 ? "Session" : "Sessions"} ≥ ${w}\u00a0%`,
+	ctxChipAria: (pct) => `Kontext zu ${pct}\u00a0% voll`,
+	ctxTipFocused: (pct, used, max) => `Dieser Chat: Kontext zu ${pct}\u00a0% voll (${used} / ${max})`,
+	ctxTipOthers: (n, w) => `${n} weitere offene ${n === 1 ? "Session" : "Sessions"} ≥ ${w}\u00a0%`,
+	ctxTipOpen: "Klicken für Details und /compress",
+	ctxCardTitle: "Kontext",
+	ctxWarnSub: (w) => `Warnung ab ${w}\u00a0%`,
+	ctxFocused: "Dieser Chat",
+	ctxTokensOf: (used, max) => `${used} / ${max} Tokens`,
+	ctxEstimated: "geschätzt",
+	ctxCompressions: (n) => (n ? `bisher ${n}× komprimiert` : "noch nicht komprimiert"),
+	ctxCompress: "Komprimieren…",
+	ctxCompressNow: "Komprimieren",
+	ctxCancel: "Abbrechen",
+	ctxConfirm: "Fasst ältere Runden zusammen, um Kontext freizugeben — wie /compress in diesem Chat.",
+	ctxTopicPlaceholder: "Schwerpunkt (optional)",
+	ctxBusy: "Warten Sie, bis die laufende Runde fertig ist.",
+	ctxNoSession: "Öffnen Sie einen Chat, um ihn zu komprimieren.",
+	ctxNoUsage: "Noch kein Kontextwert für diesen Chat.",
+	ctxOthersTitle: (w) => `Andere Sessions ≥ ${w}\u00a0%`,
+	ctxNothing: (w) => `Keine offene Session liegt bei ${w}\u00a0% oder mehr.`,
+	ctxCompressSent: "Kontext dieses Chats wird komprimiert…",
+	ctxCompressFailed: "Eingabefeld dieses Chats nicht erreichbar — Chat öffnen und erneut versuchen.",
+	ctxRowTip: (used, max) => `Kontext ${used} / ${max}`,
+	contextOfN: (used, max) => `Kontext ${used}/${max}`,
+	contextChipLabel: "Kontextwarnung als Chip in der Statusleiste",
+	contextChipHint: "Nur solange der Kontext eines Chats die Schwelle erreicht — die Kernleiste zeigt die Nutzung des fokussierten Chats bereits.",
+	contextWarnLabel: "Kontextwarnung ab",
+	contextWarnHint: (d) => `Chip, Live-Ansicht und Benachrichtigungen; ab ${d}\u00a0% rot.`,
+	notify_context: "Kontextfenster füllt sich (Schwelle / 90\u00a0%)",
+	notifyContextTitle: (pct) => `Kontext zu ${pct}\u00a0% voll`,
+	notifyContextBody: "komprimieren (/compress) oder einen neuen Chat beginnen",
+	navContext: (pct) => `Kontext ${pct}\u00a0%`,
+	// ---- locale-aware formatting + status-bar tooltips ----
+	_locale: "de",
+	navLabel: "Kontingent",
+	resetToday: (time) => `heute ${time}`,
+	resetTomorrow: (time) => `morgen ${time}`,
+	resetting: "Reset läuft…",
+	spanDH: (d, h) => `${d}\u00a0T. ${h}\u00a0Std.`,
+	spanHM: (h, m) => `${h}\u00a0Std. ${m}\u00a0Min.`,
+	spanM: (m) => `${m}\u00a0Min.`,
+	spanH: (h) => `${h}\u00a0Std.`,
+	spanS: (s) => `${s}\u00a0s`,
+	spanLt1m: "<1\u00a0Min.",
+	updateAvailable: "⬆ Update verfügbar — mit ./install.sh installieren",
+	accountN: (n) => `Konto ${n}`,
+	valueUnknown: "unbekannt",
+	valueLeft: (v) => `${v} übrig`,
+	stale: "veraltet",
+	valueUnavailable: "nicht verfügbar",
+	valueAvailable: "verfügbar",
+	quotaBreakdown: "Kontingent im Detail:",
+	providerUnavailable: (name) => `${name}: nicht verfügbar`,
+	providerUnavailableReason: (name, reason) => `${name}: nicht verfügbar (${reason})`,
+	accountBalance: "Kontostand",
+	accountBalanceLine: (v) => `Kontostand: ${v}`,
+	apiCallsAvailable: (ok) => `API-Aufrufe möglich: ${ok ? "ja" : "nein"}`,
+	planLine: (plan) => `Tarif: ${plan}`,
+	windowFallback: "Fenster",
+	resetsAt: (when) => `Reset ${when}`,
+	seriesTotal: "gesamt",
+};
 
-function navFocusContextPct() {
-	const f = focusedContext(readHostState("focusedUsage", null));
-	return f ? f.pct : null;
-}
+const I18N_ES = {
+	paneTitle: "Cuota",
+	settingsTitle: "Cuota · Ajustes",
+	chipTip: (pct, label, reset) =>
+		`Cuota · mínimo ${pct}\u00a0% (${label})${reset ? ` · se restablece en ${reset}` : ""}`,
+	providerTip: (label, pct, reset) =>
+		`${label} · ${pct}\u00a0%${reset ? ` · se restablece en ${reset}` : ""}`,
+	popoverReset: (reset) => `se restablece en ${reset}`,
+	refreshTip: "Actualizar cuota",
+	settingsTip: "Ajustes de cuota",
+	backTip: "Volver a la cuota",
+	loading: "Cargando…",
+	error: "Backend de cuota no disponible",
+	empty: "Aún no hay datos de cuota.",
+	emptyHint: "Los datos de cuota se están preparando automáticamente…",
+	unavailable: (reason) => `no disponible (${reason})`,
+	moreDetails: (n) => `+${n} más`,
+	noData: "sin datos de ventana",
+	noDataSection: (n) => `Sin datos (${n}) — haz clic para desplegar`,
+	reset: (when) => `restablece ${when}`,
+	fetched: (when) => `Consultado ${when}`,
+	fetchedAge: (age, interval) => `hace ${age} · cada ${interval}\u00a0s`,
+	versionSkew: (widget, backend) =>
+		`Widget v${widget} · backend v${backend} — recarga los plugins de escritorio (o reinicia la app) para igualarlos.`,
+	resetFormatLabel: "Formato del restablecimiento",
+	relative: "Relativo",
+	absolute: "Absoluto",
+	statusbarModeLabel: "Modo de la barra de estado",
+	statusbarModeAll: "Todos los proveedores",
+	statusbarModeWorst: "Solo el peor",
+	paneDetailLabel: "Detalle del panel",
+	paneDetailClean: "Limpio",
+	paneDetailCleanHint: "Solo los anillos",
+	paneDetailDense: "Denso",
+	paneDetailDenseHint: "Ventanas, restablecimientos y líneas de detalle",
+	showStatusBarLabel: "Mostrar indicador en la barra de estado",
+	showStatusBarHint:
+		"La barra de estado de Hermes también debe estar visible (⌘K → Toggle status bar).",
+	showDockedPaneLabel: "Mostrar panel de cuota acoplado",
+	settingsButton: "Ajustes",
+	refreshIntervalLabel: "Intervalo de actualización",
+	refreshIntervalHint: (seconds, min, max) =>
+		`Lee la caché cada ${seconds}\u00a0s (${min}–${max}\u00a0s). Las actualizaciones corren en segundo plano, así que el ritmo es exacto.`,
+	seconds: "s",
+	disabledProvidersLabel: "Proveedores activos",
+	disableTooltip: "Desactivar este proveedor",
+	enableTooltip: "Activar este proveedor",
 
-function startNavBadge(ctx) {
-	let last = "";
-	const update = () => {
-		const t = (key, ...args) => ctx.i18n.t(key, ...args);
-		const next = navBadgeAtom.get()
-			? navBadge(navCounts(), navLowestQuota(), t, navFocusContextPct())
-			: { label: "Quota", codicon: "pulse" };
-		const sig = `${next.label}|${next.codicon}`;
-		if (sig === last) return;
-		last = sig;
-		ctx.register({
-			id: "nav",
-			area: SIDEBAR_NAV_AREA,
-			order: 80,
-			data: { codicon: next.codicon, label: next.label, path: "/quota" },
-		});
-	};
-	update();
-	let pending = null;
-	const schedule = () => {
-		if (pending) return;
-		pending = setTimeout(() => {
-			pending = null;
-			update();
-		}, 250);
-	};
-	const offs = [];
-	try {
-		offs.push(host.state.busyBySession.listen(schedule));
-	} catch {
-		/* older host */
-	}
-	for (const name of ["focusedUsage", "focusedStoredSessionId"]) {
-		try {
-			const a = host.state[name];
-			if (a && typeof a.listen === "function") offs.push(a.listen(schedule));
-		} catch {
-			/* older host */
-		}
-	}
-	try {
-		offs.push(navBadgeAtom.listen(schedule));
-	} catch {
-		/* noop */
-	}
-	try {
-		offs.push(
-			queryClient.getQueryCache().subscribe((event) => {
-				const key = event && event.query && event.query.queryKey;
-				if (Array.isArray(key) && key[0] === "quota") schedule();
-			}),
-		);
-	} catch {
-		/* noop */
-	}
-	if (typeof ctx.onDispose !== "function") return;
-	ctx.onDispose(() => {
-		if (pending) clearTimeout(pending);
-		for (const off of offs) {
-			try {
-				off();
-			} catch {
-				/* noop */
-			}
-		}
-	});
-}
+	tab_quota: "Cuota",
+	tab_live: "En vivo",
+	tab_health: "Estado",
+	tab_usage: "Uso",
+	tab_kanban: "Kanban",
+	tab_accounts: "Cuentas",
+	accountsTabLabel: "Pestaña Cuentas",
+	accountsTabHint: "Pools de credenciales, orden de cuentas, estrategia del pool, respaldos y accesos pendientes. Ocúltala si nunca cambias de cuenta.",
+	accountsExplainer: "Hermes elige una credencial del pool de un proveedor. Los perfiles sin inicio de sesión propio comparten el pool del perfil predeterminado, así que su orden se aplica a todos; la estrategia es por perfil. Los cambios se hacen con la CLI de Hermes cuando confirmas.",
+	accountsPoolsTitle: "Pools de credenciales",
+	accountsPoolsSub: (n) => `${n} ${n === 1 ? "pool" : "pools"}`,
+	accountsNoPools: "Aún no hay credenciales en el pool. Inicia sesión abajo o ejecuta `hermes auth add <provider>`.",
+	accountsSharedPool: (n) => `compartido · ${n} perfiles`,
+	accountsSharedTip: (list) => `Lo usan: ${list}`,
+	accountsOwnPool: (owner) => `pool propio · ${owner}`,
+	accountsCount: (n) => `${n} ${n === 1 ? "cuenta" : "cuentas"}`,
+	accountsProviderQuota: (label, used) => `Cuota del proveedor (cuenta en uso): ${label} ${used}\u00a0% usado`,
+	accountsListAria: (name) => `Cuentas de ${name}, en el orden en que Hermes las prueba`,
+	accountsRowAria: (n, label) => `${n}. ${label}. Alt+Arriba / Alt+Abajo para mover`,
+	accountsRingLabel: (label, left) => `${label}: queda ${left}\u00a0%`,
+	accountsRingNone: "Sin lectura de cuota para esta cuenta",
+	accountsTriedFirst: "se prueba primero",
+	accountsTriedFirstTip: "Primera cuenta disponible en este orden — fill_first la usa hasta que se agota.",
+	accountsTypeOauth: "OAuth",
+	accountsTypeKey: "Clave de API",
+	accountsTypeOther: "otra",
+	accountsSourceTip: "De dónde obtuvo Hermes esta credencial",
+	accountsStatus_active: "activa",
+	accountsStatus_cooldown: "en enfriamiento",
+	accountsStatus_exhausted: "agotada",
+	accountsStatusUntil: (status, left) => `${status} · ${left}`,
+	accountsCooldownModels: (models) => `En enfriamiento: ${models}`,
+	accountsMoveUp: (label) => `Subir ${label}`,
+	accountsMoveDown: (label) => `Bajar ${label}`,
+	accountsDragHint: "Arrastra una fila, o usa ▲▼ / Alt+↑↓, para cambiar qué cuenta se prueba primero.",
+	accountsNotWritable: "Este pool no se puede reordenar desde aquí (a una fila le falta el id del pool).",
+	accountsSingle: "Una sola cuenta — nada que ordenar. Añade otra con `hermes auth add <provider>`.",
+	accountsBlocked_loading: "Actualizando datos de cuentas… los cambios esperan a que estén al día.",
+	accountsBlocked_stale: "Los datos de cuentas están desactualizados — actualiza antes de cambiar nada.",
+	accountsBlocked_busy: "Aplicando un cambio…",
+	accountsBlocked_confirm: "Confirma o cancela primero el cambio pendiente.",
+	accountsSharedWarning: (owner, others) => `Pool compartido de «${owner}»: reordenar también cambia ${others || "ningún otro perfil"}.`,
+	accountsStrategyTitle: "Estrategia por perfil",
+	strategy_fill_first: "Llenar primero",
+	strategy_round_robin: "Rotación",
+	strategy_least_used: "Menos usada",
+	strategy_random: "Aleatoria",
+	strategyShort_fill_first: "Llenar",
+	strategyShort_round_robin: "Rotar",
+	strategyShort_least_used: "Menos",
+	strategyShort_random: "Azar",
+	strategyHint_fill_first: "Usa la primera cuenta hasta agotarla y luego la siguiente (el orden importa).",
+	strategyHint_round_robin: "Alterna las cuentas por igual (el orden solo desempata).",
+	strategyHint_least_used: "Elige siempre la cuenta menos usada.",
+	strategyHint_random: "Elige una cuenta al azar.",
+	accountsProfilesTitle: "Perfiles",
+	accountsProfilesSub: "acceso al pool · estrategia · modelo → respaldos",
+	accountsProfileCol: "Perfil",
+	accountsChainCol: "Modelo → respaldos",
+	accountsRootTag: "raíz",
+	accountsAccess_own: "propio",
+	accountsAccess_shared: "compartido",
+	accountsPrimaryTip: "Modelo principal",
+	accountsFallbackTip: (n) => `Respaldo n.º ${n}`,
+	accountsCustomRoute: "endpoint personalizado",
+	accountsNoModel: "sin modelo",
+	accountsFallbackCopyTip: "Copiar — Hermes solo edita la cadena de respaldo en su selector interactivo (o en Ajustes ▸ Modelo ▸ Respaldos para el perfil elegido allí).",
+	accountsFallbackEdit: "Copiar comando de respaldo",
+	accountsFallbackNote: "El orden de respaldo es de solo lectura aquí: Hermes no puede reordenarlo de forma no interactiva. Copia el comando y ejecútalo en una terminal.",
+	accountsSigninTitle: "Sin iniciar sesión",
+	accountsSigninSub: (n) => `${n} requieren atención`,
+	accountsAllSignedIn: "Has iniciado sesión en todos los proveedores que conoce la caché de cuota.",
+	accountsOtherUnavailable: (n) => `${n} no disponibles temporalmente`,
+	accountsMoreSignin: (n) => `${n} más sin inicio de sesión`,
+	accountsUsed: "en uso",
+	accountsUsedTip: "El modelo o un respaldo de algún perfil usa este proveedor",
+	accountsKind_signin: "sin sesión",
+	accountsKind_reauth: "vuelve a iniciar sesión",
+	accountsKind_optin: "desactivado",
+	accountsKind_rate_limited: "límite de velocidad",
+	accountsKind_error: "no disponible",
+	accountsReason_signin: (reason, tool) => tool ? `No se encontró inicio de sesión (${reason}). Inicia sesión con ${tool}.` : `No se encontró inicio de sesión (${reason}).`,
+	accountsReason_reauth: (reason) => `El inicio de sesión guardado ya no funciona (${reason}).`,
+	accountsReason_optin: (reason, tool) => `Desactivado en el plugin de cuota (${reason}). Actívalo para leer ${tool || "este proveedor"}.`,
+	accountsReason_rate_limited: () => "El proveedor limita las lecturas de cuota. No hace falta iniciar sesión.",
+	accountsReason_error: (reason) => `Falló la última lectura (${reason}). Se reintenta en la próxima actualización.`,
+	accountsRetryIn: (left) => `reintento en ${left}`,
+	accountsRetrySoon: "reintento en la próxima actualización",
+	accountsSigninAction: "Iniciar sesión",
+	accountsAddKeyAction: "Añadir clave de API",
+	accountsReason_key: (reason) => `No se encontró clave de API (${reason}).`,
+	accountsReauthAction: "Volver a iniciar sesión",
+	accountsOptinAction: "Activar",
+	accountsCopyTip: "Copia este comando y ejecútalo en una terminal (los inicios de sesión abren un navegador, así que no se pueden ejecutar desde aquí)",
+	accountsLimits: "Hermes no asigna cuentas por perfil: un perfil usa el pool compartido salvo que tenga su propio inicio de sesión (`hermes -p <profile> auth add <provider>`). El orden pertenece al pool y la estrategia al perfil. Aquí no se mueven ni se copian credenciales entre perfiles.",
+	accountsConfirmOrderTitle: (name) => `¿Cambiar el orden de cuentas de ${name}?`,
+	accountsConfirmOrderShared: (owner, n) => `Es el pool compartido de «${owner}». El nuevo orden se aplica a los ${n} perfiles que lo usan.`,
+	accountsConfirmOrderOwn: (owner) => `Solo «${owner}» usa este pool.`,
+	accountsConfirmBefore: "Ahora",
+	accountsConfirmAfter: "Después",
+	accountsConfirmFirst: (label) => `Con fill_first se prueba primero: ${label}.`,
+	accountsConfirmProfiles: (list) => `Afecta a: ${list}`,
+	accountsConfirmStrategyTitle: (profile, name) => `¿Cambiar la estrategia de ${name} de ${profile}?`,
+	accountsConfirmStrategyDesc: (profile) => `Solo cambia «${profile}»; los demás perfiles conservan su estrategia.`,
+	accountsConfirmApply: "Aplicar",
+	accountsConfirmBusy: "Aplicando…",
+	accountsConfirmCancel: "Cancelar",
+	accountsSavedOrder: (name) => `Orden de cuentas de ${name} guardado`,
+	accountsSavedStrategy: (profile, s) => `${profile}: estrategia cambiada a ${s}`,
+	accountsWriteUnsupported: "El plugin de cuota del gateway es antiguo y aún no puede cambiar cuentas — actualízalo.",
+	accountsUnsupported: "El plugin de cuota de este gateway es anterior a la vista de Cuentas — actualiza el backend.",
+	accountsError: "No se pudieron leer los datos de cuentas.",
+	monitorOff: "El monitor de agentes está apagado — actívalo en Ajustes.",
+	monitorUnsupported:
+		"El plugin de cuota de este gateway aún no tiene monitor de agentes — actualízalo (./install.sh) para ver sesiones en vivo, estado, uso y kanban.",
+	monitorError: "Monitor de agentes no disponible ahora mismo.",
+	sectionError: (section) => `Esta vez no se pudieron leer los datos de ${section}.`,
+	monitorUpdated: (when, interval) => `Actualizado ${when} · cada ${interval}\u00a0s`,
+	state_working: "trabajando",
+	state_waiting: "tu turno",
+	state_needs_approval: "necesita aprobación",
+	state_stalled: "¿atascado?",
+	state_long_tool: "llamada de herramienta larga",
+	state_ended: "terminada",
+	untitled: "(sesión sin título)",
+	subagent: "subagente",
+	agent: "Agente",
+	cliSource: "CLI",
+	tokensN: (n) => `${n} tokens`,
+	contextN: (n) => `ctx ${n}`,
+	ago: (span) => `hace ${span}`,
+	longToolCall: (tool) => `llamada de herramienta larga en curso: ${tool}`,
+	openSessionTip: "Abrir esta sesión",
+	copyCommandTip: (command) => `Copiar: ${command}`,
+	commandCopied: (command) => `Copiado: ${command}`,
+	commandCopyFailed: (command) => `No se pudo copiar — ejecuta: ${command}`,
+	last1m: "Último minuto",
+	last60m: "Últimos 60 min",
+	tokensPerMin: "tokens / min",
+	costPerMin: (cost) => `≈ ${cost} / min`,
+	cost60m: (cost) => `≈ ${cost} en 60 min`,
+	openSessions: "Sesiones abiertas",
+	countWorking: (n) => `${n} trabajando`,
+	countApproval: (n) => `${n} esperan aprobación`,
+	countYourTurn: (n) => `${n} tu turno`,
+	countStalled: (n) => `${n} ¿atascadas?`,
+	tokensChart: "Tokens / minuto",
+	attentionTitle: (n) => `Requiere atención (${n})`,
+	noOpenSessions: "No hay sesiones abiertas.",
+	attention_approval: (who) => `${who} necesita aprobación`,
+	attention_your_turn: (who) => `${who} terminó — tu turno`,
+	attention_stalled: (who) => `${who} puede estar atascado`,
+	attention_loop: (who) => `${who}: posible bucle`,
+	attention_big_context: (who) => `${who}: contexto grande`,
+	healthAccounts: "Cuentas",
+	healthModels: "Modelos",
+	healthChains: "Cadenas de respaldo",
+	healthSpeed: "Velocidad de modelos",
+	notSetUp: (n, names) => `No configurados aquí (${n}): ${names}`,
+	last24h: "últimas 24 h",
+	none: "Nada que mostrar.",
+	credentialN: (n) => `credencial ${n}`,
+	credLocked: "límite alcanzado",
+	unlocksIn: (span) => ` — se libera en ${span}`,
+	modelStatus_ok: "ok",
+	modelStatus_idle: "inactivo",
+	modelStatus_degraded: "degradado",
+	modelStatus_failing: "fallando",
+	modelStatus_account_exhausted: "límite de cuenta",
+	callsN: (n) => `${n} ${n === 1 ? "llamada" : "llamadas"}`,
+	errorRate: (pct) => `${pct}\u00a0% errores`,
+	errorsN: (n) => `${n} ${n === 1 ? "error" : "errores"}`,
+	cooldownFor: (span) => `enfriamiento ${span}`,
+	recovered: "recuperado",
+	chainOk: "utilizable",
+	chainSkip: (reason) => `omitido: ${reason}`,
+	chainRisky: (pct) => `arriesgado (${pct}\u00a0% errores)`,
+	skip_same_backend: "mismo backend que el principal",
+	skip_no_credentials: "sin credenciales",
+	skip_locked: "todas las credenciales bloqueadas",
+	skip_cooldown: "en enfriamiento",
+	skip_undefined: "desconocido",
+	noFallbacks: "sin respaldos configurados",
+	speedLine: (p50, p90, turns) => `mediana ${p50} · p90 ${p90} · ${turns} turnos`,
+	costToday: "Hoy",
+	costMonth: "Este mes",
+	projection: (cost) => `fin de mes ≈ ${cost}`,
+	projectionOver: (cost) => `fin de mes ≈ ${cost} — por encima del presupuesto`,
+	budgetTitle: "Presupuesto",
+	budgetDaily: "Diario",
+	budgetMonthly: "Mensual",
+	budgetHint: "Define un presupuesto diario o mensual en Ajustes para seguir el gasto.",
+	budgetOff: "desactivado",
+	budgetSettingsHint: "USD; vacío o 0 = desactivado. Los costes son estimaciones con precios de API.",
+	last7Days: "Últimos 7 días",
+	topModels: "Modelos principales · mes",
+	topProfiles: "Perfiles principales · mes",
+	topSessions: "Sesiones principales · 7 días",
+	sessionsN: (n) => `${n} ${n === 1 ? "sesión" : "sesiones"}`,
+	costEstimateNote: "Los costes son estimaciones con precios de API; una suscripción no se factura por token.",
+	board: "Tablero",
+	noBoards: "No hay tableros kanban.",
+	kanbanQuiet: "Nada en curso, bloqueado, en revisión ni fallando.",
+	kanbanGroup_running: "En curso",
+	kanbanGroup_blocked: "Bloqueadas",
+	kanbanGroup_review: "Revisión",
+	kanbanGroup_failing: "Fallando",
+	kanban_todo: "pendiente",
+	kanban_triage: "triaje",
+	kanban_ready: "lista",
+	kanban_running: "en curso",
+	kanban_blocked: "bloqueada",
+	kanban_review: "revisión",
+	kanban_done: "hecha",
+	kanban_archived: "archivada",
+	unassigned: "sin asignar",
+	failuresN: (n) => `falló ${n}×`,
+	cardWhat_input: "necesita tu respuesta",
+	cardWhat_blocked: "bloqueada",
+	cardWhat_review: "espera revisión",
+	cardWhat_failing: "falla",
+	burnRate: (rate) => `${rate}\u00a0%/h`,
+	burnFlat: "sin cambios en las últimas 2 h",
+	fillsIn: (span) => `lleno en ~${span}`,
+	beforeReset: (span) => `${span} antes del restablecimiento`,
+	noFillBeforeReset: "no se llenará antes del restablecimiento",
+	accountHint: (full, used, room) => `${full} está al ${used}\u00a0% · ${room} tiene margen`,
+	accountHintBody: (window, left, room) => `${window}: queda ${left}\u00a0% en ${room}`,
+	chipWorking: (n) => `${n} trabajando`,
+	chipYourTurn: (n) => `${n} tu turno`,
+	chipApproval: (n) => `${n} aprobación`,
+	chipOpenLive: "Haz clic para abrir En vivo",
+	// ---- status bar chips + cards ----
+	chipOpenList: "Haz clic para ver la lista de sesiones",
+	chipQuotaOpen: "Haz clic para ver la tarjeta de cuota (enlaza al panel Cuota)",
+	chipCostOpen: "Haz clic para ver el detalle de gasto",
+	chipFullIn: (span) => `lleno ~${span}`,
+	cardOpenLive: "Abrir En vivo",
+	cardOpenQuota: "Abrir Cuota",
+	cardOpenUsage: "Abrir Uso",
+	cardOpen: "abrir",
+	cardCopy: "copiar",
+	tokensPerMinN: (n) => `${n} tokens/min`,
+	quotaCardTitle: "Ventanas de cuota",
+	checkedAgo: (age) => `consultado hace ${age}`,
+	costCardTitle: "Gasto",
+	monthEnd: "Fin de mes",
+	topModelsToday: "Modelos principales · hoy",
+	costChipAria: (cost) => `${cost} gastado hoy`,
+	costOfDaily: (pct) => `${pct}\u00a0% del presupuesto diario`,
+	costOfMonthly: (pct) => `${pct}\u00a0% del presupuesto mensual`,
+	quotaAlertsLabel: "Cuenta atrás y tiempo hasta llenarse en el chip de cuota",
+	quotaAlertsHint: (pct) => `Solo cuando una ventana está al ${pct}\u00a0%+ o la previsión la llena antes del restablecimiento.`,
+	chipSparkLabel: "Minigráfico de tokens por minuto en el chip de agentes",
+	chipFlashLabel: "Hacer parpadear el chip de agentes cuando una sesión te necesita",
+	chipFlashHint: "Una vez por sesión que pasa a esperar tu turno o una aprobación. Respeta Reducir movimiento.",
+	costChipLabel: "Chip de gasto de hoy",
+	costChipHint: "Se colorea según tu presupuesto (80\u00a0% aviso, 100\u00a0% excedido). Por defecto: activo en cuanto hay un presupuesto.",
+	notifyQuotaTitle: (pct) => `Cuota al ${pct}\u00a0%`,
+	notifyResetsIn: (span) => ` — se restablece en ${span}`,
+	notifySoonTitle: "La cuota se llenará pronto",
+	notifySoonBody: (span) => `a este ritmo se llena en ~${span}, antes del restablecimiento`,
+	notifyBudgetTitle: (label, pct) => `Presupuesto ${label} al ${pct}\u00a0%`,
+	notifyCardTitle: (what) => `Kanban: tarjeta ${what}`,
+	notifyModelTitle: (status, model) => `Modelo ${status}: ${model}`,
+	notifyLockedTitle: (provider) => `Límite de cuenta alcanzado: ${provider}`,
+	monitorSettingsTitle: "Monitor de agentes",
+	monitorEnabledLabel: "Monitor de agentes",
+	monitorEnabledHint: "Sesiones en vivo, estado, uso y kanban — una lectura extra de la CLI por intervalo de actualización.",
+	agentsChipLabel: "Mostrar el chip trabajando / tu turno en la barra de estado",
+	quotaForecastLabel: "Ritmo de consumo, previsión e historial en la vista Cuota",
+	quotaForecastHint: "El historial se lee cada pocos minutos, solo mientras la vista Cuota está abierta.",
+	historyRangeLabel: "Rango del historial",
+	liveIntervalLabel: "Actualización en vivo",
+	navBadgeLabel: "Contadores en vivo en la barra lateral",
+	navBadgeHint: "Muestra agentes trabajando, aprobaciones, una cuota baja y un contexto de chat casi lleno junto a la entrada Cuota del menú.",
+	navWorking: (n) => `${n} activos`,
+	navYourTurn: (n) => `${n} tu turno`,
+	navApproval: (n) => `${n} aprobación`,
+	navStalled: (n) => `${n} atascados`,
+	historyDay: "24 h",
+	historyWeek: "7 días",
+	notificationsTitle: "Notificaciones",
+	notificationsHint: "Las notificaciones del sistema solo aparecen cuando no estás en Hermes, una vez por evento.",
+	notify_quota: "Cuota 80\u00a0% / 95\u00a0%, a punto de llenarse, sugerencias de cuenta",
+	notify_budget: "Presupuesto 80\u00a0% / 100\u00a0%",
+	notify_kanban: "Tarjetas kanban bloqueadas, en revisión o fallando",
+	notify_health: "Modelos que fallan y cuentas bloqueadas",
+	notify_agents: "Agentes que necesitan aprobación, atascados, en bucle o con contexto grande",
+	notify_turns: "El agente terminó — tu turno",
+	// ---- Agent Bar layout ----
+	left: "restante",
+	historyCaption: "Historial de % usado",
+	summaryLowest: (pct) => `mínimo ${pct}\u00a0% restante`,
+	summaryToday: (cost) => `${cost} hoy`,
+	messagesChart: "Mensajes / minuto",
+	dailyChart: "Coste diario",
+	dailyAvg: (cost) => `≈ ${cost} / día`,
+	budgetSub: "coste de API estimado",
+	settingsGroupStatusBar: "Barra de estado y barra lateral",
+	settingsGroupQuota: "Vista Cuota",
+	subagentsN: (n) => `${n} ${n === 1 ? "subagente en curso" : "subagentes en curso"}`,
+	// ---- context guard ----
+	ctxChipOthers: (n, w) => `${n} ${n === 1 ? "sesión" : "sesiones"} ≥ ${w}\u00a0%`,
+	ctxChipAria: (pct) => `Contexto al ${pct}\u00a0%`,
+	ctxTipFocused: (pct, used, max) => `Este chat: contexto al ${pct}\u00a0% (${used} / ${max})`,
+	ctxTipOthers: (n, w) => `${n} ${n === 1 ? "otra sesión abierta" : "otras sesiones abiertas"} ≥ ${w}\u00a0%`,
+	ctxTipOpen: "Haz clic para ver detalles y /compress",
+	ctxCardTitle: "Contexto",
+	ctxWarnSub: (w) => `avisa al ${w}\u00a0%`,
+	ctxFocused: "Este chat",
+	ctxTokensOf: (used, max) => `${used} / ${max} tokens`,
+	ctxEstimated: "estimado",
+	ctxCompressions: (n) => (n ? `comprimido ${n}× hasta ahora` : "aún sin comprimir"),
+	ctxCompress: "Comprimir…",
+	ctxCompressNow: "Comprimir",
+	ctxCancel: "Cancelar",
+	ctxConfirm: "Resume los turnos antiguos para liberar contexto — igual que escribir /compress en este chat.",
+	ctxTopicPlaceholder: "Tema en el que centrarse (opcional)",
+	ctxBusy: "Espera a que termine el turno actual.",
+	ctxNoSession: "Abre un chat para comprimirlo.",
+	ctxNoUsage: "Aún no hay lectura de contexto para este chat.",
+	ctxOthersTitle: (w) => `Otras sesiones ≥ ${w}\u00a0%`,
+	ctxNothing: (w) => `Ninguna sesión abierta está al ${w}\u00a0% o más.`,
+	ctxCompressSent: "Comprimiendo el contexto de este chat…",
+	ctxCompressFailed: "No se pudo acceder al campo de este chat — ábrelo y vuelve a intentarlo.",
+	ctxRowTip: (used, max) => `Contexto ${used} / ${max}`,
+	contextOfN: (used, max) => `ctx ${used}/${max}`,
+	contextChipLabel: "Mostrar el chip de aviso de contexto en la barra de estado",
+	contextChipHint: "Solo mientras el contexto de un chat está en el umbral o por encima — la barra principal ya muestra el uso del chat activo.",
+	contextWarnLabel: "Aviso de contexto a partir de",
+	contextWarnHint: (d) => `Chip, vista En vivo y notificaciones; desde ${d}\u00a0% en rojo.`,
+	notify_context: "La ventana de contexto se llena (umbral / 90\u00a0%)",
+	notifyContextTitle: (pct) => `Contexto al ${pct}\u00a0%`,
+	notifyContextBody: "comprímelo (/compress) o empieza un chat nuevo",
+	navContext: (pct) => `ctx ${pct}\u00a0%`,
+	// ---- locale-aware formatting + status-bar tooltips ----
+	_locale: "es",
+	navLabel: "Cuota",
+	resetToday: (time) => `hoy ${time}`,
+	resetTomorrow: (time) => `mañana ${time}`,
+	resetting: "restableciendo…",
+	spanDH: (d, h) => `${d}\u00a0d ${h}\u00a0h`,
+	spanHM: (h, m) => `${h}\u00a0h ${m}\u00a0min`,
+	spanM: (m) => `${m}\u00a0min`,
+	spanH: (h) => `${h}\u00a0h`,
+	spanS: (s) => `${s}\u00a0s`,
+	spanLt1m: "<1\u00a0min",
+	updateAvailable: "⬆ Actualización disponible — ejecuta ./install.sh para obtenerla",
+	accountN: (n) => `Cuenta ${n}`,
+	valueUnknown: "desconocido",
+	valueLeft: (v) => `${v} restante`,
+	stale: "desactualizado",
+	valueUnavailable: "no disponible",
+	valueAvailable: "disponible",
+	quotaBreakdown: "Desglose de cuota:",
+	providerUnavailable: (name) => `${name}: no disponible`,
+	providerUnavailableReason: (name, reason) => `${name}: no disponible (${reason})`,
+	accountBalance: "Saldo de la cuenta",
+	accountBalanceLine: (v) => `Saldo de la cuenta: ${v}`,
+	apiCallsAvailable: (ok) => `Llamadas a la API disponibles: ${ok ? "sí" : "no"}`,
+	planLine: (plan) => `Plan: ${plan}`,
+	windowFallback: "ventana",
+	resetsAt: (when) => `restablece ${when}`,
+	seriesTotal: "total",
+};
 
-export default {
-	id: ID,
-	name: "Quota Widget",
-	defaultEnabled: true,
-	register(ctx) {
-		CTX = ctx;
-		applyStoredAll();
-		registerDockedPane();
-		ctx.i18n.register({ en: I18N_EN, tr: I18N_TR });
+const I18N_FR = {
+	paneTitle: "Quota",
+	settingsTitle: "Quota · Réglages",
+	chipTip: (pct, label, reset) =>
+		`Quota · minimum ${pct}\u00a0% (${label})${reset ? ` · réinitialisé dans ${reset}` : ""}`,
+	providerTip: (label, pct, reset) =>
+		`${label} · ${pct}\u00a0%${reset ? ` · réinitialisé dans ${reset}` : ""}`,
+	popoverReset: (reset) => `réinitialisé dans ${reset}`,
+	refreshTip: "Actualiser le quota",
+	settingsTip: "Réglages du quota",
+	backTip: "Retour au quota",
+	loading: "Chargement…",
+	error: "Backend de quota indisponible",
+	empty: "Pas encore de données de quota.",
+	emptyHint: "Les données de quota sont préparées automatiquement…",
+	unavailable: (reason) => `indisponible (${reason})`,
+	moreDetails: (n) => `+${n} de plus`,
+	noData: "aucune donnée de fenêtre",
+	noDataSection: (n) => `Aucune donnée (${n}) — cliquez pour déplier`,
+	reset: (when) => `réinitialisation ${when}`,
+	fetched: (when) => `Vérifié ${when}`,
+	fetchedAge: (age, interval) => `il y a ${age} · toutes les ${interval}\u00a0s`,
+	versionSkew: (widget, backend) =>
+		`Widget v${widget} · backend v${backend} — rechargez les plugins de bureau (ou redémarrez l'app) pour les aligner.`,
+	resetFormatLabel: "Format de réinitialisation",
+	relative: "Relatif",
+	absolute: "Absolu",
+	statusbarModeLabel: "Mode de la barre d'état",
+	statusbarModeAll: "Tous les fournisseurs",
+	statusbarModeWorst: "Le plus bas seulement",
+	paneDetailLabel: "Détail du panneau",
+	paneDetailClean: "Épuré",
+	paneDetailCleanHint: "Seulement les anneaux",
+	paneDetailDense: "Dense",
+	paneDetailDenseHint: "Fenêtres, réinitialisations et lignes de détail",
+	showStatusBarLabel: "Afficher l'indicateur dans la barre d'état",
+	showStatusBarHint:
+		"La barre d'état de Hermes doit aussi être visible (⌘K → Toggle status bar).",
+	showDockedPaneLabel: "Afficher le panneau de quota ancré",
+	settingsButton: "Réglages",
+	refreshIntervalLabel: "Intervalle d'actualisation",
+	refreshIntervalHint: (seconds, min, max) =>
+		`Lit le cache toutes les ${seconds}\u00a0s (${min}–${max}\u00a0s). Les actualisations tournent en arrière-plan, la cadence reste exacte.`,
+	seconds: "s",
+	disabledProvidersLabel: "Fournisseurs activés",
+	disableTooltip: "Désactiver ce fournisseur",
+	enableTooltip: "Activer ce fournisseur",
 
-		// Single, static statusbar item. The StatusBar component re-renders itself
-		// via hooks (useQuota / useValue) — it never re-registers, so no feedback
-		// loop. Order 125 keeps it left of the default right-side items.
-		ctx.register({
-			id: "statusbar",
-			area: STATUSBAR_AREAS.right,
-			order: 125,
-			render: () => jsx(StatusBar, {}),
-		});
+	tab_quota: "Quota",
+	tab_live: "En direct",
+	tab_health: "Santé",
+	tab_usage: "Utilisation",
+	tab_kanban: "Kanban",
+	tab_accounts: "Comptes",
+	accountsTabLabel: "Onglet Comptes",
+	accountsTabHint: "Pools d'identifiants, ordre des comptes, stratégie du pool, secours et connexions manquantes. Masquez-le si vous ne changez jamais de compte.",
+	accountsExplainer: "Hermes choisit un identifiant dans le pool d'un fournisseur. Les profils sans connexion propre partagent le pool du profil par défaut : son ordre s'applique donc à tous ; la stratégie se règle par profil. Les modifications passent par la CLI de Hermes après votre confirmation.",
+	accountsPoolsTitle: "Pools d'identifiants",
+	accountsPoolsSub: (n) => `${n} ${n === 1 ? "pool" : "pools"}`,
+	accountsNoPools: "Aucun identifiant dans un pool pour l'instant. Connectez-vous ci-dessous ou lancez `hermes auth add <provider>`.",
+	accountsSharedPool: (n) => `partagé · ${n} profils`,
+	accountsSharedTip: (list) => `Utilisé par : ${list}`,
+	accountsOwnPool: (owner) => `pool propre · ${owner}`,
+	accountsCount: (n) => `${n} ${n === 1 ? "compte" : "comptes"}`,
+	accountsProviderQuota: (label, used) => `Quota du fournisseur (compte utilisé) : ${label} ${used}\u00a0% utilisé`,
+	accountsListAria: (name) => `Comptes ${name}, dans l'ordre où Hermes les essaie`,
+	accountsRowAria: (n, label) => `${n}. ${label}. Alt+Haut / Alt+Bas pour déplacer`,
+	accountsRingLabel: (label, left) => `${label} : ${left}\u00a0% restant`,
+	accountsRingNone: "Aucune mesure de quota pour ce compte",
+	accountsTriedFirst: "essayé en premier",
+	accountsTriedFirstTip: "Premier compte disponible dans cet ordre — fill_first l'utilise jusqu'à épuisement.",
+	accountsTypeOauth: "OAuth",
+	accountsTypeKey: "Clé d'API",
+	accountsTypeOther: "autre",
+	accountsSourceTip: "D'où Hermes tient cet identifiant",
+	accountsStatus_active: "actif",
+	accountsStatus_cooldown: "en pause",
+	accountsStatus_exhausted: "épuisé",
+	accountsStatusUntil: (status, left) => `${status} · ${left}`,
+	accountsCooldownModels: (models) => `En pause : ${models}`,
+	accountsMoveUp: (label) => `Monter ${label}`,
+	accountsMoveDown: (label) => `Descendre ${label}`,
+	accountsDragHint: "Faites glisser une ligne, ou utilisez ▲▼ / Alt+↑↓, pour changer le compte essayé en premier.",
+	accountsNotWritable: "Ce pool ne peut pas être réordonné d'ici (une ligne n'a pas d'id de pool).",
+	accountsSingle: "Un seul compte — rien à ordonner. Ajoutez-en un avec `hermes auth add <provider>`.",
+	accountsBlocked_loading: "Actualisation des données de compte… les modifications attendent qu'elles soient à jour.",
+	accountsBlocked_stale: "Les données de compte sont périmées — actualisez avant de modifier quoi que ce soit.",
+	accountsBlocked_busy: "Application d'une modification…",
+	accountsBlocked_confirm: "Confirmez ou annulez d'abord la modification en attente.",
+	accountsSharedWarning: (owner, others) => `Pool partagé de « ${owner} » : réordonner modifie aussi ${others || "aucun autre profil"}.`,
+	accountsStrategyTitle: "Stratégie par profil",
+	strategy_fill_first: "Remplir d'abord",
+	strategy_round_robin: "Tourniquet",
+	strategy_least_used: "Le moins utilisé",
+	strategy_random: "Aléatoire",
+	strategyShort_fill_first: "Remplir",
+	strategyShort_round_robin: "Tour",
+	strategyShort_least_used: "Moins",
+	strategyShort_random: "Hasard",
+	strategyHint_fill_first: "Utiliser le premier compte jusqu'à épuisement, puis le suivant (l'ordre compte).",
+	strategyHint_round_robin: "Alterner les comptes équitablement (l'ordre ne fait que départager).",
+	strategyHint_least_used: "Toujours choisir le compte le moins utilisé.",
+	strategyHint_random: "Choisir un compte au hasard.",
+	accountsProfilesTitle: "Profils",
+	accountsProfilesSub: "accès au pool · stratégie · modèle → secours",
+	accountsProfileCol: "Profil",
+	accountsChainCol: "Modèle → secours",
+	accountsRootTag: "racine",
+	accountsAccess_own: "propre",
+	accountsAccess_shared: "partagé",
+	accountsPrimaryTip: "Modèle principal",
+	accountsFallbackTip: (n) => `Secours n°\u00a0${n}`,
+	accountsCustomRoute: "endpoint personnalisé",
+	accountsNoModel: "aucun modèle défini",
+	accountsFallbackCopyTip: "Copier — Hermes ne modifie la chaîne de secours que dans son sélecteur interactif (ou Réglages ▸ Modèle ▸ Secours pour le profil choisi là-bas).",
+	accountsFallbackEdit: "Copier la commande de secours",
+	accountsFallbackNote: "L'ordre de secours est en lecture seule ici : Hermes ne sait pas le réordonner de façon non interactive. Copiez la commande et lancez-la dans un terminal.",
+	accountsSigninTitle: "Non connecté",
+	accountsSigninSub: (n) => `${n} à traiter`,
+	accountsAllSignedIn: "Vous êtes connecté à tous les fournisseurs que connaît le cache de quota.",
+	accountsOtherUnavailable: (n) => `${n} temporairement indisponible${n === 1 ? "" : "s"}`,
+	accountsMoreSignin: (n) => `${n} de plus sans connexion`,
+	accountsUsed: "utilisé",
+	accountsUsedTip: "Le modèle ou un secours d'un profil utilise ce fournisseur",
+	accountsKind_signin: "non connecté",
+	accountsKind_reauth: "se reconnecter",
+	accountsKind_optin: "désactivé",
+	accountsKind_rate_limited: "limité",
+	accountsKind_error: "indisponible",
+	accountsReason_signin: (reason, tool) => tool ? `Aucune connexion trouvée (${reason}). Connectez-vous avec ${tool}.` : `Aucune connexion trouvée (${reason}).`,
+	accountsReason_reauth: (reason) => `La connexion enregistrée ne fonctionne plus (${reason}).`,
+	accountsReason_optin: (reason, tool) => `Désactivé dans le plugin de quota (${reason}). Activez-le pour lire ${tool || "ce fournisseur"}.`,
+	accountsReason_rate_limited: () => "Le fournisseur limite les lectures de quota. Aucune connexion nécessaire.",
+	accountsReason_error: (reason) => `Dernière lecture en échec (${reason}). Nouvel essai à la prochaine actualisation.`,
+	accountsRetryIn: (left) => `nouvel essai dans ${left}`,
+	accountsRetrySoon: "nouvel essai à la prochaine actualisation",
+	accountsSigninAction: "Se connecter",
+	accountsAddKeyAction: "Ajouter une clé d'API",
+	accountsReason_key: (reason) => `Aucune clé d'API trouvée (${reason}).`,
+	accountsReauthAction: "Se reconnecter",
+	accountsOptinAction: "Activer",
+	accountsCopyTip: "Copiez cette commande et lancez-la dans un terminal (les connexions ouvrent un navigateur, elles ne peuvent pas s'exécuter d'ici)",
+	accountsLimits: "Hermes n'attribue pas de compte par profil : un profil utilise le pool partagé sauf s'il a sa propre connexion (`hermes -p <profile> auth add <provider>`). L'ordre appartient au pool, la stratégie au profil. Rien ici ne déplace ni ne copie d'identifiants entre profils.",
+	accountsConfirmOrderTitle: (name) => `Changer l'ordre des comptes ${name} ?`,
+	accountsConfirmOrderShared: (owner, n) => `C'est le pool partagé de « ${owner} ». Le nouvel ordre s'applique aux ${n} profils qui l'utilisent.`,
+	accountsConfirmOrderOwn: (owner) => `Seul « ${owner} » utilise ce pool.`,
+	accountsConfirmBefore: "Maintenant",
+	accountsConfirmAfter: "Après",
+	accountsConfirmFirst: (label) => `Essayé en premier avec fill_first : ${label}.`,
+	accountsConfirmProfiles: (list) => `Concerne : ${list}`,
+	accountsConfirmStrategyTitle: (profile, name) => `Changer la stratégie ${name} de ${profile} ?`,
+	accountsConfirmStrategyDesc: (profile) => `Seul « ${profile} » change ; les autres profils gardent leur stratégie.`,
+	accountsConfirmApply: "Appliquer",
+	accountsConfirmBusy: "Application…",
+	accountsConfirmCancel: "Annuler",
+	accountsSavedOrder: (name) => `Ordre des comptes ${name} enregistré`,
+	accountsSavedStrategy: (profile, s) => `${profile} : stratégie réglée sur ${s}`,
+	accountsWriteUnsupported: "Le plugin de quota de la passerelle est trop ancien pour modifier les comptes — mettez-le à jour.",
+	accountsUnsupported: "Le plugin de quota de cette passerelle est antérieur à la vue Comptes — mettez à jour le backend.",
+	accountsError: "Impossible de lire les données de compte.",
+	monitorOff: "Le moniteur d'agents est désactivé — activez-le dans les Réglages.",
+	monitorUnsupported:
+		"Le plugin de quota de cette passerelle n'a pas encore de moniteur d'agents — mettez-le à jour (./install.sh) pour voir les sessions en direct, la santé, l'utilisation et le kanban.",
+	monitorError: "Moniteur d'agents indisponible pour le moment.",
+	sectionError: (section) => `Impossible de lire les données ${section} cette fois-ci.`,
+	monitorUpdated: (when, interval) => `Mis à jour ${when} · toutes les ${interval}\u00a0s`,
+	state_working: "en cours",
+	state_waiting: "à vous",
+	state_needs_approval: "approbation requise",
+	state_stalled: "bloqué ?",
+	state_long_tool: "appel d'outil long",
+	state_ended: "terminé",
+	untitled: "(session sans titre)",
+	subagent: "sous-agent",
+	agent: "Agent",
+	cliSource: "CLI",
+	tokensN: (n) => `${n} jetons`,
+	contextN: (n) => `ctx ${n}`,
+	ago: (span) => `il y a ${span}`,
+	longToolCall: (tool) => `appel d'outil long en cours : ${tool}`,
+	openSessionTip: "Ouvrir cette session",
+	copyCommandTip: (command) => `Copier : ${command}`,
+	commandCopied: (command) => `Copié : ${command}`,
+	commandCopyFailed: (command) => `Copie impossible — lancez : ${command}`,
+	last1m: "Dernière minute",
+	last60m: "60 dernières min",
+	tokensPerMin: "jetons / min",
+	costPerMin: (cost) => `≈ ${cost} / min`,
+	cost60m: (cost) => `≈ ${cost} en 60 min`,
+	openSessions: "Sessions ouvertes",
+	countWorking: (n) => `${n} en cours`,
+	countApproval: (n) => `${n} en attente d'approbation`,
+	countYourTurn: (n) => `${n} à vous`,
+	countStalled: (n) => `${n} bloqué${n === 1 ? "" : "s"} ?`,
+	tokensChart: "Jetons / minute",
+	attentionTitle: (n) => `À traiter (${n})`,
+	noOpenSessions: "Aucune session ouverte.",
+	attention_approval: (who) => `${who} attend une approbation`,
+	attention_your_turn: (who) => `${who} a terminé — à vous`,
+	attention_stalled: (who) => `${who} est peut-être bloqué`,
+	attention_loop: (who) => `${who} : boucle possible`,
+	attention_big_context: (who) => `${who} : contexte volumineux`,
+	healthAccounts: "Comptes",
+	healthModels: "Modèles",
+	healthChains: "Chaînes de secours",
+	healthSpeed: "Vitesse des modèles",
+	notSetUp: (n, names) => `Non configuré ici (${n}) : ${names}`,
+	last24h: "dernières 24 h",
+	none: "Rien à afficher.",
+	credentialN: (n) => `identifiant ${n}`,
+	credLocked: "limite atteinte",
+	unlocksIn: (span) => ` — débloqué dans ${span}`,
+	modelStatus_ok: "ok",
+	modelStatus_idle: "inactif",
+	modelStatus_degraded: "dégradé",
+	modelStatus_failing: "en échec",
+	modelStatus_account_exhausted: "limite du compte",
+	callsN: (n) => `${n} ${n === 1 ? "appel" : "appels"}`,
+	errorRate: (pct) => `${pct}\u00a0% d'erreurs`,
+	errorsN: (n) => `${n} ${n === 1 ? "erreur" : "erreurs"}`,
+	cooldownFor: (span) => `pause ${span}`,
+	recovered: "rétabli",
+	chainOk: "utilisable",
+	chainSkip: (reason) => `ignoré : ${reason}`,
+	chainRisky: (pct) => `risqué (${pct}\u00a0% d'erreurs)`,
+	skip_same_backend: "même backend que le principal",
+	skip_no_credentials: "aucun identifiant",
+	skip_locked: "tous les identifiants bloqués",
+	skip_cooldown: "en pause",
+	skip_undefined: "inconnu",
+	noFallbacks: "aucun secours configuré",
+	speedLine: (p50, p90, turns) => `médiane ${p50} · p90 ${p90} · ${turns} tours`,
+	costToday: "Aujourd'hui",
+	costMonth: "Ce mois-ci",
+	projection: (cost) => `fin de mois ≈ ${cost}`,
+	projectionOver: (cost) => `fin de mois ≈ ${cost} — budget dépassé`,
+	budgetTitle: "Budget",
+	budgetDaily: "Quotidien",
+	budgetMonthly: "Mensuel",
+	budgetHint: "Définissez un budget quotidien ou mensuel dans les Réglages pour suivre les dépenses.",
+	budgetOff: "désactivé",
+	budgetSettingsHint: "USD ; vide ou 0 = désactivé. Les coûts sont des estimations au prix de l'API.",
+	last7Days: "7 derniers jours",
+	topModels: "Top modèles · mois",
+	topProfiles: "Top profils · mois",
+	topSessions: "Top sessions · 7 jours",
+	sessionsN: (n) => `${n} ${n === 1 ? "session" : "sessions"}`,
+	costEstimateNote: "Les coûts sont des estimations au prix de l'API ; un abonnement n'est pas facturé au jeton.",
+	board: "Tableau",
+	noBoards: "Aucun tableau kanban.",
+	kanbanQuiet: "Rien en cours, bloqué, en revue ou en échec.",
+	kanbanGroup_running: "En cours",
+	kanbanGroup_blocked: "Bloquées",
+	kanbanGroup_review: "Revue",
+	kanbanGroup_failing: "En échec",
+	kanban_todo: "à faire",
+	kanban_triage: "tri",
+	kanban_ready: "prête",
+	kanban_running: "en cours",
+	kanban_blocked: "bloquée",
+	kanban_review: "revue",
+	kanban_done: "terminée",
+	kanban_archived: "archivée",
+	unassigned: "non assignée",
+	failuresN: (n) => `${n}× en échec`,
+	cardWhat_input: "attend votre réponse",
+	cardWhat_blocked: "bloquée",
+	cardWhat_review: "attend une revue",
+	cardWhat_failing: "en échec",
+	burnRate: (rate) => `${rate}\u00a0%/h`,
+	burnFlat: "aucun changement ces 2 dernières heures",
+	fillsIn: (span) => `plein dans ~${span}`,
+	beforeReset: (span) => `${span} avant la réinitialisation`,
+	noFillBeforeReset: "ne sera pas plein avant la réinitialisation",
+	accountHint: (full, used, room) => `${full} est à ${used}\u00a0% · ${room} a de la marge`,
+	accountHintBody: (window, left, room) => `${window} : ${left}\u00a0% restant sur ${room}`,
+	chipWorking: (n) => `${n} en cours`,
+	chipYourTurn: (n) => `${n} à vous`,
+	chipApproval: (n) => `${n} approbation${n === 1 ? "" : "s"}`,
+	chipOpenLive: "Cliquez pour ouvrir En direct",
+	// ---- status bar chips + cards ----
+	chipOpenList: "Cliquez pour la liste des sessions",
+	chipQuotaOpen: "Cliquez pour la carte de quota (lien vers le panneau Quota)",
+	chipCostOpen: "Cliquez pour le détail des dépenses",
+	chipFullIn: (span) => `plein ~${span}`,
+	cardOpenLive: "Ouvrir En direct",
+	cardOpenQuota: "Ouvrir Quota",
+	cardOpenUsage: "Ouvrir Utilisation",
+	cardOpen: "ouvrir",
+	cardCopy: "copier",
+	tokensPerMinN: (n) => `${n} jetons/min`,
+	quotaCardTitle: "Fenêtres de quota",
+	checkedAgo: (age) => `vérifié il y a ${age}`,
+	costCardTitle: "Dépenses",
+	monthEnd: "Fin de mois",
+	topModelsToday: "Top modèles · aujourd'hui",
+	costChipAria: (cost) => `${cost} dépensés aujourd'hui`,
+	costOfDaily: (pct) => `${pct}\u00a0% du budget quotidien`,
+	costOfMonthly: (pct) => `${pct}\u00a0% du budget mensuel`,
+	quotaAlertsLabel: "Compte à rebours et temps avant saturation sur la puce de quota",
+	quotaAlertsHint: (pct) => `Seulement quand une fenêtre est utilisée à ${pct}\u00a0%+ ou que la prévision la remplit avant la réinitialisation.`,
+	chipSparkLabel: "Mini-courbe jetons / minute dans la puce des agents",
+	chipFlashLabel: "Faire clignoter la puce des agents quand une session a besoin de vous",
+	chipFlashHint: "Une fois par session qui passe en attente de vous ou d'une approbation. Respecte Réduire les animations.",
+	costChipLabel: "Puce des dépenses du jour",
+	costChipHint: "Teintée selon votre budget (80\u00a0% alerte, 100\u00a0% dépassé). Par défaut : active dès qu'un budget est défini.",
+	notifyQuotaTitle: (pct) => `Quota à ${pct}\u00a0%`,
+	notifyResetsIn: (span) => ` — réinitialisé dans ${span}`,
+	notifySoonTitle: "Le quota sera bientôt plein",
+	notifySoonBody: (span) => `à ce rythme, plein dans ~${span}, avant la réinitialisation`,
+	notifyBudgetTitle: (label, pct) => `Budget ${label} à ${pct}\u00a0%`,
+	notifyCardTitle: (what) => `Kanban : carte ${what}`,
+	notifyModelTitle: (status, model) => `Modèle ${status} : ${model}`,
+	notifyLockedTitle: (provider) => `Limite du compte atteinte : ${provider}`,
+	monitorSettingsTitle: "Moniteur d'agents",
+	monitorEnabledLabel: "Moniteur d'agents",
+	monitorEnabledHint: "Sessions en direct, santé, utilisation et kanban — une lecture CLI de plus par intervalle d'actualisation.",
+	agentsChipLabel: "Afficher la puce en cours / à vous dans la barre d'état",
+	quotaForecastLabel: "Rythme de consommation, prévision et historique dans la vue Quota",
+	quotaForecastHint: "L'historique est lu toutes les quelques minutes, seulement quand la vue Quota est ouverte.",
+	historyRangeLabel: "Période de l'historique",
+	liveIntervalLabel: "Actualisation en direct",
+	navBadgeLabel: "Compteurs en direct dans la barre latérale",
+	navBadgeHint: "Affiche les agents actifs, les approbations, un quota bas et un contexte de chat presque plein à côté de l'entrée Quota du menu.",
+	navWorking: (n) => `${n} actif${n === 1 ? "" : "s"}`,
+	navYourTurn: (n) => `${n} à vous`,
+	navApproval: (n) => `${n} approbation${n === 1 ? "" : "s"}`,
+	navStalled: (n) => `${n} bloqué${n === 1 ? "" : "s"}`,
+	historyDay: "24 h",
+	historyWeek: "7 jours",
+	notificationsTitle: "Notifications",
+	notificationsHint: "Les notifications système n'apparaissent que lorsque vous n'êtes pas dans Hermes, une fois par événement.",
+	notify_quota: "Quota 80\u00a0% / 95\u00a0%, bientôt plein, conseils de compte",
+	notify_budget: "Budget 80\u00a0% / 100\u00a0%",
+	notify_kanban: "Cartes kanban bloquées, en revue ou en échec",
+	notify_health: "Modèles en échec et comptes bloqués",
+	notify_agents: "Agents en attente d'approbation, bloqués, en boucle ou au contexte volumineux",
+	notify_turns: "Agent terminé — à vous",
+	// ---- Agent Bar layout ----
+	left: "restant",
+	historyCaption: "Historique du % utilisé",
+	summaryLowest: (pct) => `minimum ${pct}\u00a0% restant`,
+	summaryToday: (cost) => `${cost} aujourd'hui`,
+	messagesChart: "Messages / minute",
+	dailyChart: "Coût quotidien",
+	dailyAvg: (cost) => `≈ ${cost} / jour`,
+	budgetSub: "coût d'API estimé",
+	settingsGroupStatusBar: "Barre d'état et barre latérale",
+	settingsGroupQuota: "Vue Quota",
+	subagentsN: (n) => `${n} sous-agent${n === 1 ? "" : "s"} en cours`,
+	// ---- context guard ----
+	ctxChipOthers: (n, w) => `${n} ${n === 1 ? "session" : "sessions"} ≥ ${w}\u00a0%`,
+	ctxChipAria: (pct) => `Contexte plein à ${pct}\u00a0%`,
+	ctxTipFocused: (pct, used, max) => `Ce chat : contexte plein à ${pct}\u00a0% (${used} / ${max})`,
+	ctxTipOthers: (n, w) => `${n} autre${n === 1 ? " session ouverte" : "s sessions ouvertes"} ≥ ${w}\u00a0%`,
+	ctxTipOpen: "Cliquez pour les détails et /compress",
+	ctxCardTitle: "Contexte",
+	ctxWarnSub: (w) => `alerte à ${w}\u00a0%`,
+	ctxFocused: "Ce chat",
+	ctxTokensOf: (used, max) => `${used} / ${max} jetons`,
+	ctxEstimated: "estimé",
+	ctxCompressions: (n) => (n ? `compressé ${n}× jusqu'ici` : "pas encore compressé"),
+	ctxCompress: "Compresser…",
+	ctxCompressNow: "Compresser",
+	ctxCancel: "Annuler",
+	ctxConfirm: "Résume les anciens tours pour libérer du contexte — comme taper /compress dans ce chat.",
+	ctxTopicPlaceholder: "Sujet à privilégier (facultatif)",
+	ctxBusy: "Attendez la fin du tour en cours.",
+	ctxNoSession: "Ouvrez un chat pour le compresser.",
+	ctxNoUsage: "Pas encore de mesure de contexte pour ce chat.",
+	ctxOthersTitle: (w) => `Autres sessions ≥ ${w}\u00a0%`,
+	ctxNothing: (w) => `Aucune session ouverte n'est à ${w}\u00a0% ou plus.`,
+	ctxCompressSent: "Compression du contexte de ce chat…",
+	ctxCompressFailed: "Impossible d'atteindre la zone de saisie de ce chat — ouvrez-le et réessayez.",
+	ctxRowTip: (used, max) => `Contexte ${used} / ${max}`,
+	contextOfN: (used, max) => `ctx ${used}/${max}`,
+	contextChipLabel: "Afficher la puce d'alerte de contexte dans la barre d'état",
+	contextChipHint: "Seulement quand le contexte d'un chat atteint le seuil — la barre principale affiche déjà l'utilisation du chat actif.",
+	contextWarnLabel: "Alerte de contexte à",
+	contextWarnHint: (d) => `Puce, vue En direct et notifications ; rouge à partir de ${d}\u00a0%.`,
+	notify_context: "Fenêtre de contexte presque pleine (seuil / 90\u00a0%)",
+	notifyContextTitle: (pct) => `Contexte plein à ${pct}\u00a0%`,
+	notifyContextBody: "compressez-le (/compress) ou ouvrez un nouveau chat",
+	navContext: (pct) => `ctx ${pct}\u00a0%`,
+	// ---- locale-aware formatting + status-bar tooltips ----
+	_locale: "fr",
+	navLabel: "Quota",
+	resetToday: (time) => `aujourd'hui ${time}`,
+	resetTomorrow: (time) => `demain ${time}`,
+	resetting: "réinitialisation…",
+	spanDH: (d, h) => `${d}\u00a0j ${h}\u00a0h`,
+	spanHM: (h, m) => `${h}\u00a0h ${m}\u00a0min`,
+	spanM: (m) => `${m}\u00a0min`,
+	spanH: (h) => `${h}\u00a0h`,
+	spanS: (s) => `${s}\u00a0s`,
+	spanLt1m: "<1\u00a0min",
+	updateAvailable: "⬆ Mise à jour disponible — lancez ./install.sh pour l'obtenir",
+	accountN: (n) => `Compte ${n}`,
+	valueUnknown: "inconnu",
+	valueLeft: (v) => `${v} restant`,
+	stale: "périmé",
+	valueUnavailable: "indisponible",
+	valueAvailable: "disponible",
+	quotaBreakdown: "Détail du quota :",
+	providerUnavailable: (name) => `${name} : indisponible`,
+	providerUnavailableReason: (name, reason) => `${name} : indisponible (${reason})`,
+	accountBalance: "Solde du compte",
+	accountBalanceLine: (v) => `Solde du compte : ${v}`,
+	apiCallsAvailable: (ok) => `Appels d'API disponibles : ${ok ? "oui" : "non"}`,
+	planLine: (plan) => `Offre : ${plan}`,
+	windowFallback: "fenêtre",
+	resetsAt: (when) => `réinitialisation ${when}`,
+	seriesTotal: "total",
+};
 
-		// Agents chip (working / your turn) + the monitor notifier. Renders
-		// nothing until a monitor snapshot exists, so an older backend leaves
-		// the status bar exactly as it was.
-		ctx.register({
-			id: "agents",
-			area: STATUSBAR_AREAS.right,
-			order: 124,
-			render: () => jsx(MonitorStatus, {}),
-		});
+const I18N_RU = {
+	paneTitle: "Квоты",
+	settingsTitle: "Квоты · Настройки",
+	chipTip: (pct, label, reset) =>
+		`Квоты · минимум ${pct}\u00a0% (${label})${reset ? ` · сброс через ${reset}` : ""}`,
+	providerTip: (label, pct, reset) =>
+		`${label} · ${pct}\u00a0%${reset ? ` · сброс через ${reset}` : ""}`,
+	popoverReset: (reset) => `сброс через ${reset}`,
+	refreshTip: "Обновить квоты",
+	settingsTip: "Настройки квот",
+	backTip: "Назад к квотам",
+	loading: "Загрузка…",
+	error: "Бэкенд квот недоступен",
+	empty: "Данных о квотах пока нет.",
+	emptyHint: "Данные о квотах готовятся автоматически…",
+	unavailable: (reason) => `недоступно (${reason})`,
+	moreDetails: (n) => `ещё ${n}`,
+	noData: "нет данных об окнах",
+	noDataSection: (n) => `Нет данных (${n}) — нажмите, чтобы развернуть`,
+	reset: (when) => `сброс ${when}`,
+	fetched: (when) => `Проверено ${when}`,
+	fetchedAge: (age, interval) => `${age} назад · опрос каждые ${interval}\u00a0с`,
+	versionSkew: (widget, backend) =>
+		`Виджет v${widget} · бэкенд v${backend} — перезагрузите плагины приложения (или перезапустите его), чтобы версии совпали.`,
+	resetFormatLabel: "Формат сброса",
+	relative: "Относительный",
+	absolute: "Точное время",
+	statusbarModeLabel: "Режим статус-бара",
+	statusbarModeAll: "Все провайдеры",
+	statusbarModeWorst: "Только худший",
+	paneDetailLabel: "Детализация панели",
+	paneDetailClean: "Просто",
+	paneDetailCleanHint: "Только кольца",
+	paneDetailDense: "Подробно",
+	paneDetailDenseHint: "Окна, сбросы и строки с деталями",
+	showStatusBarLabel: "Показывать индикатор в статус-баре",
+	showStatusBarHint:
+		"Статус-бар Hermes тоже должен быть виден (⌘K → Toggle status bar).",
+	showDockedPaneLabel: "Показывать закреплённую панель квот",
+	settingsButton: "Настройки",
+	refreshIntervalLabel: "Интервал обновления",
+	refreshIntervalHint: (seconds, min, max) =>
+		`Читает кэш каждые ${seconds}\u00a0с (${min}–${max}\u00a0с). Обновления идут в фоне, поэтому интервал точный.`,
+	seconds: "с",
+	disabledProvidersLabel: "Включённые провайдеры",
+	disableTooltip: "Отключить этого провайдера",
+	enableTooltip: "Включить этого провайдера",
 
-		// Context guard chip, left of the agents chip. Hidden unless some
-		// chat's context is at/over the warn threshold (the core bar already
-		// shows the focused chat's usage, so a calm chip would duplicate it).
-		ctx.register({
-			id: "context",
-			area: STATUSBAR_AREAS.right,
-			order: 123,
-			render: () => jsx(ContextChip, {}),
-		});
+	tab_quota: "Квоты",
+	tab_live: "Сейчас",
+	tab_health: "Состояние",
+	tab_usage: "Расход",
+	tab_kanban: "Канбан",
+	tab_accounts: "Аккаунты",
+	accountsTabLabel: "Вкладка «Аккаунты»",
+	accountsTabHint: "Пулы учётных данных, порядок аккаунтов, стратегия пула, резервные модели и недостающие входы. Скройте, если вы не меняете аккаунты.",
+	accountsExplainer: "Hermes берёт учётные данные из пула провайдера. Профили без собственного входа используют пул профиля по умолчанию, поэтому его порядок действует для всех; стратегия задаётся для каждого профиля. Изменения выполняются через CLI Hermes после вашего подтверждения.",
+	accountsPoolsTitle: "Пулы учётных данных",
+	accountsPoolsSub: (n) => ruN(n, "пул", "пула", "пулов"),
+	accountsNoPools: "В пулах пока нет учётных данных. Войдите ниже или выполните `hermes auth add <provider>`.",
+	accountsSharedPool: (n) => `общий · ${ruN(n, "профиль", "профиля", "профилей")}`,
+	accountsSharedTip: (list) => `Используют: ${list}`,
+	accountsOwnPool: (owner) => `свой пул · ${owner}`,
+	accountsCount: (n) => ruN(n, "аккаунт", "аккаунта", "аккаунтов"),
+	accountsProviderQuota: (label, used) => `Квота провайдера (текущий аккаунт): ${label}, использовано ${used}\u00a0%`,
+	accountsListAria: (name) => `Аккаунты ${name} в том порядке, в котором Hermes их пробует`,
+	accountsRowAria: (n, label) => `${n}. ${label}. Alt+Вверх / Alt+Вниз — переместить`,
+	accountsRingLabel: (label, left) => `${label}: осталось ${left}\u00a0%`,
+	accountsRingNone: "Для этого аккаунта нет данных о квоте",
+	accountsTriedFirst: "пробуется первым",
+	accountsTriedFirstTip: "Первый доступный аккаунт в этом порядке — fill_first использует его, пока он не исчерпан.",
+	accountsTypeOauth: "OAuth",
+	accountsTypeKey: "API-ключ",
+	accountsTypeOther: "другое",
+	accountsSourceTip: "Откуда Hermes взял эти учётные данные",
+	accountsStatus_active: "активен",
+	accountsStatus_cooldown: "пауза",
+	accountsStatus_exhausted: "исчерпан",
+	accountsStatusUntil: (status, left) => `${status} · ${left}`,
+	accountsCooldownModels: (models) => `На паузе: ${models}`,
+	accountsMoveUp: (label) => `Переместить ${label} выше`,
+	accountsMoveDown: (label) => `Переместить ${label} ниже`,
+	accountsDragHint: "Перетащите строку или используйте ▲▼ / Alt+↑↓, чтобы выбрать аккаунт, который пробуется первым.",
+	accountsNotWritable: "Этот пул нельзя переупорядочить отсюда (у строки нет id пула).",
+	accountsSingle: "Один аккаунт — упорядочивать нечего. Добавьте ещё: `hermes auth add <provider>`.",
+	accountsBlocked_loading: "Данные аккаунтов обновляются… изменения ждут актуальных данных.",
+	accountsBlocked_stale: "Данные аккаунтов устарели — обновите их перед изменениями.",
+	accountsBlocked_busy: "Применяется изменение…",
+	accountsBlocked_confirm: "Сначала подтвердите или отмените ожидающее изменение.",
+	accountsSharedWarning: (owner, others) => `Общий пул «${owner}»: новый порядок затронет и ${others || "никакие другие профили"}.`,
+	accountsStrategyTitle: "Стратегия по профилям",
+	strategy_fill_first: "Сначала заполнить",
+	strategy_round_robin: "По кругу",
+	strategy_least_used: "Наименее загруженный",
+	strategy_random: "Случайно",
+	strategyShort_fill_first: "Заполн.",
+	strategyShort_round_robin: "Круг",
+	strategyShort_least_used: "Мин.",
+	strategyShort_random: "Случ.",
+	strategyHint_fill_first: "Использовать первый аккаунт до исчерпания, затем следующий (порядок важен).",
+	strategyHint_round_robin: "Чередовать аккаунты поровну (порядок решает только при равенстве).",
+	strategyHint_least_used: "Всегда выбирать наименее загруженный аккаунт.",
+	strategyHint_random: "Выбирать аккаунт случайно.",
+	accountsProfilesTitle: "Профили",
+	accountsProfilesSub: "доступ к пулу · стратегия · модель → резервные",
+	accountsProfileCol: "Профиль",
+	accountsChainCol: "Модель → резервные",
+	accountsRootTag: "корень",
+	accountsAccess_own: "свой",
+	accountsAccess_shared: "общий",
+	accountsPrimaryTip: "Основная модель",
+	accountsFallbackTip: (n) => `Резервная №${n}`,
+	accountsCustomRoute: "свой эндпоинт",
+	accountsNoModel: "модель не задана",
+	accountsFallbackCopyTip: "Скопировать — Hermes меняет цепочку резервных моделей только в интерактивном выборе (или в Настройки ▸ Модель ▸ Резервные для выбранного там профиля).",
+	accountsFallbackEdit: "Скопировать команду",
+	accountsFallbackNote: "Порядок резервных моделей здесь только для чтения: Hermes не умеет менять его неинтерактивно. Скопируйте команду и выполните в терминале.",
+	accountsSigninTitle: "Вход не выполнен",
+	accountsSigninSub: (n) => `требуют внимания: ${n}`,
+	accountsAllSignedIn: "Вход выполнен у всех провайдеров, известных кэшу квот.",
+	accountsOtherUnavailable: (n) => `временно недоступны: ${n}`,
+	accountsMoreSignin: (n) => `ещё без входа: ${n}`,
+	accountsUsed: "используется",
+	accountsUsedTip: "Модель или резервная модель какого-то профиля использует этого провайдера",
+	accountsKind_signin: "нет входа",
+	accountsKind_reauth: "войти заново",
+	accountsKind_optin: "выкл.",
+	accountsKind_rate_limited: "лимит запросов",
+	accountsKind_error: "недоступно",
+	accountsReason_signin: (reason, tool) => tool ? `Вход не найден (${reason}). Войдите через ${tool}.` : `Вход не найден (${reason}).`,
+	accountsReason_reauth: (reason) => `Сохранённый вход больше не работает (${reason}).`,
+	accountsReason_optin: (reason, tool) => `Отключено в плагине квот (${reason}). Включите, чтобы читать ${tool || "этого провайдера"}.`,
+	accountsReason_rate_limited: () => "Провайдер ограничивает чтение квот. Входить заново не нужно.",
+	accountsReason_error: (reason) => `Последнее чтение не удалось (${reason}). Повтор при следующем обновлении.`,
+	accountsRetryIn: (left) => `повтор через ${left}`,
+	accountsRetrySoon: "повтор при следующем обновлении",
+	accountsSigninAction: "Войти",
+	accountsAddKeyAction: "Добавить API-ключ",
+	accountsReason_key: (reason) => `API-ключ не найден (${reason}).`,
+	accountsReauthAction: "Войти заново",
+	accountsOptinAction: "Включить",
+	accountsCopyTip: "Скопируйте команду и выполните её в терминале (вход открывает браузер, поэтому отсюда его не запустить)",
+	accountsLimits: "В Hermes нельзя закрепить аккаунт за профилем: профиль использует общий пул, если у него нет собственного входа (`hermes -p <profile> auth add <provider>`). Порядок принадлежит пулу, стратегия — профилю. Здесь учётные данные не переносятся и не копируются между профилями.",
+	accountsConfirmOrderTitle: (name) => `Изменить порядок аккаунтов ${name}?`,
+	accountsConfirmOrderShared: (owner, n) => `Это общий пул профиля «${owner}». Новый порядок применится ко всем профилям, которые его используют (${n}).`,
+	accountsConfirmOrderOwn: (owner) => `Этот пул использует только «${owner}».`,
+	accountsConfirmBefore: "Сейчас",
+	accountsConfirmAfter: "После",
+	accountsConfirmFirst: (label) => `Первым при fill_first: ${label}.`,
+	accountsConfirmProfiles: (list) => `Затронет: ${list}`,
+	accountsConfirmStrategyTitle: (profile, name) => `Изменить стратегию ${name} для ${profile}?`,
+	accountsConfirmStrategyDesc: (profile) => `Изменится только «${profile}»; остальные профили сохранят свою стратегию.`,
+	accountsConfirmApply: "Применить",
+	accountsConfirmBusy: "Применяется…",
+	accountsConfirmCancel: "Отмена",
+	accountsSavedOrder: (name) => `Порядок аккаунтов ${name} сохранён`,
+	accountsSavedStrategy: (profile, s) => `${profile}: стратегия — ${s}`,
+	accountsWriteUnsupported: "Плагин квот на шлюзе устарел и пока не умеет менять аккаунты — обновите его.",
+	accountsUnsupported: "Плагин квот на этом шлюзе старше вкладки «Аккаунты» — обновите бэкенд.",
+	accountsError: "Не удалось прочитать данные аккаунтов.",
+	monitorOff: "Монитор агентов выключен — включите его в настройках.",
+	monitorUnsupported:
+		"В плагине квот на этом шлюзе ещё нет монитора агентов — обновите его (./install.sh), чтобы видеть активные сеансы, состояние, расход и канбан.",
+	monitorError: "Монитор агентов сейчас недоступен.",
+	sectionError: (section) => `Не удалось прочитать данные «${section}».`,
+	monitorUpdated: (when, interval) => `Обновлено ${when} · опрос каждые ${interval}\u00a0с`,
+	state_working: "работает",
+	state_waiting: "ваша очередь",
+	state_needs_approval: "нужно одобрение",
+	state_stalled: "завис?",
+	state_long_tool: "долгий вызов инструмента",
+	state_ended: "завершён",
+	untitled: "(сеанс без названия)",
+	subagent: "субагент",
+	agent: "Агент",
+	cliSource: "CLI",
+	tokensN: (n) => ruN(n, "токен", "токена", "токенов"),
+	contextN: (n) => `контекст ${n}`,
+	ago: (span) => `${span} назад`,
+	longToolCall: (tool) => `идёт долгий вызов инструмента: ${tool}`,
+	openSessionTip: "Открыть этот сеанс",
+	copyCommandTip: (command) => `Скопировать: ${command}`,
+	commandCopied: (command) => `Скопировано: ${command}`,
+	commandCopyFailed: (command) => `Не удалось скопировать — выполните: ${command}`,
+	last1m: "Последняя минута",
+	last60m: "Последние 60 мин",
+	tokensPerMin: "токенов / мин",
+	costPerMin: (cost) => `≈ ${cost} / мин`,
+	cost60m: (cost) => `≈ ${cost} за 60 мин`,
+	openSessions: "Открытые сеансы",
+	countWorking: (n) => `работают: ${n}`,
+	countApproval: (n) => `ждут одобрения: ${n}`,
+	countYourTurn: (n) => `ваша очередь: ${n}`,
+	countStalled: (n) => `зависли?: ${n}`,
+	tokensChart: "Токены / минуту",
+	attentionTitle: (n) => `Требует внимания (${n})`,
+	noOpenSessions: "Открытых сеансов нет.",
+	attention_approval: (who) => `${who} ждёт одобрения`,
+	attention_your_turn: (who) => `${who} закончил — ваша очередь`,
+	attention_stalled: (who) => `${who}, возможно, завис`,
+	attention_loop: (who) => `${who}: возможен цикл`,
+	attention_big_context: (who) => `${who}: большой контекст`,
+	healthAccounts: "Аккаунты",
+	healthModels: "Модели",
+	healthChains: "Цепочки резервных моделей",
+	healthSpeed: "Скорость моделей",
+	notSetUp: (n, names) => `Здесь не настроены (${n}): ${names}`,
+	last24h: "за 24 ч",
+	none: "Нечего показать.",
+	credentialN: (n) => `учётные данные ${n}`,
+	credLocked: "лимит исчерпан",
+	unlocksIn: (span) => ` — снова доступен через ${span}`,
+	modelStatus_ok: "ок",
+	modelStatus_idle: "простаивает",
+	modelStatus_degraded: "сбоит",
+	modelStatus_failing: "ошибки",
+	modelStatus_account_exhausted: "лимит аккаунта",
+	callsN: (n) => ruN(n, "вызов", "вызова", "вызовов"),
+	errorRate: (pct) => `${pct}\u00a0% ошибок`,
+	errorsN: (n) => ruN(n, "ошибка", "ошибки", "ошибок"),
+	cooldownFor: (span) => `пауза ${span}`,
+	recovered: "восстановлена",
+	chainOk: "доступна",
+	chainSkip: (reason) => `пропущена: ${reason}`,
+	chainRisky: (pct) => `рискованно (${pct}\u00a0% ошибок)`,
+	skip_same_backend: "тот же бэкенд, что у основной",
+	skip_no_credentials: "нет учётных данных",
+	skip_locked: "все учётные данные заблокированы",
+	skip_cooldown: "на паузе",
+	skip_undefined: "неизвестно",
+	noFallbacks: "резервные модели не настроены",
+	speedLine: (p50, p90, turns) => `медиана ${p50} · p90 ${p90} · ${ruN(turns, "ход", "хода", "ходов")}`,
+	costToday: "Сегодня",
+	costMonth: "Этот месяц",
+	projection: (cost) => `к концу месяца ≈ ${cost}`,
+	projectionOver: (cost) => `к концу месяца ≈ ${cost} — сверх бюджета`,
+	budgetTitle: "Бюджет",
+	budgetDaily: "В день",
+	budgetMonthly: "В месяц",
+	budgetHint: "Задайте дневной или месячный бюджет в настройках, чтобы следить за расходами.",
+	budgetOff: "выкл.",
+	budgetSettingsHint: "USD; пусто или 0 = выкл. Стоимость — оценка по ценам API.",
+	last7Days: "Последние 7 дней",
+	topModels: "Топ моделей · месяц",
+	topProfiles: "Топ профилей · месяц",
+	topSessions: "Топ сеансов · 7 дней",
+	sessionsN: (n) => ruN(n, "сеанс", "сеанса", "сеансов"),
+	costEstimateNote: "Стоимость — оценка по ценам API; подписка не оплачивается по токенам.",
+	board: "Доска",
+	noBoards: "Канбан-досок нет.",
+	kanbanQuiet: "Нет карточек в работе, заблокированных, на проверке или с ошибками.",
+	kanbanGroup_running: "В работе",
+	kanbanGroup_blocked: "Заблокированы",
+	kanbanGroup_review: "Проверка",
+	kanbanGroup_failing: "С ошибками",
+	kanban_todo: "к выполнению",
+	kanban_triage: "разбор",
+	kanban_ready: "готово к работе",
+	kanban_running: "в работе",
+	kanban_blocked: "заблокирована",
+	kanban_review: "проверка",
+	kanban_done: "готово",
+	kanban_archived: "в архиве",
+	unassigned: "не назначена",
+	failuresN: (n) => `ошибок подряд: ${n}`,
+	cardWhat_input: "ждёт вашего ответа",
+	cardWhat_blocked: "заблокирована",
+	cardWhat_review: "ждёт проверки",
+	cardWhat_failing: "с ошибками",
+	burnRate: (rate) => `${rate}\u00a0%/ч`,
+	burnFlat: "без изменений за 2 ч",
+	fillsIn: (span) => `заполнится через ~${span}`,
+	beforeReset: (span) => `за ${span} до сброса`,
+	noFillBeforeReset: "не заполнится до сброса",
+	accountHint: (full, used, room) => `${full}: ${used}\u00a0% · у ${room} есть запас`,
+	accountHintBody: (window, left, room) => `${window}: у ${room} осталось ${left}\u00a0%`,
+	chipWorking: (n) => `работают: ${n}`,
+	chipYourTurn: (n) => `ваша очередь: ${n}`,
+	chipApproval: (n) => `одобрение: ${n}`,
+	chipOpenLive: "Нажмите, чтобы открыть «Сейчас»",
+	// ---- status bar chips + cards ----
+	chipOpenList: "Нажмите, чтобы увидеть список сеансов",
+	chipQuotaOpen: "Нажмите, чтобы открыть карточку квот (со ссылкой на панель квот)",
+	chipCostOpen: "Нажмите, чтобы увидеть расходы подробно",
+	chipFullIn: (span) => `заполнится ~${span}`,
+	cardOpenLive: "Открыть «Сейчас»",
+	cardOpenQuota: "Открыть квоты",
+	cardOpenUsage: "Открыть расход",
+	cardOpen: "открыть",
+	cardCopy: "копировать",
+	tokensPerMinN: (n) => `${n} токенов/мин`,
+	quotaCardTitle: "Окна квот",
+	checkedAgo: (age) => `проверено ${age} назад`,
+	costCardTitle: "Расходы",
+	monthEnd: "Конец месяца",
+	topModelsToday: "Топ моделей · сегодня",
+	costChipAria: (cost) => `сегодня потрачено ${cost}`,
+	costOfDaily: (pct) => `${pct}\u00a0% дневного бюджета`,
+	costOfMonthly: (pct) => `${pct}\u00a0% месячного бюджета`,
+	quotaAlertsLabel: "Отсчёт до сброса и время до заполнения на чипе квот",
+	quotaAlertsHint: (pct) => `Только когда окно использовано на ${pct}\u00a0%+ или прогноз заполняет его до сброса.`,
+	chipSparkLabel: "Мини-график токенов в минуту в чипе агентов",
+	chipFlashLabel: "Мигать чипом агентов, когда сеанс ждёт вас",
+	chipFlashHint: "Один раз на сеанс, который начал ждать вашей очереди или одобрения. Учитывает «Уменьшить движение».",
+	costChipLabel: "Чип «потрачено сегодня»",
+	costChipHint: "Цвет зависит от бюджета (80\u00a0% — предупреждение, 100\u00a0% — превышение). По умолчанию включён, когда задан бюджет.",
+	notifyQuotaTitle: (pct) => `Квота использована на ${pct}\u00a0%`,
+	notifyResetsIn: (span) => ` — сброс через ${span}`,
+	notifySoonTitle: "Квота скоро закончится",
+	notifySoonBody: (span) => `при таком темпе заполнится через ~${span}, до сброса`,
+	notifyBudgetTitle: (label, pct) => `Бюджет (${label}): ${pct}\u00a0%`,
+	notifyCardTitle: (what) => `Канбан: карточка ${what}`,
+	notifyModelTitle: (status, model) => `Модель ${status}: ${model}`,
+	notifyLockedTitle: (provider) => `Лимит аккаунта исчерпан: ${provider}`,
+	monitorSettingsTitle: "Монитор агентов",
+	monitorEnabledLabel: "Монитор агентов",
+	monitorEnabledHint: "Активные сеансы, состояние, расход и канбан — одно дополнительное чтение через CLI за интервал обновления.",
+	agentsChipLabel: "Показывать чип «работает / ваша очередь» в статус-баре",
+	quotaForecastLabel: "Темп расхода, прогноз и история во вкладке квот",
+	quotaForecastHint: "История читается раз в несколько минут и только пока открыта вкладка квот.",
+	historyRangeLabel: "Период истории",
+	liveIntervalLabel: "Обновление «Сейчас»",
+	navBadgeLabel: "Счётчики в боковой панели",
+	navBadgeHint: "Показывает работающих агентов, одобрения, низкую квоту и почти заполненный контекст чата рядом с пунктом меню «Квоты».",
+	navWorking: (n) => `активно: ${n}`,
+	navYourTurn: (n) => `ваша очередь: ${n}`,
+	navApproval: (n) => `одобрение: ${n}`,
+	navStalled: (n) => `зависли: ${n}`,
+	historyDay: "24 ч",
+	historyWeek: "7 дней",
+	notificationsTitle: "Уведомления",
+	notificationsHint: "Системные уведомления приходят, только когда вы не в Hermes, — по одному на событие.",
+	notify_quota: "Квота 80\u00a0% / 95\u00a0%, скоро закончится, подсказки по аккаунтам",
+	notify_budget: "Бюджет 80\u00a0% / 100\u00a0%",
+	notify_kanban: "Карточки канбана заблокированы, на проверке или с ошибками",
+	notify_health: "Модели с ошибками и заблокированные аккаунты",
+	notify_agents: "Агенты, которые ждут одобрения, зависли, зациклились или с большим контекстом",
+	notify_turns: "Агент закончил — ваша очередь",
+	// ---- Agent Bar layout ----
+	left: "осталось",
+	historyCaption: "История использования, %",
+	summaryLowest: (pct) => `минимум ${pct}\u00a0% осталось`,
+	summaryToday: (cost) => `${cost} сегодня`,
+	messagesChart: "Сообщения / минуту",
+	dailyChart: "Расход по дням",
+	dailyAvg: (cost) => `≈ ${cost} / день`,
+	budgetSub: "оценка стоимости API",
+	settingsGroupStatusBar: "Статус-бар и боковая панель",
+	settingsGroupQuota: "Вкладка квот",
+	subagentsN: (n) => `субагентов работает: ${n}`,
+	// ---- context guard ----
+	ctxChipOthers: (n, w) => `${ruN(n, "сеанс", "сеанса", "сеансов")} ≥ ${w}\u00a0%`,
+	ctxChipAria: (pct) => `Контекст заполнен на ${pct}\u00a0%`,
+	ctxTipFocused: (pct, used, max) => `Этот чат: контекст заполнен на ${pct}\u00a0% (${used} / ${max})`,
+	ctxTipOthers: (n, w) => `Ещё ${ruN(n, "открытый сеанс", "открытых сеанса", "открытых сеансов")} ≥ ${w}\u00a0%`,
+	ctxTipOpen: "Нажмите для подробностей и /compress",
+	ctxCardTitle: "Контекст",
+	ctxWarnSub: (w) => `предупреждение с ${w}\u00a0%`,
+	ctxFocused: "Этот чат",
+	ctxTokensOf: (used, max) => `${used} / ${max} токенов`,
+	ctxEstimated: "оценка",
+	ctxCompressions: (n) => (n ? `сжат ${n}× к этому моменту` : "ещё не сжимался"),
+	ctxCompress: "Сжать…",
+	ctxCompressNow: "Сжать",
+	ctxCancel: "Отмена",
+	ctxConfirm: "Старые ходы будут кратко пересказаны, чтобы освободить контекст, — то же, что /compress в этом чате.",
+	ctxTopicPlaceholder: "Тема для фокуса (необязательно)",
+	ctxBusy: "Дождитесь окончания текущего хода.",
+	ctxNoSession: "Откройте чат, чтобы сжать его.",
+	ctxNoUsage: "Для этого чата пока нет данных о контексте.",
+	ctxOthersTitle: (w) => `Другие сеансы ≥ ${w}\u00a0%`,
+	ctxNothing: (w) => `Нет открытых сеансов с ${w}\u00a0% и более.`,
+	ctxCompressSent: "Сжимаем контекст этого чата…",
+	ctxCompressFailed: "Не удалось обратиться к полю ввода этого чата — откройте чат и попробуйте снова.",
+	ctxRowTip: (used, max) => `Контекст ${used} / ${max}`,
+	contextOfN: (used, max) => `контекст ${used}/${max}`,
+	contextChipLabel: "Показывать чип-предупреждение о контексте в статус-баре",
+	contextChipHint: "Только пока контекст чата на пороге или выше — основная панель уже показывает расход активного чата.",
+	contextWarnLabel: "Предупреждать о контексте с",
+	contextWarnHint: (d) => `Чип, вкладка «Сейчас» и уведомления; от ${d}\u00a0% — красный.`,
+	notify_context: "Окно контекста заполняется (порог / 90\u00a0%)",
+	notifyContextTitle: (pct) => `Контекст заполнен на ${pct}\u00a0%`,
+	notifyContextBody: "сожмите его (/compress) или начните новый чат",
+	navContext: (pct) => `контекст ${pct}\u00a0%`,
+	// ---- locale-aware formatting + status-bar tooltips ----
+	_locale: "ru",
+	navLabel: "Квоты",
+	resetToday: (time) => `сегодня в ${time}`,
+	resetTomorrow: (time) => `завтра в ${time}`,
+	resetting: "сбрасывается…",
+	spanDH: (d, h) => `${d}\u00a0д ${h}\u00a0ч`,
+	spanHM: (h, m) => `${h}\u00a0ч ${m}\u00a0мин`,
+	spanM: (m) => `${m}\u00a0мин`,
+	spanH: (h) => `${h}\u00a0ч`,
+	spanS: (s) => `${s}\u00a0с`,
+	spanLt1m: "<1\u00a0мин",
+	updateAvailable: "⬆ Доступно обновление — выполните ./install.sh",
+	accountN: (n) => `Аккаунт ${n}`,
+	valueUnknown: "неизвестно",
+	valueLeft: (v) => `осталось ${v}`,
+	stale: "устарело",
+	valueUnavailable: "недоступно",
+	valueAvailable: "доступно",
+	quotaBreakdown: "Квоты подробно:",
+	providerUnavailable: (name) => `${name}: недоступно`,
+	providerUnavailableReason: (name, reason) => `${name}: недоступно (${reason})`,
+	accountBalance: "Баланс аккаунта",
+	accountBalanceLine: (v) => `Баланс аккаунта: ${v}`,
+	apiCallsAvailable: (ok) => `Вызовы API доступны: ${ok ? "да" : "нет"}`,
+	planLine: (plan) => `Тариф: ${plan}`,
+	windowFallback: "окно",
+	resetsAt: (when) => `сброс ${when}`,
+	seriesTotal: "всего",
+};
 
-		// Spend-today chip, right of the quota chips. Off unless a budget is
-		// set (or the user switched it on); reads the same monitor snapshot.
-		ctx.register({
-			id: "cost",
-			area: STATUSBAR_AREAS.right,
-			order: 126,
-			render: () => jsx(CostChip, {}),
-		});
+const I18N_JA = {
+	paneTitle: "クォータ",
+	settingsTitle: "クォータ · 設定",
+	chipTip: (pct, label, reset) =>
+		`クォータ · 最小 ${pct}%（${label}）${reset ? ` · ${reset}後にリセット` : ""}`,
+	providerTip: (label, pct, reset) =>
+		`${label} · ${pct}%${reset ? ` · ${reset}後にリセット` : ""}`,
+	popoverReset: (reset) => `${reset}後にリセット`,
+	refreshTip: "クォータを更新",
+	settingsTip: "クォータの設定",
+	backTip: "クォータに戻る",
+	loading: "読み込み中…",
+	error: "クォータのバックエンドを利用できません",
+	empty: "クォータのデータはまだありません。",
+	emptyHint: "クォータのデータを自動で準備しています…",
+	unavailable: (reason) => `利用不可（${reason}）`,
+	moreDetails: (n) => `ほか ${n} 件`,
+	noData: "ウィンドウのデータなし",
+	noDataSection: (n) => `データなし（${n}）— クリックで展開`,
+	reset: (when) => `リセット ${when}`,
+	fetched: (when) => `確認 ${when}`,
+	fetchedAge: (age, interval) => `${age}前 · ${interval}秒ごとに取得`,
+	versionSkew: (widget, backend) =>
+		`ウィジェット v${widget} · バックエンド v${backend} — デスクトッププラグインを再読み込み（またはアプリを再起動）して揃えてください。`,
+	resetFormatLabel: "リセットの表示",
+	relative: "相対",
+	absolute: "絶対",
+	statusbarModeLabel: "ステータスバーの表示",
+	statusbarModeAll: "すべてのプロバイダー",
+	statusbarModeWorst: "最も低いものだけ",
+	paneDetailLabel: "パネルの詳細度",
+	paneDetailClean: "シンプル",
+	paneDetailCleanHint: "リングだけ",
+	paneDetailDense: "詳細",
+	paneDetailDenseHint: "ウィンドウ、リセット、詳細行",
+	showStatusBarLabel: "ステータスバーに表示",
+	showStatusBarHint:
+		"Hermes のステータスバーも表示されている必要があります（⌘K → Toggle status bar）。",
+	showDockedPaneLabel: "ドッキングしたクォータパネルを表示",
+	settingsButton: "設定",
+	refreshIntervalLabel: "更新間隔",
+	refreshIntervalHint: (seconds, min, max) =>
+		`${seconds}秒ごとにキャッシュを読み込みます（${min}〜${max}秒）。更新はバックグラウンドで行われるため、間隔は正確です。`,
+	seconds: "秒",
+	disabledProvidersLabel: "有効なプロバイダー",
+	disableTooltip: "このプロバイダーを無効にする",
+	enableTooltip: "このプロバイダーを有効にする",
 
-		// Chip keyframes (attention flash) + focus ring, scoped `qm-sb-`.
-		const styleEl = ensureStatusbarStyles();
-		try {
-			ctx.onDispose?.(() => styleEl?.remove?.());
-		} catch {
-			/* older host */
-		}
+	tab_quota: "クォータ",
+	tab_live: "ライブ",
+	tab_health: "状態",
+	tab_usage: "使用量",
+	tab_kanban: "カンバン",
+	tab_accounts: "アカウント",
+	accountsTabLabel: "アカウントタブ",
+	accountsTabHint: "認証情報プール、アカウントの順序、プール戦略、代替モデル、未サインイン。アカウントを変更しないなら非表示にできます。",
+	accountsExplainer: "Hermes はプロバイダーのプールから認証情報を選びます。自分のログインを持たないプロファイルは default プロファイルのプールを共有するため、その順序はすべてに適用されます。戦略はプロファイルごとです。変更は確認後に Hermes 自身の CLI で実行されます。",
+	accountsPoolsTitle: "認証情報プール",
+	accountsPoolsSub: (n) => `${n} 個のプール`,
+	accountsNoPools: "プールに認証情報がまだありません。下でサインインするか `hermes auth add <provider>` を実行してください。",
+	accountsSharedPool: (n) => `共有 · ${n} プロファイル`,
+	accountsSharedTip: (list) => `使用中: ${list}`,
+	accountsOwnPool: (owner) => `専用プール · ${owner}`,
+	accountsCount: (n) => `${n} アカウント`,
+	accountsProviderQuota: (label, used) => `プロバイダーのクォータ（使用中のアカウント）: ${label} ${used}% 使用`,
+	accountsListAria: (name) => `${name} のアカウント（Hermes が試す順）`,
+	accountsRowAria: (n, label) => `${n}. ${label}。Alt+上 / Alt+下 で移動`,
+	accountsRingLabel: (label, left) => `${label}: 残り ${left}%`,
+	accountsRingNone: "このアカウントのクォータ値はありません",
+	accountsTriedFirst: "最初に試す",
+	accountsTriedFirstTip: "この順序で最初に使えるアカウント — fill_first は使い切るまでこれを使います。",
+	accountsTypeOauth: "OAuth",
+	accountsTypeKey: "API キー",
+	accountsTypeOther: "その他",
+	accountsSourceTip: "Hermes がこの認証情報を取得した場所",
+	accountsStatus_active: "有効",
+	accountsStatus_cooldown: "クールダウン",
+	accountsStatus_exhausted: "上限到達",
+	accountsStatusUntil: (status, left) => `${status} · ${left}`,
+	accountsCooldownModels: (models) => `クールダウン中: ${models}`,
+	accountsMoveUp: (label) => `${label} を上へ`,
+	accountsMoveDown: (label) => `${label} を下へ`,
+	accountsDragHint: "行をドラッグするか ▲▼ / Alt+↑↓ で、最初に試すアカウントを変更します。",
+	accountsNotWritable: "このプールはここでは並べ替えできません（プール ID のない行があります）。",
+	accountsSingle: "アカウントは 1 つだけ — 並べ替えるものはありません。`hermes auth add <provider>` で追加できます。",
+	accountsBlocked_loading: "アカウントデータを更新中… 最新になるまで変更は保留されます。",
+	accountsBlocked_stale: "アカウントデータが古くなっています — 変更する前に更新してください。",
+	accountsBlocked_busy: "変更を適用中…",
+	accountsBlocked_confirm: "先に保留中の変更を確定またはキャンセルしてください。",
+	accountsSharedWarning: (owner, others) => `「${owner}」の共有プール: 並べ替えると ${others || "ほかのプロファイルはなし"} にも影響します。`,
+	accountsStrategyTitle: "プロファイルごとの戦略",
+	strategy_fill_first: "順に使い切る",
+	strategy_round_robin: "ラウンドロビン",
+	strategy_least_used: "最小使用",
+	strategy_random: "ランダム",
+	strategyShort_fill_first: "順次",
+	strategyShort_round_robin: "巡回",
+	strategyShort_least_used: "最小",
+	strategyShort_random: "ランダム",
+	strategyHint_fill_first: "最初のアカウントを使い切ったら次へ（順序が重要）。",
+	strategyHint_round_robin: "アカウントを均等に順番に使う（順序は同点時のみ）。",
+	strategyHint_least_used: "常に使用量が最も少ないアカウントを選ぶ。",
+	strategyHint_random: "アカウントをランダムに選ぶ。",
+	accountsProfilesTitle: "プロファイル",
+	accountsProfilesSub: "プールへのアクセス · 戦略 · モデル → 代替",
+	accountsProfileCol: "プロファイル",
+	accountsChainCol: "モデル → 代替",
+	accountsRootTag: "ルート",
+	accountsAccess_own: "専用",
+	accountsAccess_shared: "共有",
+	accountsPrimaryTip: "メインモデル",
+	accountsFallbackTip: (n) => `代替 #${n}`,
+	accountsCustomRoute: "カスタムエンドポイント",
+	accountsNoModel: "モデル未設定",
+	accountsFallbackCopyTip: "コピー — Hermes が代替チェーンを編集できるのは対話式の選択画面だけです（または、そこで選んだプロファイルの 設定 ▸ モデル ▸ 代替）。",
+	accountsFallbackEdit: "代替コマンドをコピー",
+	accountsFallbackNote: "代替の順序はここでは読み取り専用です: Hermes には非対話で並べ替える方法がありません。コマンドをコピーしてターミナルで実行してください。",
+	accountsSigninTitle: "未サインイン",
+	accountsSigninSub: (n) => `${n} 件の対応が必要`,
+	accountsAllSignedIn: "クォータキャッシュが知っているすべてのプロバイダーにサインイン済みです。",
+	accountsOtherUnavailable: (n) => `${n} 件が一時的に利用不可`,
+	accountsMoreSignin: (n) => `ほかにログインのないもの ${n} 件`,
+	accountsUsed: "使用中",
+	accountsUsedTip: "いずれかのプロファイルのモデルまたは代替がこのプロバイダーを使用しています",
+	accountsKind_signin: "未サインイン",
+	accountsKind_reauth: "再サインイン",
+	accountsKind_optin: "オフ",
+	accountsKind_rate_limited: "レート制限",
+	accountsKind_error: "利用不可",
+	accountsReason_signin: (reason, tool) => tool ? `ログインが見つかりません（${reason}）。${tool} でサインインしてください。` : `ログインが見つかりません（${reason}）。`,
+	accountsReason_reauth: (reason) => `保存されたログインはもう使えません（${reason}）。`,
+	accountsReason_optin: (reason, tool) => `クォータプラグインでオフになっています（${reason}）。${tool || "このプロバイダー"}を読み取るにはオンにしてください。`,
+	accountsReason_rate_limited: () => "プロバイダーがクォータの読み取りを制限しています。サインインは不要です。",
+	accountsReason_error: (reason) => `前回の読み取りに失敗しました（${reason}）。次回の更新で再試行します。`,
+	accountsRetryIn: (left) => `${left}後に再試行`,
+	accountsRetrySoon: "次回の更新で再試行",
+	accountsSigninAction: "サインイン",
+	accountsAddKeyAction: "API キーを追加",
+	accountsReason_key: (reason) => `API キーが見つかりません（${reason}）。`,
+	accountsReauthAction: "再サインイン",
+	accountsOptinAction: "オンにする",
+	accountsCopyTip: "このコマンドをコピーしてターミナルで実行してください（サインインはブラウザーを開くため、ここからは実行できません）",
+	accountsLimits: "Hermes にはプロファイルごとのアカウント割り当てはありません: 自分のログイン（`hermes -p <profile> auth add <provider>`）がない限り、プロファイルは共有プールを使います。順序はプールに、戦略はプロファイルに属します。ここでプロファイル間の認証情報を移動・コピーすることはありません。",
+	accountsConfirmOrderTitle: (name) => `${name} のアカウント順序を変更しますか？`,
+	accountsConfirmOrderShared: (owner, n) => `これは「${owner}」が所有する共有プールです。新しい順序は、これを使う ${n} 個のプロファイルすべてに適用されます。`,
+	accountsConfirmOrderOwn: (owner) => `このプールを使うのは「${owner}」だけです。`,
+	accountsConfirmBefore: "現在",
+	accountsConfirmAfter: "変更後",
+	accountsConfirmFirst: (label) => `fill_first で最初に試すもの: ${label}。`,
+	accountsConfirmProfiles: (list) => `影響: ${list}`,
+	accountsConfirmStrategyTitle: (profile, name) => `${profile} の ${name} 戦略を変更しますか？`,
+	accountsConfirmStrategyDesc: (profile) => `変わるのは「${profile}」だけです。ほかのプロファイルは自分の戦略を保ちます。`,
+	accountsConfirmApply: "適用",
+	accountsConfirmBusy: "適用中…",
+	accountsConfirmCancel: "キャンセル",
+	accountsSavedOrder: (name) => `${name} のアカウント順序を保存しました`,
+	accountsSavedStrategy: (profile, s) => `${profile}: 戦略を ${s} にしました`,
+	accountsWriteUnsupported: "ゲートウェイのクォータプラグインが古く、まだアカウントを変更できません — 更新してください。",
+	accountsUnsupported: "このゲートウェイのクォータプラグインはアカウント画面より古いバージョンです — バックエンドを更新してください。",
+	accountsError: "アカウントデータを読み取れませんでした。",
+	monitorOff: "エージェントモニターはオフです — 設定でオンにしてください。",
+	monitorUnsupported:
+		"このゲートウェイのクォータプラグインにはエージェントモニターがまだありません — ライブのセッション、状態、使用量、カンバンを見るには更新してください（./install.sh）。",
+	monitorError: "エージェントモニターは現在利用できません。",
+	sectionError: (section) => `今回は ${section} のデータを読み取れませんでした。`,
+	monitorUpdated: (when, interval) => `更新 ${when} · ${interval}秒ごとに取得`,
+	state_working: "作業中",
+	state_waiting: "あなたの番",
+	state_needs_approval: "承認待ち",
+	state_stalled: "停止中？",
+	state_long_tool: "長いツール呼び出し",
+	state_ended: "終了",
+	untitled: "（無題のセッション）",
+	subagent: "サブエージェント",
+	agent: "エージェント",
+	cliSource: "CLI",
+	tokensN: (n) => `${n} トークン`,
+	contextN: (n) => `コンテキスト ${n}`,
+	ago: (span) => `${span}前`,
+	longToolCall: (tool) => `長いツール呼び出しを実行中: ${tool}`,
+	openSessionTip: "このセッションを開く",
+	copyCommandTip: (command) => `コピー: ${command}`,
+	commandCopied: (command) => `コピーしました: ${command}`,
+	commandCopyFailed: (command) => `コピーできませんでした — 実行してください: ${command}`,
+	last1m: "直近 1 分",
+	last60m: "直近 60 分",
+	tokensPerMin: "トークン / 分",
+	costPerMin: (cost) => `≈ ${cost} / 分`,
+	cost60m: (cost) => `60 分で ≈ ${cost}`,
+	openSessions: "開いているセッション",
+	countWorking: (n) => `${n} 件作業中`,
+	countApproval: (n) => `${n} 件承認待ち`,
+	countYourTurn: (n) => `${n} 件あなたの番`,
+	countStalled: (n) => `${n} 件停止中？`,
+	tokensChart: "トークン / 分",
+	attentionTitle: (n) => `要対応（${n}）`,
+	noOpenSessions: "開いているセッションはありません。",
+	attention_approval: (who) => `${who} が承認を待っています`,
+	attention_your_turn: (who) => `${who} が完了 — あなたの番です`,
+	attention_stalled: (who) => `${who} が停止している可能性があります`,
+	attention_loop: (who) => `${who}: ループの可能性`,
+	attention_big_context: (who) => `${who}: コンテキストが大きい`,
+	healthAccounts: "アカウント",
+	healthModels: "モデル",
+	healthChains: "代替チェーン",
+	healthSpeed: "モデルの速度",
+	notSetUp: (n, names) => `ここでは未設定（${n}）: ${names}`,
+	last24h: "直近 24 時間",
+	none: "表示するものはありません。",
+	credentialN: (n) => `認証情報 ${n}`,
+	credLocked: "上限到達",
+	unlocksIn: (span) => ` — ${span}後に解除`,
+	modelStatus_ok: "正常",
+	modelStatus_idle: "待機",
+	modelStatus_degraded: "低下",
+	modelStatus_failing: "失敗中",
+	modelStatus_account_exhausted: "アカウント上限",
+	callsN: (n) => `${n} 回の呼び出し`,
+	errorRate: (pct) => `エラー ${pct}%`,
+	errorsN: (n) => `${n} 件のエラー`,
+	cooldownFor: (span) => `クールダウン ${span}`,
+	recovered: "回復",
+	chainOk: "使用可",
+	chainSkip: (reason) => `スキップ: ${reason}`,
+	chainRisky: (pct) => `要注意（エラー ${pct}%）`,
+	skip_same_backend: "メインと同じバックエンド",
+	skip_no_credentials: "認証情報なし",
+	skip_locked: "すべての認証情報がロック中",
+	skip_cooldown: "クールダウン中",
+	skip_undefined: "不明",
+	noFallbacks: "代替モデルは未設定",
+	speedLine: (p50, p90, turns) => `中央値 ${p50} · p90 ${p90} · ${turns} ターン`,
+	costToday: "今日",
+	costMonth: "今月",
+	projection: (cost) => `月末 ≈ ${cost}`,
+	projectionOver: (cost) => `月末 ≈ ${cost} — 予算超過`,
+	budgetTitle: "予算",
+	budgetDaily: "日次",
+	budgetMonthly: "月次",
+	budgetHint: "設定で日次または月次の予算を設定すると、支出を追跡できます。",
+	budgetOff: "オフ",
+	budgetSettingsHint: "USD。空欄または 0 = オフ。コストは API 価格による推定です。",
+	last7Days: "直近 7 日",
+	topModels: "上位モデル · 月",
+	topProfiles: "上位プロファイル · 月",
+	topSessions: "上位セッション · 7 日",
+	sessionsN: (n) => `${n} セッション`,
+	costEstimateNote: "コストは API 価格による推定です。サブスクリプションはトークン単位で請求されません。",
+	board: "ボード",
+	noBoards: "カンバンボードはありません。",
+	kanbanQuiet: "実行中・ブロック中・レビュー中・失敗中のものはありません。",
+	kanbanGroup_running: "実行中",
+	kanbanGroup_blocked: "ブロック中",
+	kanbanGroup_review: "レビュー",
+	kanbanGroup_failing: "失敗中",
+	kanban_todo: "未着手",
+	kanban_triage: "トリアージ",
+	kanban_ready: "準備完了",
+	kanban_running: "実行中",
+	kanban_blocked: "ブロック中",
+	kanban_review: "レビュー",
+	kanban_done: "完了",
+	kanban_archived: "アーカイブ済み",
+	unassigned: "未割り当て",
+	failuresN: (n) => `${n} 回失敗`,
+	cardWhat_input: "入力待ち",
+	cardWhat_blocked: "ブロック中",
+	cardWhat_review: "レビュー待ち",
+	cardWhat_failing: "失敗中",
+	burnRate: (rate) => `${rate}%/時`,
+	burnFlat: "直近 2 時間で変化なし",
+	fillsIn: (span) => `約 ${span}で上限`,
+	beforeReset: (span) => `リセットの ${span}前`,
+	noFillBeforeReset: "リセットまでに上限に達しない",
+	accountHint: (full, used, room) => `${full} は ${used}% · ${room} に余裕あり`,
+	accountHintBody: (window, left, room) => `${window}: ${room} は残り ${left}%`,
+	chipWorking: (n) => `${n} 作業中`,
+	chipYourTurn: (n) => `${n} あなたの番`,
+	chipApproval: (n) => `${n} 承認`,
+	chipOpenLive: "クリックでライブを開く",
+	// ---- status bar chips + cards ----
+	chipOpenList: "クリックでセッション一覧",
+	chipQuotaOpen: "クリックでクォータカード（クォータパネルへのリンク付き）",
+	chipCostOpen: "クリックで支出の詳細",
+	chipFullIn: (span) => `上限まで ~${span}`,
+	cardOpenLive: "ライブを開く",
+	cardOpenQuota: "クォータを開く",
+	cardOpenUsage: "使用量を開く",
+	cardOpen: "開く",
+	cardCopy: "コピー",
+	tokensPerMinN: (n) => `${n} トークン/分`,
+	quotaCardTitle: "クォータウィンドウ",
+	checkedAgo: (age) => `${age}前に確認`,
+	costCardTitle: "支出",
+	monthEnd: "月末",
+	topModelsToday: "上位モデル · 今日",
+	costChipAria: (cost) => `今日の支出 ${cost}`,
+	costOfDaily: (pct) => `日次予算の ${pct}%`,
+	costOfMonthly: (pct) => `月次予算の ${pct}%`,
+	quotaAlertsLabel: "クォータチップにリセットまでの時間と上限までの時間を表示",
+	quotaAlertsHint: (pct) => `ウィンドウが ${pct}% 以上使われたとき、または予測でリセット前に上限に達するときだけ。`,
+	chipSparkLabel: "エージェントチップにトークン/分のミニグラフ",
+	chipFlashLabel: "セッションがあなたを必要とするときエージェントチップを点滅",
+	chipFlashHint: "あなたの番または承認待ちになったセッションごとに 1 回。「視差効果を減らす」に従います。",
+	costChipLabel: "今日の支出チップ",
+	costChipHint: "予算に応じて色が変わります（80% 警告、100% 超過）。既定: 予算を設定するとオン。",
+	notifyQuotaTitle: (pct) => `クォータ ${pct}%`,
+	notifyResetsIn: (span) => ` — ${span}後にリセット`,
+	notifySoonTitle: "クォータがまもなく上限",
+	notifySoonBody: (span) => `このペースだと約 ${span}でリセット前に上限に達します`,
+	notifyBudgetTitle: (label, pct) => `${label}予算 ${pct}%`,
+	notifyCardTitle: (what) => `カンバン: カードが${what}`,
+	notifyModelTitle: (status, model) => `モデル${status}: ${model}`,
+	notifyLockedTitle: (provider) => `アカウント上限に到達: ${provider}`,
+	monitorSettingsTitle: "エージェントモニター",
+	monitorEnabledLabel: "エージェントモニター",
+	monitorEnabledHint: "ライブのセッション、状態、使用量、カンバン — 更新間隔ごとに CLI の読み取りが 1 回増えます。",
+	agentsChipLabel: "ステータスバーに作業中 / あなたの番のチップを表示",
+	quotaForecastLabel: "クォータ画面に消費ペース、予測、履歴を表示",
+	quotaForecastHint: "履歴は数分ごと、クォータ画面が開いているときだけ読み取ります。",
+	historyRangeLabel: "履歴の範囲",
+	liveIntervalLabel: "ライブの更新間隔",
+	navBadgeLabel: "サイドバーにライブ件数",
+	navBadgeHint: "クォータのメニュー項目の横に、作業中のエージェント、承認待ち、残り少ないクォータ、上限に近いチャットのコンテキストを表示します。",
+	navWorking: (n) => `${n} 作業中`,
+	navYourTurn: (n) => `${n} あなたの番`,
+	navApproval: (n) => `${n} 承認`,
+	navStalled: (n) => `${n} 停止`,
+	historyDay: "24 時間",
+	historyWeek: "7 日",
+	notificationsTitle: "通知",
+	notificationsHint: "システム通知は Hermes から離れているときだけ、イベントごとに 1 回表示されます。",
+	notify_quota: "クォータ 80% / 95%、まもなく上限、アカウントのヒント",
+	notify_budget: "予算 80% / 100%",
+	notify_kanban: "ブロック・レビュー待ち・失敗中のカンバンカード",
+	notify_health: "失敗中のモデルとロックされたアカウント",
+	notify_agents: "承認待ち、停止、ループ、コンテキストが大きいエージェント",
+	notify_turns: "エージェントが完了 — あなたの番",
+	// ---- Agent Bar layout ----
+	left: "残り",
+	historyCaption: "使用率の履歴",
+	summaryLowest: (pct) => `最小 残り ${pct}%`,
+	summaryToday: (cost) => `今日 ${cost}`,
+	messagesChart: "メッセージ / 分",
+	dailyChart: "日ごとのコスト",
+	dailyAvg: (cost) => `≈ ${cost} / 日`,
+	budgetSub: "API コストの推定",
+	settingsGroupStatusBar: "ステータスバーとサイドバー",
+	settingsGroupQuota: "クォータ画面",
+	subagentsN: (n) => `${n} 個のサブエージェントが実行中`,
+	// ---- context guard ----
+	ctxChipOthers: (n, w) => `${n} セッション ≥ ${w}%`,
+	ctxChipAria: (pct) => `コンテキスト ${pct}% 使用`,
+	ctxTipFocused: (pct, used, max) => `このチャット: コンテキスト ${pct}% 使用（${used} / ${max}）`,
+	ctxTipOthers: (n, w) => `ほかに ${w}% 以上の開いているセッション ${n} 件`,
+	ctxTipOpen: "クリックで詳細と /compress",
+	ctxCardTitle: "コンテキスト",
+	ctxWarnSub: (w) => `${w}% で警告`,
+	ctxFocused: "このチャット",
+	ctxTokensOf: (used, max) => `${used} / ${max} トークン`,
+	ctxEstimated: "推定",
+	ctxCompressions: (n) => (n ? `これまでに ${n} 回圧縮` : "まだ圧縮していません"),
+	ctxCompress: "圧縮…",
+	ctxCompressNow: "圧縮",
+	ctxCancel: "キャンセル",
+	ctxConfirm: "古いターンを要約してコンテキストを空けます — このチャットで /compress と入力するのと同じです。",
+	ctxTopicPlaceholder: "重点トピック（任意）",
+	ctxBusy: "現在のターンが終わるまでお待ちください。",
+	ctxNoSession: "圧縮するにはチャットを開いてください。",
+	ctxNoUsage: "このチャットのコンテキスト値はまだありません。",
+	ctxOthersTitle: (w) => `${w}% 以上のほかのセッション`,
+	ctxNothing: (w) => `${w}% 以上の開いているセッションはありません。`,
+	ctxCompressSent: "このチャットのコンテキストを圧縮しています…",
+	ctxCompressFailed: "このチャットの入力欄に届きませんでした — チャットを開いてもう一度お試しください。",
+	ctxRowTip: (used, max) => `コンテキスト ${used} / ${max}`,
+	contextOfN: (used, max) => `コンテキスト ${used}/${max}`,
+	contextChipLabel: "ステータスバーにコンテキスト警告チップを表示",
+	contextChipHint: "チャットのコンテキストがしきい値以上のときだけ — フォーカス中のチャットの使用量は標準のバーにすでに表示されています。",
+	contextWarnLabel: "コンテキスト警告のしきい値",
+	contextWarnHint: (d) => `チップ、ライブ画面、通知。${d}% 以上は赤。`,
+	notify_context: "コンテキストウィンドウが上限に近い（しきい値 / 90%）",
+	notifyContextTitle: (pct) => `コンテキスト ${pct}% 使用`,
+	notifyContextBody: "圧縮する（/compress）か新しいチャットを始めてください",
+	navContext: (pct) => `コンテキスト ${pct}%`,
+	// ---- locale-aware formatting + status-bar tooltips ----
+	_locale: "ja",
+	navLabel: "クォータ",
+	resetToday: (time) => `今日 ${time}`,
+	resetTomorrow: (time) => `明日 ${time}`,
+	resetting: "リセット中…",
+	spanDH: (d, h) => `${d}日${h}時間`,
+	spanHM: (h, m) => `${h}時間${m}分`,
+	spanM: (m) => `${m}分`,
+	spanH: (h) => `${h}時間`,
+	spanS: (s) => `${s}秒`,
+	spanLt1m: "1分未満",
+	updateAvailable: "⬆ アップデートがあります — ./install.sh を実行してください",
+	accountN: (n) => `アカウント ${n}`,
+	valueUnknown: "不明",
+	valueLeft: (v) => `残り ${v}`,
+	stale: "古いデータ",
+	valueUnavailable: "利用不可",
+	valueAvailable: "利用可",
+	quotaBreakdown: "クォータの内訳:",
+	providerUnavailable: (name) => `${name}: 利用不可`,
+	providerUnavailableReason: (name, reason) => `${name}: 利用不可（${reason}）`,
+	accountBalance: "アカウント残高",
+	accountBalanceLine: (v) => `アカウント残高: ${v}`,
+	apiCallsAvailable: (ok) => `API 呼び出し: ${ok ? "可" : "不可"}`,
+	planLine: (plan) => `プラン: ${plan}`,
+	windowFallback: "ウィンドウ",
+	resetsAt: (when) => `リセット ${when}`,
+	seriesTotal: "合計",
+};
 
-		// Route page (/quota).
-		ctx.register({
-			id: "page",
-			area: ROUTES_AREA,
-			data: { path: "/quota" },
-			render: () => jsx(QuotaPane, { page: true }),
-		});
+const I18N_ZH = {
+	paneTitle: "额度",
+	settingsTitle: "额度 · 设置",
+	chipTip: (pct, label, reset) =>
+		`额度 · 最低 ${pct}%（${label}）${reset ? ` · ${reset}后重置` : ""}`,
+	providerTip: (label, pct, reset) =>
+		`${label} · ${pct}%${reset ? ` · ${reset}后重置` : ""}`,
+	popoverReset: (reset) => `${reset}后重置`,
+	refreshTip: "刷新额度",
+	settingsTip: "额度设置",
+	backTip: "返回额度",
+	loading: "加载中…",
+	error: "额度后端不可用",
+	empty: "暂无额度数据。",
+	emptyHint: "正在自动准备额度数据…",
+	unavailable: (reason) => `不可用（${reason}）`,
+	moreDetails: (n) => `还有 ${n} 项`,
+	noData: "无窗口数据",
+	noDataSection: (n) => `无数据（${n}）— 点击展开`,
+	reset: (when) => `重置 ${when}`,
+	fetched: (when) => `检查于 ${when}`,
+	fetchedAge: (age, interval) => `${age}前 · 每 ${interval} 秒拉取`,
+	versionSkew: (widget, backend) =>
+		`组件 v${widget} · 后端 v${backend} — 请重新加载桌面插件（或重启应用）使两者一致。`,
+	resetFormatLabel: "重置时间格式",
+	relative: "相对",
+	absolute: "绝对",
+	statusbarModeLabel: "状态栏模式",
+	statusbarModeAll: "全部提供方",
+	statusbarModeWorst: "仅最低的",
+	paneDetailLabel: "面板详细程度",
+	paneDetailClean: "简洁",
+	paneDetailCleanHint: "只显示圆环",
+	paneDetailDense: "详细",
+	paneDetailDenseHint: "窗口、重置时间和详情行",
+	showStatusBarLabel: "在状态栏中显示",
+	showStatusBarHint:
+		"Hermes 状态栏也需要可见（⌘K → Toggle status bar）。",
+	showDockedPaneLabel: "显示停靠的额度面板",
+	settingsButton: "设置",
+	refreshIntervalLabel: "刷新间隔",
+	refreshIntervalHint: (seconds, min, max) =>
+		`每 ${seconds} 秒读取一次缓存（${min}–${max} 秒）。刷新在后台运行，节奏保持准确。`,
+	seconds: "秒",
+	disabledProvidersLabel: "已启用的提供方",
+	disableTooltip: "停用此提供方",
+	enableTooltip: "启用此提供方",
 
-		// Sidebar nav row, with live counts in its label (see startNavBadge).
-		applyStoredBoolean(NAV_BADGE_KEY, navBadgeAtom, true);
-		startNavBadge(ctx);
-	},
+	tab_quota: "额度",
+	tab_live: "实时",
+	tab_health: "健康",
+	tab_usage: "用量",
+	tab_kanban: "看板",
+	tab_accounts: "账号",
+	accountsTabLabel: "账号标签页",
+	accountsTabHint: "凭据池、账号顺序、池策略、备用模型和未登录项。如果你从不切换账号，可以隐藏它。",
+	accountsExplainer: "Hermes 从提供方的凭据池中选取凭据。没有自己登录的配置共用默认配置的池，因此池的顺序对它们全部生效；策略按配置单独设置。确认后，变更通过 Hermes 自己的 CLI 执行。",
+	accountsPoolsTitle: "凭据池",
+	accountsPoolsSub: (n) => `${n} 个池`,
+	accountsNoPools: "池中还没有凭据。在下方登录，或运行 `hermes auth add <provider>`。",
+	accountsSharedPool: (n) => `共享 · ${n} 个配置`,
+	accountsSharedTip: (list) => `使用者：${list}`,
+	accountsOwnPool: (owner) => `独立池 · ${owner}`,
+	accountsCount: (n) => `${n} 个账号`,
+	accountsProviderQuota: (label, used) => `提供方额度（当前账号）：${label} 已用 ${used}%`,
+	accountsListAria: (name) => `${name} 账号，按 Hermes 尝试的顺序`,
+	accountsRowAria: (n, label) => `${n}. ${label}。Alt+上 / Alt+下 移动`,
+	accountsRingLabel: (label, left) => `${label}：剩余 ${left}%`,
+	accountsRingNone: "此账号没有额度读数",
+	accountsTriedFirst: "优先尝试",
+	accountsTriedFirstTip: "此顺序中第一个可用账号 — fill_first 会一直用它直到用尽。",
+	accountsTypeOauth: "OAuth",
+	accountsTypeKey: "API 密钥",
+	accountsTypeOther: "其他",
+	accountsSourceTip: "Hermes 获取此凭据的来源",
+	accountsStatus_active: "可用",
+	accountsStatus_cooldown: "冷却中",
+	accountsStatus_exhausted: "已用尽",
+	accountsStatusUntil: (status, left) => `${status} · ${left}`,
+	accountsCooldownModels: (models) => `冷却中：${models}`,
+	accountsMoveUp: (label) => `上移 ${label}`,
+	accountsMoveDown: (label) => `下移 ${label}`,
+	accountsDragHint: "拖动一行，或使用 ▲▼ / Alt+↑↓，更改优先尝试的账号。",
+	accountsNotWritable: "无法在此调整此池的顺序（有一行缺少池 ID）。",
+	accountsSingle: "只有一个账号 — 无需排序。可用 `hermes auth add <provider>` 再添加。",
+	accountsBlocked_loading: "正在刷新账号数据… 数据最新前暂停变更。",
+	accountsBlocked_stale: "账号数据已过期 — 修改前请先刷新。",
+	accountsBlocked_busy: "正在应用变更…",
+	accountsBlocked_confirm: "请先确认或取消待处理的变更。",
+	accountsSharedWarning: (owner, others) => `“${owner}”的共享池：调整顺序也会影响${others || "（无其他配置）"}。`,
+	accountsStrategyTitle: "按配置设置策略",
+	strategy_fill_first: "先用满",
+	strategy_round_robin: "轮询",
+	strategy_least_used: "最少使用",
+	strategy_random: "随机",
+	strategyShort_fill_first: "用满",
+	strategyShort_round_robin: "轮询",
+	strategyShort_least_used: "最少",
+	strategyShort_random: "随机",
+	strategyHint_fill_first: "先用第一个账号直到用尽，再用下一个（顺序重要）。",
+	strategyHint_round_robin: "在账号之间平均轮换（顺序只用于打破平局）。",
+	strategyHint_least_used: "总是选择使用最少的账号。",
+	strategyHint_random: "随机选择一个账号。",
+	accountsProfilesTitle: "配置",
+	accountsProfilesSub: "池访问 · 策略 · 模型 → 备用",
+	accountsProfileCol: "配置",
+	accountsChainCol: "模型 → 备用",
+	accountsRootTag: "根",
+	accountsAccess_own: "独立",
+	accountsAccess_shared: "共享",
+	accountsPrimaryTip: "主模型",
+	accountsFallbackTip: (n) => `备用 #${n}`,
+	accountsCustomRoute: "自定义端点",
+	accountsNoModel: "未设置模型",
+	accountsFallbackCopyTip: "复制 — Hermes 只能在其交互式选择器中编辑备用链（或在 设置 ▸ 模型 ▸ 备用 中编辑当时所选配置）。",
+	accountsFallbackEdit: "复制备用命令",
+	accountsFallbackNote: "这里的备用顺序是只读的：Hermes 无法非交互地重新排序。请复制命令并在终端中运行。",
+	accountsSigninTitle: "未登录",
+	accountsSigninSub: (n) => `${n} 项需要处理`,
+	accountsAllSignedIn: "额度缓存已知的每个提供方都已登录。",
+	accountsOtherUnavailable: (n) => `${n} 项暂时不可用`,
+	accountsMoreSignin: (n) => `另有 ${n} 项未登录`,
+	accountsUsed: "使用中",
+	accountsUsedTip: "某个配置的模型或备用模型使用此提供方",
+	accountsKind_signin: "未登录",
+	accountsKind_reauth: "需重新登录",
+	accountsKind_optin: "已关闭",
+	accountsKind_rate_limited: "受速率限制",
+	accountsKind_error: "不可用",
+	accountsReason_signin: (reason, tool) => tool ? `未找到登录（${reason}）。请用 ${tool} 登录。` : `未找到登录（${reason}）。`,
+	accountsReason_reauth: (reason) => `保存的登录已失效（${reason}）。`,
+	accountsReason_optin: (reason, tool) => `已在额度插件中关闭（${reason}）。开启后才能读取${tool || "此提供方"}。`,
+	accountsReason_rate_limited: () => "提供方正在限制额度读取。无需重新登录。",
+	accountsReason_error: (reason) => `上次读取失败（${reason}）。下次刷新时会重试。`,
+	accountsRetryIn: (left) => `${left}后重试`,
+	accountsRetrySoon: "下次刷新时重试",
+	accountsSigninAction: "登录",
+	accountsAddKeyAction: "添加 API 密钥",
+	accountsReason_key: (reason) => `未找到 API 密钥（${reason}）。`,
+	accountsReauthAction: "重新登录",
+	accountsOptinAction: "开启",
+	accountsCopyTip: "复制此命令并在终端中运行（登录会打开浏览器，因此无法从这里运行）",
+	accountsLimits: "Hermes 不支持按配置分配账号：除非配置有自己的登录（`hermes -p <profile> auth add <provider>`），否则使用共享池。顺序属于池，策略属于配置。这里不会在配置之间移动或复制凭据。",
+	accountsConfirmOrderTitle: (name) => `更改 ${name} 的账号顺序？`,
+	accountsConfirmOrderShared: (owner, n) => `这是“${owner}”拥有的共享池。新顺序将应用于使用它的全部 ${n} 个配置。`,
+	accountsConfirmOrderOwn: (owner) => `只有“${owner}”使用此池。`,
+	accountsConfirmBefore: "当前",
+	accountsConfirmAfter: "之后",
+	accountsConfirmFirst: (label) => `fill_first 下优先尝试：${label}。`,
+	accountsConfirmProfiles: (list) => `影响：${list}`,
+	accountsConfirmStrategyTitle: (profile, name) => `更改 ${profile} 的 ${name} 策略？`,
+	accountsConfirmStrategyDesc: (profile) => `只有“${profile}”会变更；其他配置保留各自的策略。`,
+	accountsConfirmApply: "应用",
+	accountsConfirmBusy: "正在应用…",
+	accountsConfirmCancel: "取消",
+	accountsSavedOrder: (name) => `已保存 ${name} 的账号顺序`,
+	accountsSavedStrategy: (profile, s) => `${profile}：策略已设为 ${s}`,
+	accountsWriteUnsupported: "网关上的额度插件版本较旧，还不能更改账号 — 请更新。",
+	accountsUnsupported: "此网关的额度插件早于账号视图 — 请更新后端。",
+	accountsError: "无法读取账号数据。",
+	monitorOff: "智能体监控已关闭 — 请在设置中开启。",
+	monitorUnsupported:
+		"此网关的额度插件还没有智能体监控 — 请更新（./install.sh）以查看实时会话、健康、用量和看板。",
+	monitorError: "智能体监控暂时不可用。",
+	sectionError: (section) => `这次无法读取${section}数据。`,
+	monitorUpdated: (when, interval) => `更新于 ${when} · 每 ${interval} 秒拉取`,
+	state_working: "工作中",
+	state_waiting: "轮到你了",
+	state_needs_approval: "需要批准",
+	state_stalled: "卡住了？",
+	state_long_tool: "长时间工具调用",
+	state_ended: "已结束",
+	untitled: "（无标题会话）",
+	subagent: "子智能体",
+	agent: "智能体",
+	cliSource: "CLI",
+	tokensN: (n) => `${n} token`,
+	contextN: (n) => `上下文 ${n}`,
+	ago: (span) => `${span}前`,
+	longToolCall: (tool) => `长时间工具调用进行中：${tool}`,
+	openSessionTip: "打开此会话",
+	copyCommandTip: (command) => `复制：${command}`,
+	commandCopied: (command) => `已复制：${command}`,
+	commandCopyFailed: (command) => `无法复制 — 请运行：${command}`,
+	last1m: "最近 1 分钟",
+	last60m: "最近 60 分钟",
+	tokensPerMin: "token / 分钟",
+	costPerMin: (cost) => `≈ ${cost} / 分钟`,
+	cost60m: (cost) => `60 分钟内 ≈ ${cost}`,
+	openSessions: "打开的会话",
+	countWorking: (n) => `${n} 个工作中`,
+	countApproval: (n) => `${n} 个等待批准`,
+	countYourTurn: (n) => `${n} 个轮到你`,
+	countStalled: (n) => `${n} 个卡住了？`,
+	tokensChart: "token / 分钟",
+	attentionTitle: (n) => `需要处理（${n}）`,
+	noOpenSessions: "没有打开的会话。",
+	attention_approval: (who) => `${who} 需要批准`,
+	attention_your_turn: (who) => `${who} 已完成 — 轮到你了`,
+	attention_stalled: (who) => `${who} 可能卡住了`,
+	attention_loop: (who) => `${who}：可能陷入循环`,
+	attention_big_context: (who) => `${who}：上下文过大`,
+	healthAccounts: "账号",
+	healthModels: "模型",
+	healthChains: "备用链",
+	healthSpeed: "模型速度",
+	notSetUp: (n, names) => `此处未设置（${n}）：${names}`,
+	last24h: "最近 24 小时",
+	none: "暂无内容。",
+	credentialN: (n) => `凭据 ${n}`,
+	credLocked: "已达上限",
+	unlocksIn: (span) => ` — ${span}后解锁`,
+	modelStatus_ok: "正常",
+	modelStatus_idle: "空闲",
+	modelStatus_degraded: "降级",
+	modelStatus_failing: "失败",
+	modelStatus_account_exhausted: "账号上限",
+	callsN: (n) => `${n} 次调用`,
+	errorRate: (pct) => `错误率 ${pct}%`,
+	errorsN: (n) => `${n} 个错误`,
+	cooldownFor: (span) => `冷却 ${span}`,
+	recovered: "已恢复",
+	chainOk: "可用",
+	chainSkip: (reason) => `跳过：${reason}`,
+	chainRisky: (pct) => `有风险（错误率 ${pct}%）`,
+	skip_same_backend: "与主模型同一后端",
+	skip_no_credentials: "无凭据",
+	skip_locked: "所有凭据均被锁定",
+	skip_cooldown: "冷却中",
+	skip_undefined: "未知",
+	noFallbacks: "未配置备用模型",
+	speedLine: (p50, p90, turns) => `中位数 ${p50} · p90 ${p90} · ${turns} 轮`,
+	costToday: "今天",
+	costMonth: "本月",
+	projection: (cost) => `月底 ≈ ${cost}`,
+	projectionOver: (cost) => `月底 ≈ ${cost} — 超出预算`,
+	budgetTitle: "预算",
+	budgetDaily: "每日",
+	budgetMonthly: "每月",
+	budgetHint: "在设置中设定每日或每月预算，以跟踪支出。",
+	budgetOff: "关闭",
+	budgetSettingsHint: "美元；留空或 0 = 关闭。费用按 API 价格估算。",
+	last7Days: "最近 7 天",
+	topModels: "费用最高的模型 · 本月",
+	topProfiles: "费用最高的配置 · 本月",
+	topSessions: "费用最高的会话 · 7 天",
+	sessionsN: (n) => `${n} 个会话`,
+	costEstimateNote: "费用按 API 价格估算；订阅不按 token 计费。",
+	board: "看板",
+	noBoards: "没有看板。",
+	kanbanQuiet: "没有运行中、受阻、待审或失败的卡片。",
+	kanbanGroup_running: "运行中",
+	kanbanGroup_blocked: "受阻",
+	kanbanGroup_review: "待审",
+	kanbanGroup_failing: "失败",
+	kanban_todo: "待办",
+	kanban_triage: "分类",
+	kanban_ready: "就绪",
+	kanban_running: "运行中",
+	kanban_blocked: "受阻",
+	kanban_review: "待审",
+	kanban_done: "完成",
+	kanban_archived: "已归档",
+	unassigned: "未分配",
+	failuresN: (n) => `失败 ${n} 次`,
+	cardWhat_input: "需要你的输入",
+	cardWhat_blocked: "受阻",
+	cardWhat_review: "等待审核",
+	cardWhat_failing: "失败",
+	burnRate: (rate) => `${rate}%/小时`,
+	burnFlat: "最近 2 小时无变化",
+	fillsIn: (span) => `约 ${span}后用满`,
+	beforeReset: (span) => `比重置早 ${span}`,
+	noFillBeforeReset: "重置前不会用满",
+	accountHint: (full, used, room) => `${full} 已用 ${used}% · ${room} 还有余量`,
+	accountHintBody: (window, left, room) => `${window}：${room} 剩余 ${left}%`,
+	chipWorking: (n) => `${n} 工作中`,
+	chipYourTurn: (n) => `${n} 轮到你`,
+	chipApproval: (n) => `${n} 待批准`,
+	chipOpenLive: "点击打开实时",
+	// ---- status bar chips + cards ----
+	chipOpenList: "点击查看会话列表",
+	chipQuotaOpen: "点击查看额度卡片（可跳转到额度面板）",
+	chipCostOpen: "点击查看支出详情",
+	chipFullIn: (span) => `约 ${span}用满`,
+	cardOpenLive: "打开实时",
+	cardOpenQuota: "打开额度",
+	cardOpenUsage: "打开用量",
+	cardOpen: "打开",
+	cardCopy: "复制",
+	tokensPerMinN: (n) => `${n} token/分钟`,
+	quotaCardTitle: "额度窗口",
+	checkedAgo: (age) => `${age}前检查`,
+	costCardTitle: "支出",
+	monthEnd: "月底",
+	topModelsToday: "费用最高的模型 · 今天",
+	costChipAria: (cost) => `今天已花费 ${cost}`,
+	costOfDaily: (pct) => `每日预算的 ${pct}%`,
+	costOfMonthly: (pct) => `每月预算的 ${pct}%`,
+	quotaAlertsLabel: "在额度标签上显示重置倒计时和用满时间",
+	quotaAlertsHint: (pct) => `仅当某个窗口已用 ${pct}% 以上，或预测会在重置前用满时。`,
+	chipSparkLabel: "在智能体标签中显示每分钟 token 迷你图",
+	chipFlashLabel: "会话需要你时闪烁智能体标签",
+	chipFlashHint: "每个新进入“轮到你”或等待批准的会话闪烁一次。遵循“减少动态效果”。",
+	costChipLabel: "今日支出标签",
+	costChipHint: "按预算着色（80% 警告，100% 超支）。默认：设定预算后开启。",
+	notifyQuotaTitle: (pct) => `额度已用 ${pct}%`,
+	notifyResetsIn: (span) => ` — ${span}后重置`,
+	notifySoonTitle: "额度即将用满",
+	notifySoonBody: (span) => `按此速度约 ${span}后用满，早于重置`,
+	notifyBudgetTitle: (label, pct) => `${label}预算已达 ${pct}%`,
+	notifyCardTitle: (what) => `看板：卡片${what}`,
+	notifyModelTitle: (status, model) => `模型${status}：${model}`,
+	notifyLockedTitle: (provider) => `账号已达上限：${provider}`,
+	monitorSettingsTitle: "智能体监控",
+	monitorEnabledLabel: "智能体监控",
+	monitorEnabledHint: "实时会话、健康、用量和看板 — 每个刷新间隔多一次 CLI 读取。",
+	agentsChipLabel: "在状态栏显示工作中 / 轮到你标签",
+	quotaForecastLabel: "在额度视图中显示消耗速度、预测和历史",
+	quotaForecastHint: "历史每隔几分钟读取一次，仅在额度视图打开时。",
+	historyRangeLabel: "历史范围",
+	liveIntervalLabel: "实时刷新",
+	navBadgeLabel: "侧边栏中的实时计数",
+	navBadgeHint: "在额度菜单项旁显示工作中的智能体、待批准项、偏低的额度和接近用满的聊天上下文。",
+	navWorking: (n) => `${n} 活跃`,
+	navYourTurn: (n) => `${n} 轮到你`,
+	navApproval: (n) => `${n} 待批准`,
+	navStalled: (n) => `${n} 卡住`,
+	historyDay: "24 小时",
+	historyWeek: "7 天",
+	notificationsTitle: "通知",
+	notificationsHint: "仅当你不在 Hermes 中时显示系统通知，每个事件一次。",
+	notify_quota: "额度 80% / 95%、即将用满、账号提示",
+	notify_budget: "预算 80% / 100%",
+	notify_kanban: "受阻、待审或失败的看板卡片",
+	notify_health: "失败的模型和被锁定的账号",
+	notify_agents: "需要批准、卡住、循环或上下文过大的智能体",
+	notify_turns: "智能体已完成 — 轮到你了",
+	// ---- Agent Bar layout ----
+	left: "剩余",
+	historyCaption: "已用 % 历史",
+	summaryLowest: (pct) => `最低剩余 ${pct}%`,
+	summaryToday: (cost) => `今天 ${cost}`,
+	messagesChart: "消息 / 分钟",
+	dailyChart: "每日费用",
+	dailyAvg: (cost) => `≈ ${cost} / 天`,
+	budgetSub: "API 费用估算",
+	settingsGroupStatusBar: "状态栏和侧边栏",
+	settingsGroupQuota: "额度视图",
+	subagentsN: (n) => `${n} 个子智能体运行中`,
+	// ---- context guard ----
+	ctxChipOthers: (n, w) => `${n} 个会话 ≥ ${w}%`,
+	ctxChipAria: (pct) => `上下文已用 ${pct}%`,
+	ctxTipFocused: (pct, used, max) => `此聊天：上下文已用 ${pct}%（${used} / ${max}）`,
+	ctxTipOthers: (n, w) => `另有 ${n} 个打开的会话 ≥ ${w}%`,
+	ctxTipOpen: "点击查看详情和 /compress",
+	ctxCardTitle: "上下文",
+	ctxWarnSub: (w) => `${w}% 时警告`,
+	ctxFocused: "此聊天",
+	ctxTokensOf: (used, max) => `${used} / ${max} token`,
+	ctxEstimated: "估算",
+	ctxCompressions: (n) => (n ? `至今已压缩 ${n} 次` : "尚未压缩"),
+	ctxCompress: "压缩…",
+	ctxCompressNow: "压缩",
+	ctxCancel: "取消",
+	ctxConfirm: "总结较早的轮次以释放上下文 — 与在此聊天中输入 /compress 相同。",
+	ctxTopicPlaceholder: "重点主题（可选）",
+	ctxBusy: "请等待当前轮次结束。",
+	ctxNoSession: "打开一个聊天以进行压缩。",
+	ctxNoUsage: "此聊天暂无上下文读数。",
+	ctxOthersTitle: (w) => `其他 ≥ ${w}% 的会话`,
+	ctxNothing: (w) => `没有打开的会话达到 ${w}% 或以上。`,
+	ctxCompressSent: "正在压缩此聊天的上下文…",
+	ctxCompressFailed: "无法访问此聊天的输入框 — 请打开聊天后重试。",
+	ctxRowTip: (used, max) => `上下文 ${used} / ${max}`,
+	contextOfN: (used, max) => `上下文 ${used}/${max}`,
+	contextChipLabel: "在状态栏显示上下文警告标签",
+	contextChipHint: "仅当某个聊天的上下文达到或超过阈值时 — 核心状态栏已显示当前聊天的用量。",
+	contextWarnLabel: "上下文警告阈值",
+	contextWarnHint: (d) => `标签、实时视图和通知；${d}% 及以上为红色。`,
+	notify_context: "上下文窗口即将用满（阈值 / 90%）",
+	notifyContextTitle: (pct) => `上下文已用 ${pct}%`,
+	notifyContextBody: "压缩它（/compress）或开始新的聊天",
+	navContext: (pct) => `上下文 ${pct}%`,
+	// ---- locale-aware formatting + status-bar tooltips ----
+	_locale: "zh",
+	navLabel: "额度",
+	resetToday: (time) => `今天 ${time}`,
+	resetTomorrow: (time) => `明天 ${time}`,
+	resetting: "正在重置…",
+	spanDH: (d, h) => `${d}天${h}小时`,
+	spanHM: (h, m) => `${h}小时${m}分`,
+	spanM: (m) => `${m}分钟`,
+	spanH: (h) => `${h}小时`,
+	spanS: (s) => `${s}秒`,
+	spanLt1m: "不到1分钟",
+	updateAvailable: "⬆ 有可用更新 — 运行 ./install.sh 获取",
+	accountN: (n) => `账号 ${n}`,
+	valueUnknown: "未知",
+	valueLeft: (v) => `剩余 ${v}`,
+	stale: "已过期",
+	valueUnavailable: "不可用",
+	valueAvailable: "可用",
+	quotaBreakdown: "额度明细：",
+	providerUnavailable: (name) => `${name}：不可用`,
+	providerUnavailableReason: (name, reason) => `${name}：不可用（${reason}）`,
+	accountBalance: "账号余额",
+	accountBalanceLine: (v) => `账号余额：${v}`,
+	apiCallsAvailable: (ok) => `API 调用：${ok ? "可用" : "不可用"}`,
+	planLine: (plan) => `套餐：${plan}`,
+	windowFallback: "窗口",
+	resetsAt: (when) => `重置 ${when}`,
+	seriesTotal: "合计",
+};
+
+const I18N_ZH_HANT = {
+	paneTitle: "額度",
+	settingsTitle: "額度 · 設定",
+	chipTip: (pct, label, reset) =>
+		`額度 · 最低 ${pct}%（${label}）${reset ? ` · ${reset}後重設` : ""}`,
+	providerTip: (label, pct, reset) =>
+		`${label} · ${pct}%${reset ? ` · ${reset}後重設` : ""}`,
+	popoverReset: (reset) => `${reset}後重設`,
+	refreshTip: "重新整理額度",
+	settingsTip: "額度設定",
+	backTip: "返回額度",
+	loading: "載入中…",
+	error: "額度後端不可用",
+	empty: "暫無額度資料。",
+	emptyHint: "正在自動準備額度資料…",
+	unavailable: (reason) => `不可用（${reason}）`,
+	moreDetails: (n) => `還有 ${n} 項`,
+	noData: "無視窗資料",
+	noDataSection: (n) => `無資料（${n}）— 按一下展開`,
+	reset: (when) => `重設 ${when}`,
+	fetched: (when) => `檢查於 ${when}`,
+	fetchedAge: (age, interval) => `${age}前 · 每 ${interval} 秒擷取`,
+	versionSkew: (widget, backend) =>
+		`元件 v${widget} · 後端 v${backend} — 請重新載入桌面外掛程式（或重啟應用程式）使兩者一致。`,
+	resetFormatLabel: "重設時間格式",
+	relative: "相對",
+	absolute: "絕對",
+	statusbarModeLabel: "狀態列模式",
+	statusbarModeAll: "全部提供方",
+	statusbarModeWorst: "僅最低的",
+	paneDetailLabel: "面板詳細程度",
+	paneDetailClean: "簡潔",
+	paneDetailCleanHint: "只顯示圓環",
+	paneDetailDense: "詳細",
+	paneDetailDenseHint: "視窗、重設時間和詳情行",
+	showStatusBarLabel: "在狀態列中顯示",
+	showStatusBarHint:
+		"Hermes 狀態列也需要可見（⌘K → Toggle status bar）。",
+	showDockedPaneLabel: "顯示停靠的額度面板",
+	settingsButton: "設定",
+	refreshIntervalLabel: "重新整理間隔",
+	refreshIntervalHint: (seconds, min, max) =>
+		`每 ${seconds} 秒讀取一次快取（${min}–${max} 秒）。重新整理在背景執行，節奏保持準確。`,
+	seconds: "秒",
+	disabledProvidersLabel: "已啟用的提供方",
+	disableTooltip: "停用此提供方",
+	enableTooltip: "啟用此提供方",
+
+	tab_quota: "額度",
+	tab_live: "即時",
+	tab_health: "健康狀態",
+	tab_usage: "用量",
+	tab_kanban: "看板",
+	tab_accounts: "帳號",
+	accountsTabLabel: "帳號分頁",
+	accountsTabHint: "憑證池、帳號順序、池策略、備用模型和未登入項。如果你從不切換帳號，可以隱藏它。",
+	accountsExplainer: "Hermes 從提供方的憑證池中選取憑證。沒有自己登入的設定檔共用預設設定檔的池，因此池的順序對它們全部生效；策略按設定檔單獨設定。確認後，變更通過 Hermes 自己的 CLI 執行。",
+	accountsPoolsTitle: "憑證池",
+	accountsPoolsSub: (n) => `${n} 個池`,
+	accountsNoPools: "池中還沒有憑證。在下方登入，或執行 `hermes auth add <provider>`。",
+	accountsSharedPool: (n) => `共享 · ${n} 個設定檔`,
+	accountsSharedTip: (list) => `使用者：${list}`,
+	accountsOwnPool: (owner) => `獨立池 · ${owner}`,
+	accountsCount: (n) => `${n} 個帳號`,
+	accountsProviderQuota: (label, used) => `提供方額度（目前帳號）：${label} 已用 ${used}%`,
+	accountsListAria: (name) => `${name} 帳號，按 Hermes 嘗試的順序`,
+	accountsRowAria: (n, label) => `${n}. ${label}。Alt+上 / Alt+下 移動`,
+	accountsRingLabel: (label, left) => `${label}：剩餘 ${left}%`,
+	accountsRingNone: "此帳號沒有額度讀數",
+	accountsTriedFirst: "優先嘗試",
+	accountsTriedFirstTip: "此順序中第一個可用帳號 — fill_first 會一直用它直到用盡。",
+	accountsTypeOauth: "OAuth",
+	accountsTypeKey: "API 金鑰",
+	accountsTypeOther: "其他",
+	accountsSourceTip: "Hermes 取得此憑證的來源",
+	accountsStatus_active: "可用",
+	accountsStatus_cooldown: "冷卻中",
+	accountsStatus_exhausted: "已用盡",
+	accountsStatusUntil: (status, left) => `${status} · ${left}`,
+	accountsCooldownModels: (models) => `冷卻中：${models}`,
+	accountsMoveUp: (label) => `上移 ${label}`,
+	accountsMoveDown: (label) => `下移 ${label}`,
+	accountsDragHint: "拖動一行，或使用 ▲▼ / Alt+↑↓，更改優先嘗試的帳號。",
+	accountsNotWritable: "無法在此調整此池的順序（有一行缺少池 ID）。",
+	accountsSingle: "只有一個帳號 — 無需排序。可用 `hermes auth add <provider>` 再新增。",
+	accountsBlocked_loading: "正在重新整理帳號資料… 資料最新前暫停變更。",
+	accountsBlocked_stale: "帳號資料已過期 — 修改前請先重新整理。",
+	accountsBlocked_busy: "正在套用變更…",
+	accountsBlocked_confirm: "請先確認或取消待處理的變更。",
+	accountsSharedWarning: (owner, others) => `“${owner}”的共享池：調整順序也會影響${others || "（無其他設定檔）"}。`,
+	accountsStrategyTitle: "按設定檔設定策略",
+	strategy_fill_first: "先用滿",
+	strategy_round_robin: "輪替",
+	strategy_least_used: "最少使用",
+	strategy_random: "隨機",
+	strategyShort_fill_first: "用滿",
+	strategyShort_round_robin: "輪替",
+	strategyShort_least_used: "最少",
+	strategyShort_random: "隨機",
+	strategyHint_fill_first: "先用第一個帳號直到用盡，再用下一個（順序重要）。",
+	strategyHint_round_robin: "在帳號之間平均輪換（順序只用於打破平局）。",
+	strategyHint_least_used: "總是選擇使用最少的帳號。",
+	strategyHint_random: "隨機選擇一個帳號。",
+	accountsProfilesTitle: "設定檔",
+	accountsProfilesSub: "池存取 · 策略 · 模型 → 備用",
+	accountsProfileCol: "設定檔",
+	accountsChainCol: "模型 → 備用",
+	accountsRootTag: "根",
+	accountsAccess_own: "獨立",
+	accountsAccess_shared: "共享",
+	accountsPrimaryTip: "主模型",
+	accountsFallbackTip: (n) => `備用 #${n}`,
+	accountsCustomRoute: "自訂端點",
+	accountsNoModel: "未設定模型",
+	accountsFallbackCopyTip: "複製 — Hermes 只能在其互動式選擇器中編輯備用鏈（或在 設定 ▸ 模型 ▸ 備用 中編輯當時所選設定檔）。",
+	accountsFallbackEdit: "複製備用指令",
+	accountsFallbackNote: "這裡的備用順序是唯讀的：Hermes 無法非互動地重新排序。請複製指令並在終端機中執行。",
+	accountsSigninTitle: "未登入",
+	accountsSigninSub: (n) => `${n} 項需要處理`,
+	accountsAllSignedIn: "額度快取已知的每個提供方都已登入。",
+	accountsOtherUnavailable: (n) => `${n} 項暫時不可用`,
+	accountsMoreSignin: (n) => `另有 ${n} 項未登入`,
+	accountsUsed: "使用中",
+	accountsUsedTip: "某個設定檔的模型或備用模型使用此提供方",
+	accountsKind_signin: "未登入",
+	accountsKind_reauth: "需重新登入",
+	accountsKind_optin: "已關閉",
+	accountsKind_rate_limited: "受速率限制",
+	accountsKind_error: "不可用",
+	accountsReason_signin: (reason, tool) => tool ? `未找到登入（${reason}）。請用 ${tool} 登入。` : `未找到登入（${reason}）。`,
+	accountsReason_reauth: (reason) => `儲存的登入已失效（${reason}）。`,
+	accountsReason_optin: (reason, tool) => `已在額度外掛程式中關閉（${reason}）。開啟後才能讀取${tool || "此提供方"}。`,
+	accountsReason_rate_limited: () => "提供方正在限制額度讀取。無需重新登入。",
+	accountsReason_error: (reason) => `上次讀取失敗（${reason}）。下次重新整理時會重試。`,
+	accountsRetryIn: (left) => `${left}後重試`,
+	accountsRetrySoon: "下次重新整理時重試",
+	accountsSigninAction: "登入",
+	accountsAddKeyAction: "新增 API 金鑰",
+	accountsReason_key: (reason) => `未找到 API 金鑰（${reason}）。`,
+	accountsReauthAction: "重新登入",
+	accountsOptinAction: "開啟",
+	accountsCopyTip: "複製此指令並在終端機中執行（登入會開啟瀏覽器，因此無法從這裡執行）",
+	accountsLimits: "Hermes 不支援按設定檔分配帳號：除非設定檔有自己的登入（`hermes -p <profile> auth add <provider>`），否則使用共享池。順序屬於池，策略屬於設定檔。這裡不會在設定檔之間移動或複製憑證。",
+	accountsConfirmOrderTitle: (name) => `更改 ${name} 的帳號順序？`,
+	accountsConfirmOrderShared: (owner, n) => `這是“${owner}”擁有的共享池。新順序將套用於使用它的全部 ${n} 個設定檔。`,
+	accountsConfirmOrderOwn: (owner) => `只有“${owner}”使用此池。`,
+	accountsConfirmBefore: "目前",
+	accountsConfirmAfter: "之後",
+	accountsConfirmFirst: (label) => `fill_first 下優先嘗試：${label}。`,
+	accountsConfirmProfiles: (list) => `影響：${list}`,
+	accountsConfirmStrategyTitle: (profile, name) => `更改 ${profile} 的 ${name} 策略？`,
+	accountsConfirmStrategyDesc: (profile) => `只有“${profile}”會變更；其他設定檔保留各自的策略。`,
+	accountsConfirmApply: "套用",
+	accountsConfirmBusy: "正在套用…",
+	accountsConfirmCancel: "取消",
+	accountsSavedOrder: (name) => `已儲存 ${name} 的帳號順序`,
+	accountsSavedStrategy: (profile, s) => `${profile}：策略已設為 ${s}`,
+	accountsWriteUnsupported: "閘道上的額度外掛程式版本較舊，還不能更改帳號 — 請更新。",
+	accountsUnsupported: "此閘道的額度外掛程式早於帳號檢視 — 請更新後端。",
+	accountsError: "無法讀取帳號資料。",
+	monitorOff: "代理監控已關閉 — 請在設定中開啟。",
+	monitorUnsupported:
+		"此閘道的額度外掛程式還沒有代理監控 — 請更新（./install.sh）以查看即時工作階段、健康狀態、用量和看板。",
+	monitorError: "代理監控暫時不可用。",
+	sectionError: (section) => `這次無法讀取${section}資料。`,
+	monitorUpdated: (when, interval) => `更新於 ${when} · 每 ${interval} 秒擷取`,
+	state_working: "工作中",
+	state_waiting: "輪到你了",
+	state_needs_approval: "需要核准",
+	state_stalled: "卡住了？",
+	state_long_tool: "長時間工具呼叫",
+	state_ended: "已結束",
+	untitled: "（無標題工作階段）",
+	subagent: "子代理",
+	agent: "代理",
+	cliSource: "CLI",
+	tokensN: (n) => `${n} token`,
+	contextN: (n) => `上下文 ${n}`,
+	ago: (span) => `${span}前`,
+	longToolCall: (tool) => `長時間工具呼叫進行中：${tool}`,
+	openSessionTip: "開啟此工作階段",
+	copyCommandTip: (command) => `複製：${command}`,
+	commandCopied: (command) => `已複製：${command}`,
+	commandCopyFailed: (command) => `無法複製 — 請執行：${command}`,
+	last1m: "最近 1 分鐘",
+	last60m: "最近 60 分鐘",
+	tokensPerMin: "token / 分鐘",
+	costPerMin: (cost) => `≈ ${cost} / 分鐘`,
+	cost60m: (cost) => `60 分鐘內 ≈ ${cost}`,
+	openSessions: "開啟的工作階段",
+	countWorking: (n) => `${n} 個工作中`,
+	countApproval: (n) => `${n} 個等待核准`,
+	countYourTurn: (n) => `${n} 個輪到你`,
+	countStalled: (n) => `${n} 個卡住了？`,
+	tokensChart: "token / 分鐘",
+	attentionTitle: (n) => `需要處理（${n}）`,
+	noOpenSessions: "沒有開啟的工作階段。",
+	attention_approval: (who) => `${who} 需要核准`,
+	attention_your_turn: (who) => `${who} 已完成 — 輪到你了`,
+	attention_stalled: (who) => `${who} 可能卡住了`,
+	attention_loop: (who) => `${who}：可能陷入迴圈`,
+	attention_big_context: (who) => `${who}：上下文過大`,
+	healthAccounts: "帳號",
+	healthModels: "模型",
+	healthChains: "備用鏈",
+	healthSpeed: "模型速度",
+	notSetUp: (n, names) => `此處未設定（${n}）：${names}`,
+	last24h: "最近 24 小時",
+	none: "暫無內容。",
+	credentialN: (n) => `憑證 ${n}`,
+	credLocked: "已達上限",
+	unlocksIn: (span) => ` — ${span}後解鎖`,
+	modelStatus_ok: "正常",
+	modelStatus_idle: "空閒",
+	modelStatus_degraded: "降級",
+	modelStatus_failing: "失敗",
+	modelStatus_account_exhausted: "帳號上限",
+	callsN: (n) => `${n} 次呼叫`,
+	errorRate: (pct) => `錯誤率 ${pct}%`,
+	errorsN: (n) => `${n} 個錯誤`,
+	cooldownFor: (span) => `冷卻 ${span}`,
+	recovered: "已恢復",
+	chainOk: "可用",
+	chainSkip: (reason) => `跳過：${reason}`,
+	chainRisky: (pct) => `有風險（錯誤率 ${pct}%）`,
+	skip_same_backend: "與主模型同一後端",
+	skip_no_credentials: "無憑證",
+	skip_locked: "所有憑證均被鎖定",
+	skip_cooldown: "冷卻中",
+	skip_undefined: "未知",
+	noFallbacks: "未設定備用模型",
+	speedLine: (p50, p90, turns) => `中位數 ${p50} · p90 ${p90} · ${turns} 輪`,
+	costToday: "今天",
+	costMonth: "本月",
+	projection: (cost) => `月底 ≈ ${cost}`,
+	projectionOver: (cost) => `月底 ≈ ${cost} — 超出預算`,
+	budgetTitle: "預算",
+	budgetDaily: "每日",
+	budgetMonthly: "每月",
+	budgetHint: "在設定中設定每日或每月預算，以追蹤支出。",
+	budgetOff: "關閉",
+	budgetSettingsHint: "美元；留空或 0 = 關閉。費用按 API 價格估算。",
+	last7Days: "最近 7 天",
+	topModels: "費用最高的模型 · 本月",
+	topProfiles: "費用最高的設定檔 · 本月",
+	topSessions: "費用最高的工作階段 · 7 天",
+	sessionsN: (n) => `${n} 個工作階段`,
+	costEstimateNote: "費用按 API 價格估算；訂閱不按 token 計費。",
+	board: "看板",
+	noBoards: "沒有看板。",
+	kanbanQuiet: "沒有執行中、受阻、待審或失敗的卡片。",
+	kanbanGroup_running: "執行中",
+	kanbanGroup_blocked: "受阻",
+	kanbanGroup_review: "待審",
+	kanbanGroup_failing: "失敗",
+	kanban_todo: "待辦",
+	kanban_triage: "分類",
+	kanban_ready: "就緒",
+	kanban_running: "執行中",
+	kanban_blocked: "受阻",
+	kanban_review: "待審",
+	kanban_done: "完成",
+	kanban_archived: "已封存",
+	unassigned: "未分配",
+	failuresN: (n) => `失敗 ${n} 次`,
+	cardWhat_input: "需要你的輸入",
+	cardWhat_blocked: "受阻",
+	cardWhat_review: "等待審核",
+	cardWhat_failing: "失敗",
+	burnRate: (rate) => `${rate}%/小時`,
+	burnFlat: "最近 2 小時無變化",
+	fillsIn: (span) => `約 ${span}後用滿`,
+	beforeReset: (span) => `比重設早 ${span}`,
+	noFillBeforeReset: "重設前不會用滿",
+	accountHint: (full, used, room) => `${full} 已用 ${used}% · ${room} 還有餘量`,
+	accountHintBody: (window, left, room) => `${window}：${room} 剩餘 ${left}%`,
+	chipWorking: (n) => `${n} 工作中`,
+	chipYourTurn: (n) => `${n} 輪到你`,
+	chipApproval: (n) => `${n} 待核准`,
+	chipOpenLive: "按一下開啟即時",
+	// ---- status bar chips + cards ----
+	chipOpenList: "按一下查看工作階段列表",
+	chipQuotaOpen: "按一下查看額度卡片（可跳轉到額度面板）",
+	chipCostOpen: "按一下查看支出詳情",
+	chipFullIn: (span) => `約 ${span}用滿`,
+	cardOpenLive: "開啟即時",
+	cardOpenQuota: "開啟額度",
+	cardOpenUsage: "開啟用量",
+	cardOpen: "開啟",
+	cardCopy: "複製",
+	tokensPerMinN: (n) => `${n} token/分鐘`,
+	quotaCardTitle: "額度視窗",
+	checkedAgo: (age) => `${age}前檢查`,
+	costCardTitle: "支出",
+	monthEnd: "月底",
+	topModelsToday: "費用最高的模型 · 今天",
+	costChipAria: (cost) => `今天已花費 ${cost}`,
+	costOfDaily: (pct) => `每日預算的 ${pct}%`,
+	costOfMonthly: (pct) => `每月預算的 ${pct}%`,
+	quotaAlertsLabel: "在額度標籤上顯示重設倒數計時和用滿時間",
+	quotaAlertsHint: (pct) => `僅當某個視窗已用 ${pct}% 以上，或預測會在重設前用滿時。`,
+	chipSparkLabel: "在代理標籤中顯示每分鐘 token 迷你圖",
+	chipFlashLabel: "工作階段需要你時閃爍代理標籤",
+	chipFlashHint: "每個新進入“輪到你”或等待核准的工作階段閃爍一次。遵循“減少動態效果”。",
+	costChipLabel: "今日支出標籤",
+	costChipHint: "按預算著色（80% 警告，100% 超支）。預設：設定預算後開啟。",
+	notifyQuotaTitle: (pct) => `額度已用 ${pct}%`,
+	notifyResetsIn: (span) => ` — ${span}後重設`,
+	notifySoonTitle: "額度即將用滿",
+	notifySoonBody: (span) => `按此速度約 ${span}後用滿，早於重設`,
+	notifyBudgetTitle: (label, pct) => `${label}預算已達 ${pct}%`,
+	notifyCardTitle: (what) => `看板：卡片${what}`,
+	notifyModelTitle: (status, model) => `模型${status}：${model}`,
+	notifyLockedTitle: (provider) => `帳號已達上限：${provider}`,
+	monitorSettingsTitle: "代理監控",
+	monitorEnabledLabel: "代理監控",
+	monitorEnabledHint: "即時工作階段、健康狀態、用量和看板 — 每個重新整理間隔多一次 CLI 讀取。",
+	agentsChipLabel: "在狀態列顯示工作中 / 輪到你標籤",
+	quotaForecastLabel: "在額度檢視中顯示消耗速度、預測和歷史",
+	quotaForecastHint: "歷史每隔幾分鐘讀取一次，僅在額度檢視開啟時。",
+	historyRangeLabel: "歷史範圍",
+	liveIntervalLabel: "即時重新整理",
+	navBadgeLabel: "側邊欄中的即時計數",
+	navBadgeHint: "在額度選單項目旁顯示工作中的代理、待核准項、偏低的額度和接近用滿的聊天上下文。",
+	navWorking: (n) => `${n} 活躍`,
+	navYourTurn: (n) => `${n} 輪到你`,
+	navApproval: (n) => `${n} 待核准`,
+	navStalled: (n) => `${n} 卡住`,
+	historyDay: "24 小時",
+	historyWeek: "7 天",
+	notificationsTitle: "通知",
+	notificationsHint: "僅當你不在 Hermes 中時顯示系統通知，每個事件一次。",
+	notify_quota: "額度 80% / 95%、即將用滿、帳號提示",
+	notify_budget: "預算 80% / 100%",
+	notify_kanban: "受阻、待審或失敗的看板卡片",
+	notify_health: "失敗的模型和被鎖定的帳號",
+	notify_agents: "需要核准、卡住、迴圈或上下文過大的代理",
+	notify_turns: "代理已完成 — 輪到你了",
+	// ---- Agent Bar layout ----
+	left: "剩餘",
+	historyCaption: "已用 % 歷史",
+	summaryLowest: (pct) => `最低剩餘 ${pct}%`,
+	summaryToday: (cost) => `今天 ${cost}`,
+	messagesChart: "訊息 / 分鐘",
+	dailyChart: "每日費用",
+	dailyAvg: (cost) => `≈ ${cost} / 天`,
+	budgetSub: "API 費用估算",
+	settingsGroupStatusBar: "狀態列和側邊欄",
+	settingsGroupQuota: "額度檢視",
+	subagentsN: (n) => `${n} 個子代理執行中`,
+	// ---- context guard ----
+	ctxChipOthers: (n, w) => `${n} 個工作階段 ≥ ${w}%`,
+	ctxChipAria: (pct) => `上下文已用 ${pct}%`,
+	ctxTipFocused: (pct, used, max) => `此聊天：上下文已用 ${pct}%（${used} / ${max}）`,
+	ctxTipOthers: (n, w) => `另有 ${n} 個開啟的工作階段 ≥ ${w}%`,
+	ctxTipOpen: "按一下查看詳情和 /compress",
+	ctxCardTitle: "上下文",
+	ctxWarnSub: (w) => `${w}% 時警告`,
+	ctxFocused: "此聊天",
+	ctxTokensOf: (used, max) => `${used} / ${max} token`,
+	ctxEstimated: "估算",
+	ctxCompressions: (n) => (n ? `至今已壓縮 ${n} 次` : "尚未壓縮"),
+	ctxCompress: "壓縮…",
+	ctxCompressNow: "壓縮",
+	ctxCancel: "取消",
+	ctxConfirm: "總結較早的輪次以釋放上下文 — 與在此聊天中輸入 /compress 相同。",
+	ctxTopicPlaceholder: "重點主題（可選）",
+	ctxBusy: "請等待目前輪次結束。",
+	ctxNoSession: "開啟一個聊天以進行壓縮。",
+	ctxNoUsage: "此聊天暫無上下文讀數。",
+	ctxOthersTitle: (w) => `其他 ≥ ${w}% 的工作階段`,
+	ctxNothing: (w) => `沒有開啟的工作階段達到 ${w}% 或以上。`,
+	ctxCompressSent: "正在壓縮此聊天的上下文…",
+	ctxCompressFailed: "無法存取此聊天的輸入框 — 請開啟聊天後重試。",
+	ctxRowTip: (used, max) => `上下文 ${used} / ${max}`,
+	contextOfN: (used, max) => `上下文 ${used}/${max}`,
+	contextChipLabel: "在狀態列顯示上下文警告標籤",
+	contextChipHint: "僅當某個聊天的上下文達到或超過閾值時 — 核心狀態列已顯示目前聊天的用量。",
+	contextWarnLabel: "上下文警告閾值",
+	contextWarnHint: (d) => `標籤、即時檢視和通知；${d}% 及以上為紅色。`,
+	notify_context: "上下文視窗即將用滿（閾值 / 90%）",
+	notifyContextTitle: (pct) => `上下文已用 ${pct}%`,
+	notifyContextBody: "壓縮它（/compress）或開始新的聊天",
+	navContext: (pct) => `上下文 ${pct}%`,
+	// ---- locale-aware formatting + status-bar tooltips ----
+	_locale: "zh-hant",
+	navLabel: "額度",
+	resetToday: (time) => `今天 ${time}`,
+	resetTomorrow: (time) => `明天 ${time}`,
+	resetting: "正在重設…",
+	spanDH: (d, h) => `${d}天${h}小時`,
+	spanHM: (h, m) => `${h}小時${m}分`,
+	spanM: (m) => `${m}分鐘`,
+	spanH: (h) => `${h}小時`,
+	spanS: (s) => `${s}秒`,
+	spanLt1m: "不到1分鐘",
+	updateAvailable: "⬆ 有可用更新 — 執行 ./install.sh 取得",
+	accountN: (n) => `帳號 ${n}`,
+	valueUnknown: "未知",
+	valueLeft: (v) => `剩餘 ${v}`,
+	stale: "已過期",
+	valueUnavailable: "不可用",
+	valueAvailable: "可用",
+	quotaBreakdown: "額度明細：",
+	providerUnavailable: (name) => `${name}：不可用`,
+	providerUnavailableReason: (name, reason) => `${name}：不可用（${reason}）`,
+	accountBalance: "帳號餘額",
+	accountBalanceLine: (v) => `帳號餘額：${v}`,
+	apiCallsAvailable: (ok) => `API 呼叫：${ok ? "可用" : "不可用"}`,
+	planLine: (plan) => `方案：${plan}`,
+	windowFallback: "視窗",
+	resetsAt: (when) => `重設 ${when}`,
+	seriesTotal: "合計",
+};
+
+const I18N_AR = {
+	paneTitle: "الحصة",
+	settingsTitle: "الحصة · الإعدادات",
+	chipTip: (pct, label, reset) =>
+		`الحصة · الأدنى ${pct}% (${label})${reset ? ` · تُعاد بعد ${reset}` : ""}`,
+	providerTip: (label, pct, reset) =>
+		`${label} · ${pct}%${reset ? ` · تُعاد بعد ${reset}` : ""}`,
+	popoverReset: (reset) => `تُعاد بعد ${reset}`,
+	refreshTip: "تحديث الحصة",
+	settingsTip: "إعدادات الحصة",
+	backTip: "العودة إلى الحصة",
+	loading: "جارٍ التحميل…",
+	error: "خادم الحصة غير متاح",
+	empty: "لا توجد بيانات حصة بعد.",
+	emptyHint: "يجري تجهيز بيانات الحصة تلقائيًا…",
+	unavailable: (reason) => `غير متاح (${reason})`,
+	moreDetails: (n) => `+${n} أخرى`,
+	noData: "لا بيانات للنافذة",
+	noDataSection: (n) => `بلا بيانات (${n}) — انقر للتوسيع`,
+	reset: (when) => `الإعادة ${when}`,
+	fetched: (when) => `آخر فحص ${when}`,
+	fetchedAge: (age, interval) => `منذ ${age} · كل ${interval} ث`,
+	versionSkew: (widget, backend) =>
+		`الأداة v${widget} · الخادم v${backend} — أعد تحميل إضافات سطح المكتب (أو أعد تشغيل التطبيق) لتتطابقا.`,
+	resetFormatLabel: "تنسيق وقت الإعادة",
+	relative: "نسبي",
+	absolute: "مطلق",
+	statusbarModeLabel: "وضع شريط الحالة",
+	statusbarModeAll: "كل المزوّدين",
+	statusbarModeWorst: "الأدنى فقط",
+	paneDetailLabel: "تفاصيل اللوحة",
+	paneDetailClean: "بسيط",
+	paneDetailCleanHint: "الحلقات فقط",
+	paneDetailDense: "مفصّل",
+	paneDetailDenseHint: "النوافذ وأوقات الإعادة وأسطر التفاصيل",
+	showStatusBarLabel: "إظهار المؤشر في شريط الحالة",
+	showStatusBarHint:
+		"يجب أن يكون شريط حالة Hermes ظاهرًا أيضًا (⌘K ثم Toggle status bar).",
+	showDockedPaneLabel: "إظهار لوحة الحصة المثبّتة",
+	settingsButton: "الإعدادات",
+	refreshIntervalLabel: "فاصل التحديث",
+	refreshIntervalHint: (seconds, min, max) =>
+		`يقرأ ذاكرة التخزين المؤقت كل ${seconds} ث (${min}–${max} ث). يجري التحديث في الخلفية، فيبقى الإيقاع دقيقًا.`,
+	seconds: "ث",
+	disabledProvidersLabel: "المزوّدون المفعّلون",
+	disableTooltip: "تعطيل هذا المزوّد",
+	enableTooltip: "تفعيل هذا المزوّد",
+
+	tab_quota: "الحصة",
+	tab_live: "مباشر",
+	tab_health: "الحالة",
+	tab_usage: "الاستخدام",
+	tab_kanban: "كانبان",
+	tab_accounts: "الحسابات",
+	accountsTabLabel: "تبويب الحسابات",
+	accountsTabHint: "مجمّعات بيانات الاعتماد وترتيب الحسابات واستراتيجية المجمّع والبدائل وتسجيلات الدخول الناقصة. أخفِه إن كنت لا تغيّر الحسابات.",
+	accountsExplainer: "يختار Hermes بيانات اعتماد من مجمّع المزوّد. الملفات الشخصية التي لا تملك تسجيل دخول خاصًا بها تتشارك مجمّع الملف الافتراضي، فيسري ترتيبه عليها كلها؛ أما الاستراتيجية فتُضبط لكل ملف. تُنفَّذ التغييرات عبر واجهة Hermes السطرية بعد تأكيدك.",
+	accountsPoolsTitle: "مجمّعات بيانات الاعتماد",
+	accountsPoolsSub: (n) => arN(n, "مجمّع واحد", "مجمّعان", "مجمّعات", "مجمّعًا"),
+	accountsNoPools: "لا توجد بيانات اعتماد في المجمّعات بعد. سجّل الدخول أدناه أو شغّل `hermes auth add <provider>`.",
+	accountsSharedPool: (n) => `مشترك · ${arN(n, "ملف واحد", "ملفان", "ملفات", "ملفًا")}`,
+	accountsSharedTip: (list) => `يستخدمه: ${list}`,
+	accountsOwnPool: (owner) => `مجمّع خاص · ${owner}`,
+	accountsCount: (n) => arN(n, "حساب واحد", "حسابان", "حسابات", "حسابًا"),
+	accountsProviderQuota: (label, used) => `حصة المزوّد (الحساب المستخدم): ${label} مُستهلك ${used}%`,
+	accountsListAria: (name) => `حسابات ${name} بالترتيب الذي يجرّبها به Hermes`,
+	accountsRowAria: (n, label) => `${n}. ${label}. Alt+أعلى / Alt+أسفل للنقل`,
+	accountsRingLabel: (label, left) => `${label}: متبقٍ ${left}%`,
+	accountsRingNone: "لا توجد قراءة حصة لهذا الحساب",
+	accountsTriedFirst: "يُجرَّب أولًا",
+	accountsTriedFirstTip: "أول حساب متاح بهذا الترتيب — تستخدمه fill_first حتى ينفد.",
+	accountsTypeOauth: "OAuth",
+	accountsTypeKey: "مفتاح API",
+	accountsTypeOther: "أخرى",
+	accountsSourceTip: "من أين حصل Hermes على بيانات الاعتماد هذه",
+	accountsStatus_active: "نشط",
+	accountsStatus_cooldown: "في التهدئة",
+	accountsStatus_exhausted: "مستنفد",
+	accountsStatusUntil: (status, left) => `${status} · ${left}`,
+	accountsCooldownModels: (models) => `في التهدئة: ${models}`,
+	accountsMoveUp: (label) => `نقل ${label} للأعلى`,
+	accountsMoveDown: (label) => `نقل ${label} للأسفل`,
+	accountsDragHint: "اسحب صفًا، أو استخدم ▲▼ / Alt+↑↓، لتغيير الحساب الذي يُجرَّب أولًا.",
+	accountsNotWritable: "لا يمكن إعادة ترتيب هذا المجمّع من هنا (أحد الصفوف بلا معرّف مجمّع).",
+	accountsSingle: "حساب واحد — لا شيء لترتيبه. أضف آخر عبر `hermes auth add <provider>`.",
+	accountsBlocked_loading: "جارٍ تحديث بيانات الحسابات… التغييرات متوقفة حتى تصبح حديثة.",
+	accountsBlocked_stale: "بيانات الحسابات قديمة — حدّثها قبل أي تغيير.",
+	accountsBlocked_busy: "جارٍ تطبيق تغيير…",
+	accountsBlocked_confirm: "أكّد التغيير المعلّق أو ألغِه أولًا.",
+	accountsSharedWarning: (owner, others) => `مجمّع «${owner}» المشترك: إعادة الترتيب تغيّر أيضًا ${others || "لا ملفات أخرى"}.`,
+	accountsStrategyTitle: "الاستراتيجية لكل ملف شخصي",
+	strategy_fill_first: "الملء أولًا",
+	strategy_round_robin: "بالتناوب",
+	strategy_least_used: "الأقل استخدامًا",
+	strategy_random: "عشوائي",
+	strategyShort_fill_first: "ملء",
+	strategyShort_round_robin: "تناوب",
+	strategyShort_least_used: "الأقل",
+	strategyShort_random: "عشوائي",
+	strategyHint_fill_first: "استخدم الحساب الأول حتى ينفد ثم التالي (الترتيب مهم).",
+	strategyHint_round_robin: "تناوب بين الحسابات بالتساوي (الترتيب يحسم التعادل فقط).",
+	strategyHint_least_used: "اختر دائمًا الحساب الأقل استخدامًا.",
+	strategyHint_random: "اختر حسابًا عشوائيًا.",
+	accountsProfilesTitle: "الملفات الشخصية",
+	accountsProfilesSub: "الوصول إلى المجمّع · الاستراتيجية · النموذج ← البدائل",
+	accountsProfileCol: "الملف الشخصي",
+	accountsChainCol: "النموذج ← البدائل",
+	accountsRootTag: "الجذر",
+	accountsAccess_own: "خاص",
+	accountsAccess_shared: "مشترك",
+	accountsPrimaryTip: "النموذج الأساسي",
+	accountsFallbackTip: (n) => `البديل رقم ${n}`,
+	accountsCustomRoute: "نقطة نهاية مخصّصة",
+	accountsNoModel: "لم يُضبط نموذج",
+	accountsFallbackCopyTip: "نسخ — لا يعدّل Hermes سلسلة البدائل إلا في منتقيه التفاعلي (أو الإعدادات ◂ النموذج ◂ البدائل للملف المحدد هناك).",
+	accountsFallbackEdit: "نسخ أمر البدائل",
+	accountsFallbackNote: "ترتيب البدائل للقراءة فقط هنا: لا يستطيع Hermes إعادة ترتيبه دون تفاعل. انسخ الأمر وشغّله في الطرفية.",
+	accountsSigninTitle: "لم يُسجَّل الدخول",
+	accountsSigninSub: (n) => `بحاجة إلى انتباه: ${n}`,
+	accountsAllSignedIn: "سُجِّل الدخول لدى كل مزوّد تعرفه ذاكرة الحصة.",
+	accountsOtherUnavailable: (n) => `غير متاح مؤقتًا: ${n}`,
+	accountsMoreSignin: (n) => `بلا تسجيل دخول أيضًا: ${n}`,
+	accountsUsed: "مُستخدَم",
+	accountsUsedTip: "نموذج أحد الملفات الشخصية أو بديله يستخدم هذا المزوّد",
+	accountsKind_signin: "لم يُسجَّل الدخول",
+	accountsKind_reauth: "سجّل الدخول مجددًا",
+	accountsKind_optin: "متوقف",
+	accountsKind_rate_limited: "محدود المعدّل",
+	accountsKind_error: "غير متاح",
+	accountsReason_signin: (reason, tool) => tool ? `لم يُعثر على تسجيل دخول (${reason}). سجّل الدخول عبر ${tool}.` : `لم يُعثر على تسجيل دخول (${reason}).`,
+	accountsReason_reauth: (reason) => `تسجيل الدخول المحفوظ لم يعد يعمل (${reason}).`,
+	accountsReason_optin: (reason, tool) => `متوقف في إضافة الحصة (${reason}). فعّله لقراءة ${tool || "هذا المزوّد"}.`,
+	accountsReason_rate_limited: () => "المزوّد يحدّ من قراءات الحصة. لا حاجة لتسجيل الدخول.",
+	accountsReason_error: (reason) => `فشلت آخر قراءة (${reason}). ستُعاد المحاولة في التحديث التالي.`,
+	accountsRetryIn: (left) => `إعادة المحاولة بعد ${left}`,
+	accountsRetrySoon: "إعادة المحاولة في التحديث التالي",
+	accountsSigninAction: "تسجيل الدخول",
+	accountsAddKeyAction: "إضافة مفتاح API",
+	accountsReason_key: (reason) => `لم يُعثر على مفتاح API (${reason}).`,
+	accountsReauthAction: "تسجيل الدخول مجددًا",
+	accountsOptinAction: "تفعيل",
+	accountsCopyTip: "انسخ هذا الأمر وشغّله في الطرفية (تسجيل الدخول يفتح متصفحًا، لذا لا يمكن تشغيله من هنا)",
+	accountsLimits: "لا يدعم Hermes تخصيص حساب لكل ملف شخصي: يستخدم الملف المجمّع المشترك ما لم يكن له تسجيل دخول خاص (`hermes -p <profile> auth add <provider>`). الترتيب يخص المجمّع والاستراتيجية تخص الملف. لا شيء هنا ينقل بيانات الاعتماد أو ينسخها بين الملفات.",
+	accountsConfirmOrderTitle: (name) => `تغيير ترتيب حسابات ${name}؟`,
+	accountsConfirmOrderShared: (owner, n) => `هذا هو المجمّع المشترك الذي يملكه «${owner}». يسري الترتيب الجديد على كل الملفات التي تستخدمه (${n}).`,
+	accountsConfirmOrderOwn: (owner) => `لا يستخدم هذا المجمّع سوى «${owner}».`,
+	accountsConfirmBefore: "الآن",
+	accountsConfirmAfter: "بعد",
+	accountsConfirmFirst: (label) => `يُجرَّب أولًا مع fill_first: ${label}.`,
+	accountsConfirmProfiles: (list) => `يتأثر: ${list}`,
+	accountsConfirmStrategyTitle: (profile, name) => `تغيير استراتيجية ${name} للملف ${profile}؟`,
+	accountsConfirmStrategyDesc: (profile) => `يتغيّر «${profile}» فقط؛ تحتفظ الملفات الأخرى باستراتيجيتها.`,
+	accountsConfirmApply: "تطبيق",
+	accountsConfirmBusy: "جارٍ التطبيق…",
+	accountsConfirmCancel: "إلغاء",
+	accountsSavedOrder: (name) => `حُفظ ترتيب حسابات ${name}`,
+	accountsSavedStrategy: (profile, s) => `${profile}: ضُبطت الاستراتيجية على ${s}`,
+	accountsWriteUnsupported: "إضافة الحصة على البوابة قديمة ولا تستطيع تغيير الحسابات بعد — حدّثها.",
+	accountsUnsupported: "إضافة الحصة على هذه البوابة أقدم من عرض الحسابات — حدّث الخادم.",
+	accountsError: "تعذّرت قراءة بيانات الحسابات.",
+	monitorOff: "مراقب الوكلاء متوقف — فعّله من الإعدادات.",
+	monitorUnsupported:
+		"إضافة الحصة على هذه البوابة لا تتضمن مراقب الوكلاء بعد — حدّثها (./install.sh) لرؤية الجلسات المباشرة والحالة والاستخدام وكانبان.",
+	monitorError: "مراقب الوكلاء غير متاح حاليًا.",
+	sectionError: (section) => `تعذّرت قراءة بيانات ${section} هذه المرة.`,
+	monitorUpdated: (when, interval) => `حُدِّث ${when} · كل ${interval} ث`,
+	state_working: "يعمل",
+	state_waiting: "دورك",
+	state_needs_approval: "بانتظار الموافقة",
+	state_stalled: "متعثّر؟",
+	state_long_tool: "استدعاء أداة طويل",
+	state_ended: "انتهت",
+	untitled: "(جلسة بلا عنوان)",
+	subagent: "وكيل فرعي",
+	agent: "الوكيل",
+	cliSource: "CLI",
+	tokensN: (n) => `${n} رمز`,
+	contextN: (n) => `السياق ${n}`,
+	ago: (span) => `منذ ${span}`,
+	longToolCall: (tool) => `استدعاء أداة طويل جارٍ: ${tool}`,
+	openSessionTip: "فتح هذه الجلسة",
+	copyCommandTip: (command) => `نسخ: ${command}`,
+	commandCopied: (command) => `نُسخ: ${command}`,
+	commandCopyFailed: (command) => `تعذّر النسخ — شغّل: ${command}`,
+	last1m: "آخر دقيقة",
+	last60m: "آخر 60 دقيقة",
+	tokensPerMin: "رمز / دقيقة",
+	costPerMin: (cost) => `≈ ${cost} / دقيقة`,
+	cost60m: (cost) => `≈ ${cost} في 60 دقيقة`,
+	openSessions: "الجلسات المفتوحة",
+	countWorking: (n) => `تعمل: ${n}`,
+	countApproval: (n) => `بانتظار الموافقة: ${n}`,
+	countYourTurn: (n) => `دورك: ${n}`,
+	countStalled: (n) => `متعثّرة؟ ${n}`,
+	tokensChart: "الرموز / الدقيقة",
+	attentionTitle: (n) => `بحاجة إلى انتباه (${n})`,
+	noOpenSessions: "لا توجد جلسات مفتوحة.",
+	attention_approval: (who) => `${who} بانتظار الموافقة`,
+	attention_your_turn: (who) => `أنهى ${who} — دورك`,
+	attention_stalled: (who) => `${who} قد يكون متعثّرًا`,
+	attention_loop: (who) => `${who}: حلقة محتملة`,
+	attention_big_context: (who) => `${who}: سياق كبير`,
+	healthAccounts: "الحسابات",
+	healthModels: "النماذج",
+	healthChains: "سلاسل البدائل",
+	healthSpeed: "سرعة النماذج",
+	notSetUp: (n, names) => `غير مُعدّ هنا (${n}): ${names}`,
+	last24h: "آخر 24 ساعة",
+	none: "لا شيء لعرضه.",
+	credentialN: (n) => `بيانات الاعتماد ${n}`,
+	credLocked: "بلغ الحد",
+	unlocksIn: (span) => ` — يُفتح بعد ${span}`,
+	modelStatus_ok: "سليم",
+	modelStatus_idle: "خامل",
+	modelStatus_degraded: "متراجع",
+	modelStatus_failing: "يفشل",
+	modelStatus_account_exhausted: "حد الحساب",
+	callsN: (n) => `الاستدعاءات: ${n}`,
+	errorRate: (pct) => `أخطاء ${pct}%`,
+	errorsN: (n) => `الأخطاء: ${n}`,
+	cooldownFor: (span) => `تهدئة ${span}`,
+	recovered: "تعافى",
+	chainOk: "صالح للاستخدام",
+	chainSkip: (reason) => `تخطٍّ: ${reason}`,
+	chainRisky: (pct) => `محفوف بالمخاطر (أخطاء ${pct}%)`,
+	skip_same_backend: "نفس خادم النموذج الأساسي",
+	skip_no_credentials: "لا بيانات اعتماد",
+	skip_locked: "كل بيانات الاعتماد مقفلة",
+	skip_cooldown: "في التهدئة",
+	skip_undefined: "غير معروف",
+	noFallbacks: "لا بدائل مُعدّة",
+	speedLine: (p50, p90, turns) => `الوسيط ${p50} · p90 ${p90} · الأدوار: ${turns}`,
+	costToday: "اليوم",
+	costMonth: "هذا الشهر",
+	projection: (cost) => `نهاية الشهر ≈ ${cost}`,
+	projectionOver: (cost) => `نهاية الشهر ≈ ${cost} — فوق الميزانية`,
+	budgetTitle: "الميزانية",
+	budgetDaily: "يومية",
+	budgetMonthly: "شهرية",
+	budgetHint: "اضبط ميزانية يومية أو شهرية في الإعدادات لمتابعة الإنفاق مقابلها.",
+	budgetOff: "متوقفة",
+	budgetSettingsHint: "بالدولار الأمريكي؛ فارغ أو 0 = متوقفة. التكاليف تقديرات بأسعار API.",
+	last7Days: "آخر 7 أيام",
+	topModels: "أعلى النماذج · الشهر",
+	topProfiles: "أعلى الملفات الشخصية · الشهر",
+	topSessions: "أعلى الجلسات · 7 أيام",
+	sessionsN: (n) => arN(n, "جلسة واحدة", "جلستان", "جلسات", "جلسة"),
+	costEstimateNote: "التكاليف تقديرات بأسعار API؛ الاشتراك لا يُحاسَب بالرمز.",
+	board: "اللوحة",
+	noBoards: "لا توجد لوحات كانبان.",
+	kanbanQuiet: "لا شيء قيد التشغيل أو محظور أو قيد المراجعة أو يفشل.",
+	kanbanGroup_running: "قيد التشغيل",
+	kanbanGroup_blocked: "محظورة",
+	kanbanGroup_review: "مراجعة",
+	kanbanGroup_failing: "تفشل",
+	kanban_todo: "للتنفيذ",
+	kanban_triage: "فرز",
+	kanban_ready: "جاهزة",
+	kanban_running: "قيد التشغيل",
+	kanban_blocked: "محظورة",
+	kanban_review: "مراجعة",
+	kanban_done: "منجزة",
+	kanban_archived: "مؤرشفة",
+	unassigned: "غير مُسندة",
+	failuresN: (n) => `فشلت ${n}×`,
+	cardWhat_input: "بحاجة إلى ردّك",
+	cardWhat_blocked: "محظورة",
+	cardWhat_review: "بانتظار المراجعة",
+	cardWhat_failing: "تفشل",
+	burnRate: (rate) => `${rate}%/ساعة`,
+	burnFlat: "لا تغيير في آخر ساعتين",
+	fillsIn: (span) => `تمتلئ خلال ~${span}`,
+	beforeReset: (span) => `قبل الإعادة بـ ${span}`,
+	noFillBeforeReset: "لن تمتلئ قبل الإعادة",
+	accountHint: (full, used, room) => `${full} عند ${used}% · ${room} فيه متسع`,
+	accountHintBody: (window, left, room) => `${window}: متبقٍ ${left}% في ${room}`,
+	chipWorking: (n) => `يعمل ${n}`,
+	chipYourTurn: (n) => `دورك ${n}`,
+	chipApproval: (n) => `موافقة ${n}`,
+	chipOpenLive: "انقر لفتح «مباشر»",
+	// ---- status bar chips + cards ----
+	chipOpenList: "انقر لقائمة الجلسات",
+	chipQuotaOpen: "انقر لبطاقة الحصة (مع رابط إلى لوحة الحصة)",
+	chipCostOpen: "انقر لتفاصيل الإنفاق",
+	chipFullIn: (span) => `تمتلئ ~${span}`,
+	cardOpenLive: "فتح «مباشر»",
+	cardOpenQuota: "فتح الحصة",
+	cardOpenUsage: "فتح الاستخدام",
+	cardOpen: "فتح",
+	cardCopy: "نسخ",
+	tokensPerMinN: (n) => `${n} رمز/دقيقة`,
+	quotaCardTitle: "نوافذ الحصة",
+	checkedAgo: (age) => `فُحصت منذ ${age}`,
+	costCardTitle: "الإنفاق",
+	monthEnd: "نهاية الشهر",
+	topModelsToday: "أعلى النماذج · اليوم",
+	costChipAria: (cost) => `أُنفق ${cost} اليوم`,
+	costOfDaily: (pct) => `${pct}% من الميزانية اليومية`,
+	costOfMonthly: (pct) => `${pct}% من الميزانية الشهرية`,
+	quotaAlertsLabel: "العدّ التنازلي للإعادة ووقت الامتلاء على شريحة الحصة",
+	quotaAlertsHint: (pct) => `فقط عندما تُستهلك نافذة بنسبة ${pct}% فأكثر، أو يتوقع معدل الاستهلاك امتلاءها قبل الإعادة.`,
+	chipSparkLabel: "مخطط مصغّر للرموز في الدقيقة على شريحة الوكلاء",
+	chipFlashLabel: "وميض شريحة الوكلاء عندما تحتاجك جلسة",
+	chipFlashHint: "مرة لكل جلسة تبدأ بانتظار دورك أو موافقة. يتبع إعداد «تقليل الحركة».",
+	costChipLabel: "شريحة إنفاق اليوم",
+	costChipHint: "تتلوّن حسب ميزانيتك (80% تحذير، 100% تجاوز). افتراضيًا: تعمل بمجرد ضبط ميزانية.",
+	notifyQuotaTitle: (pct) => `الحصة عند ${pct}%`,
+	notifyResetsIn: (span) => ` — تُعاد بعد ${span}`,
+	notifySoonTitle: "الحصة ستمتلئ قريبًا",
+	notifySoonBody: (span) => `بهذا المعدل تمتلئ خلال ~${span}، قبل الإعادة`,
+	notifyBudgetTitle: (label, pct) => `الميزانية ${label} عند ${pct}%`,
+	notifyCardTitle: (what) => `كانبان: بطاقة ${what}`,
+	notifyModelTitle: (status, model) => `النموذج ${status}: ${model}`,
+	notifyLockedTitle: (provider) => `بلغ حد الحساب: ${provider}`,
+	monitorSettingsTitle: "مراقب الوكلاء",
+	monitorEnabledLabel: "مراقب الوكلاء",
+	monitorEnabledHint: "الجلسات المباشرة والحالة والاستخدام وكانبان — قراءة إضافية واحدة عبر الواجهة السطرية لكل فاصل تحديث.",
+	agentsChipLabel: "إظهار شريحة يعمل / دورك في شريط الحالة",
+	quotaForecastLabel: "معدل الاستهلاك والتوقع والسجل في عرض الحصة",
+	quotaForecastHint: "يُقرأ السجل كل بضع دقائق، فقط أثناء فتح عرض الحصة.",
+	historyRangeLabel: "مدى السجل",
+	liveIntervalLabel: "تحديث «مباشر»",
+	navBadgeLabel: "أعداد مباشرة في الشريط الجانبي",
+	navBadgeHint: "يعرض الوكلاء العاملين والموافقات وانخفاض الحصة وقرب امتلاء سياق المحادثة بجوار عنصر «الحصة» في القائمة.",
+	navWorking: (n) => `نشط ${n}`,
+	navYourTurn: (n) => `دورك ${n}`,
+	navApproval: (n) => `موافقة ${n}`,
+	navStalled: (n) => `متعثّر ${n}`,
+	historyDay: "24 ساعة",
+	historyWeek: "7 أيام",
+	notificationsTitle: "الإشعارات",
+	notificationsHint: "تظهر إشعارات النظام فقط عندما تكون خارج Hermes، مرة لكل حدث.",
+	notify_quota: "الحصة 80% / 95%، اقتراب الامتلاء، تلميحات الحسابات",
+	notify_budget: "الميزانية 80% / 100%",
+	notify_kanban: "بطاقات كانبان المحظورة أو قيد المراجعة أو التي تفشل",
+	notify_health: "النماذج التي تفشل والحسابات المقفلة",
+	notify_agents: "وكلاء بانتظار الموافقة أو متعثّرون أو في حلقة أو بسياق كبير",
+	notify_turns: "أنهى الوكيل — دورك",
+	// ---- Agent Bar layout ----
+	left: "متبقٍ",
+	historyCaption: "سجل النسبة المستهلكة",
+	summaryLowest: (pct) => `الأدنى: متبقٍ ${pct}%`,
+	summaryToday: (cost) => `${cost} اليوم`,
+	messagesChart: "الرسائل / الدقيقة",
+	dailyChart: "التكلفة اليومية",
+	dailyAvg: (cost) => `≈ ${cost} / يوم`,
+	budgetSub: "تكلفة API تقديرية",
+	settingsGroupStatusBar: "شريط الحالة والشريط الجانبي",
+	settingsGroupQuota: "عرض الحصة",
+	subagentsN: (n) => `وكلاء فرعيون يعملون: ${n}`,
+	// ---- context guard ----
+	ctxChipOthers: (n, w) => `${arN(n, "جلسة واحدة", "جلستان", "جلسات", "جلسة")} ≥ ${w}%`,
+	ctxChipAria: (pct) => `السياق ممتلئ بنسبة ${pct}%`,
+	ctxTipFocused: (pct, used, max) => `هذه المحادثة: السياق ممتلئ بنسبة ${pct}% (${used} / ${max})`,
+	ctxTipOthers: (n, w) => `جلسات مفتوحة أخرى ≥ ${w}%: ${n}`,
+	ctxTipOpen: "انقر للتفاصيل و/compress",
+	ctxCardTitle: "السياق",
+	ctxWarnSub: (w) => `تحذير عند ${w}%`,
+	ctxFocused: "هذه المحادثة",
+	ctxTokensOf: (used, max) => `${used} / ${max} رمز`,
+	ctxEstimated: "تقديري",
+	ctxCompressions: (n) => (n ? `ضُغط ${n}× حتى الآن` : "لم يُضغط بعد"),
+	ctxCompress: "ضغط…",
+	ctxCompressNow: "ضغط",
+	ctxCancel: "إلغاء",
+	ctxConfirm: "يلخّص الأدوار القديمة لتحرير السياق — مثل كتابة /compress في هذه المحادثة.",
+	ctxTopicPlaceholder: "موضوع التركيز (اختياري)",
+	ctxBusy: "انتظر حتى ينتهي الدور الحالي.",
+	ctxNoSession: "افتح محادثة لضغطها.",
+	ctxNoUsage: "لا توجد قراءة سياق لهذه المحادثة بعد.",
+	ctxOthersTitle: (w) => `جلسات أخرى ≥ ${w}%`,
+	ctxNothing: (w) => `لا توجد جلسة مفتوحة عند ${w}% أو أكثر.`,
+	ctxCompressSent: "جارٍ ضغط سياق هذه المحادثة…",
+	ctxCompressFailed: "تعذّر الوصول إلى حقل كتابة هذه المحادثة — افتحها وحاول مجددًا.",
+	ctxRowTip: (used, max) => `السياق ${used} / ${max}`,
+	contextOfN: (used, max) => `السياق ${used}/${max}`,
+	contextChipLabel: "إظهار شريحة تحذير السياق في شريط الحالة",
+	contextChipHint: "فقط عندما يبلغ سياق محادثة العتبة أو يتجاوزها — الشريط الأساسي يعرض استخدام المحادثة الحالية أصلًا.",
+	contextWarnLabel: "تحذير السياق عند",
+	contextWarnHint: (d) => `الشريحة وعرض «مباشر» والإشعارات؛ ${d}% فأكثر باللون الأحمر.`,
+	notify_context: "نافذة السياق تمتلئ (العتبة / 90%)",
+	notifyContextTitle: (pct) => `السياق ممتلئ بنسبة ${pct}%`,
+	notifyContextBody: "اضغطه (/compress) أو ابدأ محادثة جديدة",
+	navContext: (pct) => `السياق ${pct}%`,
+	// ---- locale-aware formatting + status-bar tooltips ----
+	_locale: "ar",
+	navLabel: "الحصة",
+	resetToday: (time) => `اليوم ${time}`,
+	resetTomorrow: (time) => `غدًا ${time}`,
+	resetting: "جارٍ الإعادة…",
+	spanDH: (d, h) => `${d} ي ${h} س`,
+	spanHM: (h, m) => `${h} س ${m} د`,
+	spanM: (m) => `${m} د`,
+	spanH: (h) => `${h} س`,
+	spanS: (s) => `${s} ث`,
+	spanLt1m: "أقل من دقيقة",
+	updateAvailable: "⬆ يتوفر تحديث — شغّل ./install.sh للحصول عليه",
+	accountN: (n) => `الحساب ${n}`,
+	valueUnknown: "غير معروف",
+	valueLeft: (v) => `متبقٍ ${v}`,
+	stale: "قديم",
+	valueUnavailable: "غير متاح",
+	valueAvailable: "متاح",
+	quotaBreakdown: "تفصيل الحصة:",
+	providerUnavailable: (name) => `${name}: غير متاح`,
+	providerUnavailableReason: (name, reason) => `${name}: غير متاح (${reason})`,
+	accountBalance: "رصيد الحساب",
+	accountBalanceLine: (v) => `رصيد الحساب: ${v}`,
+	apiCallsAvailable: (ok) => `استدعاءات API متاحة: ${ok ? "نعم" : "لا"}`,
+	planLine: (plan) => `الخطة: ${plan}`,
+	windowFallback: "نافذة",
+	resetsAt: (when) => `الإعادة ${when}`,
+	seriesTotal: "الإجمالي",
+};
+
+const I18N_BUNDLES = {
+	en: I18N_EN,
+	tr: I18N_TR,
+	de: I18N_DE,
+	es: I18N_ES,
+	fr: I18N_FR,
+	ru: I18N_RU,
+	ja: I18N_JA,
+	zh: I18N_ZH,
+	"zh-hant": I18N_ZH_HANT,
+	ar: I18N_AR,
 };
