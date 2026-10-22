@@ -63,7 +63,7 @@ def payload(codex=True, root=None, **extra):
     data = {
         "fetched_at": "2026-10-22T12:00:00Z",
         "age_s": 4,
-        "plugin_version": "2.10.1",
+        "plugin_version": "2.11.0",
         "providers": providers,
     }
     if root is not None:

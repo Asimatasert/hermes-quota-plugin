@@ -572,7 +572,7 @@ def _request_anthropic_usage_locked(
             "Accept": "application/json",
             "Content-Type": "application/json",
             "anthropic-beta": "oauth-2025-04-20",
-            "User-Agent": "hermes-quota-plugin/2.10.1",
+            "User-Agent": "hermes-quota-plugin/2.11.0",
         },
         method="GET",
     )
