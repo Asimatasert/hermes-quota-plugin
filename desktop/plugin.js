@@ -1472,7 +1472,7 @@ function Pill({ color = "var(--ui-text-tertiary)", dot = false, halo = false, ti
  * the bars it replaces; colour follows the same thresholds as Agent Bar's
  * levelColor (≥85 % used red, ≥60 % used amber).
  */
-function Ring({ value, tone, size = 52, stroke, label, children }) {
+function Ring({ value, tone, color, size = 52, stroke, label, children }) {
 	const sw = stroke ?? Math.max(3, Math.round(size / 11));
 	const r = (size - sw) / 2;
 	const c = 2 * Math.PI * r;
@@ -1497,7 +1497,7 @@ function Ring({ value, tone, size = 52, stroke, label, children }) {
 								cy: mid,
 								r,
 								fill: "none",
-								stroke: toneColor(tone),
+								stroke: color || toneColor(tone),
 								strokeWidth: sw,
 								strokeLinecap: "round",
 								strokeDasharray: `${((pct / 100) * c).toFixed(2)} ${c.toFixed(2)}`,
@@ -2062,6 +2062,8 @@ function QuotaSettings() {
 					jsx(StatusbarModeControl, {}, "mode"),
 					jsx(QuotaAlertsControl, {}, "quotaAlerts"),
 					jsx(AgentsChipControl, {}, "agents"),
+					jsx(ContextChipControl, {}, "context"),
+					jsx(ContextWarnControl, {}, "contextWarn"),
 					jsx(ChipSparkControl, {}, "spark"),
 					jsx(ChipFlashControl, {}, "flash"),
 					jsx(CostChipControl, {}, "cost"),
@@ -2364,6 +2366,14 @@ const MONITOR_ENABLED_KEY = "monitorEnabled";
 const monitorEnabledAtom = atom(true);
 const AGENTS_CHIP_KEY = "statusbarAgents";
 const agentsChipAtom = atom(true);
+// Context guard: a chip only while some chat's context is at/over the warn threshold.
+const CONTEXT_CHIP_KEY = "statusbarContext";
+const contextChipAtom = atom(true);
+const CONTEXT_WARN_KEY = "contextWarn";
+const CONTEXT_WARN_OPTIONS = [70, 80, 90];
+const CONTEXT_WARN_DEFAULT = 80;
+const CONTEXT_DANGER = 90;
+const contextWarnAtom = atom(CONTEXT_WARN_DEFAULT);
 // Status-bar extras, each with its own switch in Settings ▸ Status bar.
 const CHIP_SPARK_KEY = "statusbarSparkline";
 const chipSparkAtom = atom(true);
@@ -2391,7 +2401,7 @@ const budgetDailyAtom = atom(0);
 const budgetMonthlyAtom = atom(0);
 
 // Per-kind notification toggles (Agent Bar's notify* prefs), all on by default.
-const NOTIFY_KINDS = ["quota", "budget", "kanban", "health", "agents", "turns"];
+const NOTIFY_KINDS = ["quota", "budget", "kanban", "health", "agents", "turns", "context"];
 const notifyAtoms = {};
 for (const kind of NOTIFY_KINDS) notifyAtoms[kind] = atom(true);
 function notifyKey(kind) {
@@ -2407,6 +2417,13 @@ function applyStoredMonitor() {
 	applyStored(PANE_VIEW_KEY, paneViewAtom, MONITOR_VIEWS, "quota");
 	applyStoredBoolean(MONITOR_ENABLED_KEY, monitorEnabledAtom, true);
 	applyStoredBoolean(AGENTS_CHIP_KEY, agentsChipAtom, true);
+	applyStoredBoolean(CONTEXT_CHIP_KEY, contextChipAtom, true);
+	try {
+		const warn = Number(readStored(CONTEXT_WARN_KEY, CONTEXT_WARN_DEFAULT));
+		contextWarnAtom.set(CONTEXT_WARN_OPTIONS.includes(warn) ? warn : CONTEXT_WARN_DEFAULT);
+	} catch {
+		/* noop */
+	}
 	applyStoredBoolean(CHIP_SPARK_KEY, chipSparkAtom, true);
 	applyStoredBoolean(CHIP_FLASH_KEY, chipFlashAtom, true);
 	applyStoredBoolean(QUOTA_ALERTS_KEY, quotaAlertsAtom, true);
@@ -2819,6 +2836,7 @@ function monitorNotifications(input, prev, nowSec = Date.now() / 1000) {
 		cards: [],
 		health: [],
 		attention: [],
+		context: { ...asObject(old.context) },
 	};
 	const notes = [];
 	const push = (kind, key, title, body, target) => notes.push({ kind, key, title, body, target: target || null });
@@ -2918,6 +2936,35 @@ function monitorNotifications(input, prev, nowSec = Date.now() / 1000) {
 	}
 	if (on("health")) for (const [key, title, body] of healthFresh.slice(0, 5)) push("health", key, title, body);
 
+	// Context guard: once per session per level (warn threshold, 90 %). A
+	// session that drops well below the threshold (compressed) re-arms.
+	const ctxIn = asObject(input && input.context);
+	const warn = CONTEXT_WARN_OPTIONS.includes(Number(ctxIn.warn)) ? Number(ctxIn.warn) : CONTEXT_WARN_DEFAULT;
+	const focusCtx = focusedContext(ctxIn.usage);
+	const ctxKnown = new Set();
+	const ctxFresh = [];
+	for (const r of contextRows(live)) {
+		const focused = ctxIn.focusedStoredId != null && String(r.id) === String(ctxIn.focusedStoredId);
+		const pct = focused && focusCtx ? focusCtx.pct : rowContextPct(r);
+		if (pct == null) continue;
+		ctxKnown.add(String(r.id));
+		const key = `${r.profile || ""}|${r.id}`;
+		const level = contextLevel(pct, warn);
+		const mark = level === "danger" ? CONTEXT_DANGER : level === "warn" ? warn : 0;
+		const had = Number(state.context[key]) || 0;
+		if (mark > had) {
+			state.context[key] = mark;
+			ctxFresh.push([key, r, Math.round(pct)]);
+		} else if (had && Math.round(pct) < warn - 5) {
+			delete state.context[key];
+		}
+	}
+	if (on("context")) {
+		for (const [key, r, pct] of ctxFresh.sort((a, b) => b[2] - a[2]).slice(0, 3)) {
+			push("context", key, tr("notifyContextTitle", pct), `${r.title || tr("untitled")} · ${r.profile || "default"} — ${tr("notifyContextBody")}`, { sessionId: r.id, profile: r.profile, source: "hermes" });
+		}
+	}
+
 	// Agent attention items (approval / your turn / stalled / loop / big context).
 	const oldAttention = Array.isArray(old.attention) ? new Set(old.attention) : null;
 	const attentionFresh = [];
@@ -2929,6 +2976,8 @@ function monitorNotifications(input, prev, nowSec = Date.now() / 1000) {
 	}
 	for (const [key, item] of attentionFresh.slice(0, 5)) {
 		if (!on(item.kind === "your_turn" ? "turns" : "agents")) continue;
+		// The context rule above covers a session whose window size is known.
+		if (item.kind === "big_context" && on("context") && ctxKnown.has(String(item.session_id))) continue;
 		const who = item.profile || tr("agent");
 		const title = I18N_EN[`attention_${item.kind}`] ? tr(`attention_${item.kind}`, who) : `${who}: ${item.kind}`;
 		const body = `${item.title || tr("untitled")}${item.detail ? ` — ${item.detail}` : ""}`;
@@ -2939,6 +2988,7 @@ function monitorNotifications(input, prev, nowSec = Date.now() / 1000) {
 	state.soon = limitKeys(state.soon);
 	state.hint = limitKeys(state.hint);
 	state.budget = limitKeys(state.budget, 60);
+	state.context = limitKeys(state.context, 200);
 	return { notes, state };
 }
 
@@ -2974,6 +3024,11 @@ function runMonitorNotifier(scope, providers, snapshot, history) {
 			burnMap: monitorBurnMap(snapshot, history),
 			settings,
 			budget: { daily: budgetDailyAtom.get(), monthly: budgetMonthlyAtom.get() },
+			context: {
+				warn: contextWarnAtom.get(),
+				usage: readHostState("focusedUsage", null),
+				focusedStoredId: readHostState("focusedStoredSessionId", null),
+			},
 		},
 		prev,
 		Date.now() / 1000,
@@ -3242,9 +3297,10 @@ function liveGroupKey(row) {
 	return !row.kind || row.kind === "hermes" ? `p:${row.profile || "default"}` : `s:${row.source_name || row.kind}`;
 }
 
-function LiveRow({ row, children, scope, snapshot, nowSec }) {
+function LiveRow({ row, children, scope, snapshot, nowSec, ctxPct = null, warn = CONTEXT_WARN_DEFAULT }) {
 	const t = usePluginI18n(ID);
 	const state = sessionState(row);
+	const ctxLevel = contextLevel(ctxPct, warn);
 	const badge = state !== "ended" && row.long_tool_call ? "long_tool" : state;
 	const activity = row.long_tool_call ? t("longToolCall", row.long_tool_call) : row.activity;
 	const hermes = row.open ? row.open.kind === "hermes-session" : !row.kind || row.kind === "hermes";
@@ -3253,7 +3309,7 @@ function LiveRow({ row, children, scope, snapshot, nowSec }) {
 		style: UI.col,
 		children: [
 			jsxs(Row, {
-				tone: badge === "needs_approval" ? STATE_STYLE.needs_approval : undefined,
+				tone: badge === "needs_approval" ? STATE_STYLE.needs_approval : ctxLevel ? contextColor(ctxLevel) : undefined,
 				title: hermes ? t("openSessionTip") : row.open && row.open.command ? t("copyCommandTip", row.open.command) : undefined,
 				onClick: () => void openMonitorTarget(scope, { open: row.open, row, sessionId: row.id, profile: row.profile }, snapshot),
 				children: [
@@ -3268,6 +3324,7 @@ function LiveRow({ row, children, scope, snapshot, nowSec }) {
 										style: { ...UI.row, gap: 6 },
 										children: [
 											jsx("span", { style: { ...UI.text, fontWeight: 500, ...UI.ellipsis, flex: "1 1 auto" }, children: row.title || t("untitled") }),
+											ctxPct != null ? jsx(ContextPct, { pct: ctxPct, level: ctxLevel, title: t("ctxRowTip", fmtTokens(row.context_tokens), fmtTokens(row.context_max)) }, "ctx") : null,
 											row.tokens != null
 												? jsx("span", { style: { ...UI.meta, ...UI.num, flexShrink: 0, color: "var(--ui-text-secondary)", fontWeight: 600 }, children: t("tokensN", fmtTokens(row.tokens)) })
 												: null,
@@ -3283,7 +3340,11 @@ function LiveRow({ row, children, scope, snapshot, nowSec }) {
 														row.subagent ? t("subagent") : null,
 														row.model,
 														row.cost != null ? fmtUsd(row.cost) : null,
-														row.context_tokens != null ? t("contextN", fmtTokens(row.context_tokens)) : null,
+														row.context_tokens != null
+															? row.context_max
+																? t("contextOfN", fmtTokens(row.context_tokens), fmtTokens(row.context_max))
+																: t("contextN", fmtTokens(row.context_tokens))
+															: null,
 														row.account ? `@${row.account}` : null,
 													],
 												}),
@@ -3321,6 +3382,12 @@ function LiveView({ mon }) {
 	const nowSec = finiteNumber(live.now) ?? nowMs / 1000;
 	const counts = liveCounts(live);
 	const running = asList(live.running).filter((r) => r && sessionState(r) !== "ended");
+	const warn = useValue(contextWarnAtom);
+	const focusUsage = useValue(hostAtom("focusedUsage"));
+	const focusId = useValue(hostAtom("focusedStoredSessionId"));
+	const focusCtx = focusedContext(focusUsage);
+	const ctxOf = (r) => (focusCtx && focusId != null && String(r.id) === String(focusId) ? focusCtx.pct : rowContextPct(r));
+	const over = (r) => (contextLevel(ctxOf(r), warn) ? 0 : 1);
 	const byParent = new Map();
 	for (const r of running) {
 		if (!r.subagent || !r.parent) continue;
@@ -3328,7 +3395,7 @@ function LiveView({ mon }) {
 		byParent.get(r.parent).push(r);
 	}
 	const rank = (r) => STATE_RANK[sessionState(r)] ?? 4;
-	const byAttention = (a, b) => rank(a) - rank(b) || (Number(b.last) || 0) - (Number(a.last) || 0);
+	const byAttention = (a, b) => rank(a) - rank(b) || over(a) - over(b) || (Number(b.last) || 0) - (Number(a.last) || 0);
 	const mains = running.filter((r) => !r.subagent || !running.some((p) => p.id === r.parent)).sort(byAttention);
 	const groups = new Map();
 	for (const r of mains) {
@@ -3435,6 +3502,8 @@ function LiveView({ mon }) {
 										scope: mon.scope,
 										snapshot,
 										nowSec,
+										ctxPct: ctxOf(r),
+										warn,
 										children: asList(byParent.get(r.id)).sort(byAttention).map((c) =>
 											jsx(LiveRow, { row: c, scope: mon.scope, snapshot, nowSec }, c.id),
 										),
@@ -4369,6 +4438,395 @@ function MonitorStatus() {
 	});
 }
 
+// ---- context guard ----
+//
+// The core status bar already shows the focused chat's context bar, so this
+// chip appears only when something needs action: the focused chat at/over the
+// warn threshold, or another open session over it (from the monitor snapshot,
+// whose Hermes rows carry context_max / context_percent). The card's Compress
+// goes through the composer exactly like a typed `/compress`, so the app's own
+// slash handler applies the replacement transcript.
+
+const NULL_ATOM = atom(null);
+const FALSE_ATOM = atom(false);
+
+/** A host.state atom, or `fallback` on an older host / an offline harness. */
+function hostAtom(name, fallback = NULL_ATOM) {
+	try {
+		const a = host && host.state ? host.state[name] : null;
+		if (a && typeof a.get === "function") return a;
+	} catch {
+		/* older host */
+	}
+	return fallback;
+}
+
+function readHostState(name, fallback = null) {
+	try {
+		const a = hostAtom(name, null);
+		return a ? a.get() : fallback;
+	} catch {
+		return fallback;
+	}
+}
+
+/** null | "warn" | "danger" for a used %, on the rounded figure the UI shows. */
+function contextLevel(pct, warn = CONTEXT_WARN_DEFAULT) {
+	const p = finiteNumber(pct);
+	if (p == null) return null;
+	const shown = Math.round(p);
+	const w = finiteNumber(warn) ?? CONTEXT_WARN_DEFAULT;
+	if (shown >= CONTEXT_DANGER) return "danger";
+	return shown >= w ? "warn" : null;
+}
+
+function contextColor(level) {
+	if (level === "danger") return "var(--ui-red)";
+	if (level === "warn") return "var(--ui-yellow)";
+	return "var(--ui-accent)";
+}
+
+/** The focused chat's live UsageStats → {used, max, pct, estimated, compressions} | null. */
+function focusedContext(usage) {
+	const u = asObject(usage);
+	const used = finiteNumber(u.context_used);
+	const max = finiteNumber(u.context_max);
+	let pct = finiteNumber(u.context_percent);
+	if (pct == null && used != null && max) pct = (used / max) * 100;
+	if (pct == null) return null;
+	return {
+		used,
+		max,
+		pct: Math.max(0, Math.min(100, pct)),
+		estimated: Boolean(u.context_estimated),
+		compressions: Math.max(0, finiteNumber(u.compressions) ?? 0),
+	};
+}
+
+/** Context % of one snapshot row (backend `context_percent`, else tokens / max). */
+function rowContextPct(row) {
+	if (!row) return null;
+	const pct = finiteNumber(row.context_percent);
+	if (pct != null) return Math.max(0, Math.min(100, pct));
+	const used = finiteNumber(row.context_tokens);
+	const max = finiteNumber(row.context_max);
+	return used != null && max ? Math.max(0, Math.min(100, (used / max) * 100)) : null;
+}
+
+/** Open main Hermes sessions of a snapshot (the rows a context % can exist for). */
+function contextRows(live) {
+	return asList(live && live.running).filter((r) => r && r.id != null && !r.subagent && sessionState(r) !== "ended" && (!r.kind || r.kind === "hermes"));
+}
+
+/** Everything the chip / card / nav need, pure. */
+function contextGuard({ usage, focusedStoredId, live, warn = CONTEXT_WARN_DEFAULT }) {
+	const rows = contextRows(live);
+	const fid = focusedStoredId != null ? String(focusedStoredId) : null;
+	let focus = focusedContext(usage);
+	if (!focus && fid) {
+		// No live reading yet (a chat just opened): the snapshot row stands in.
+		const row = rows.find((r) => String(r.id) === fid);
+		const pct = rowContextPct(row);
+		if (pct != null) focus = { used: finiteNumber(row.context_tokens), max: finiteNumber(row.context_max), pct, estimated: row.context_estimated !== false, compressions: null };
+	}
+	if (focus) focus = { ...focus, level: contextLevel(focus.pct, warn) };
+	const others = rows
+		.filter((r) => String(r.id) !== fid)
+		.map((row) => ({ row, pct: rowContextPct(row) }))
+		.filter((x) => contextLevel(x.pct, warn))
+		.map((x) => ({ ...x, level: contextLevel(x.pct, warn) }))
+		.sort((a, b) => b.pct - a.pct);
+	const levels = [focus && focus.level, ...others.map((o) => o.level)];
+	const level = levels.includes("danger") ? "danger" : levels.includes("warn") ? "warn" : null;
+	return { focus, others, level, warn, visible: Boolean((focus && focus.level) || others.length) };
+}
+
+/** Chip text: the focused chat's % (+ others), else "2 sessions ≥ 80%". */
+function contextChipText(g, t) {
+	if (g.focus && g.focus.level) return `${Math.round(g.focus.pct)}%${g.others.length ? ` +${g.others.length}` : ""}`;
+	return t("ctxChipOthers", g.others.length, g.warn);
+}
+
+/** The focused chat's `/compress [topic]`, the same path as typing it. */
+function compressCommand(topic) {
+	const clean = String(topic == null ? "" : topic).replace(/\s+/g, " ").trim().slice(0, 200);
+	return clean ? `/compress ${clean}` : "/compress";
+}
+
+function compressFocused(topic) {
+	const sessionId = readHostState("focusedSessionId", null) || readHostState("focusedStoredSessionId", null);
+	if (!sessionId) return { ok: false, reason: "no_session" };
+	if (readHostState("busy", false)) return { ok: false, reason: "busy" };
+	const text = compressCommand(topic);
+	let ok = false;
+	try {
+		ok = Boolean(host.composer && typeof host.composer.submit === "function" && host.composer.submit(sessionId, text) === true);
+	} catch {
+		ok = false;
+	}
+	try {
+		host.notify?.({ kind: ok ? "success" : "warning", message: ok ? tr("ctxCompressSent") : tr("ctxCompressFailed") });
+	} catch {
+		/* noop */
+	}
+	return { ok, text, sessionId, reason: ok ? null : "unclaimed" };
+}
+
+/** Mini ring + percent (chip, Live rows). */
+function ContextPct({ pct, level, title, size = 12 }) {
+	const value = Math.round(pct);
+	return jsxs("span", {
+		"data-ctx-pct": value,
+		"data-ctx-level": level || "ok",
+		title,
+		style: { display: "inline-flex", alignItems: "center", gap: 3, flexShrink: 0, ...UI.num },
+		children: [
+			jsx(Ring, { value, color: contextColor(level), size, stroke: 2, label: `${value}%` }, "ring"),
+			jsx("span", { style: { fontSize: "0.6875rem", fontWeight: level ? 650 : 500, color: level ? contextColor(level) : "var(--ui-text-tertiary)" }, children: `${value}%` }, "pct"),
+		],
+	});
+}
+
+const CARD_BUTTON = {
+	border: "1px solid var(--ui-stroke-secondary)",
+	background: "transparent",
+	borderRadius: 6,
+	padding: "3px 10px",
+	fontSize: "0.6875rem",
+	fontWeight: 600,
+	color: "var(--ui-text-primary)",
+	whiteSpace: "nowrap",
+	flexShrink: 0,
+};
+
+function CompressControls({ stage, setStage, topic, setTopic, disabled, reason, close }) {
+	const t = usePluginI18n(ID);
+	const hint = reason === "busy" ? t("ctxBusy") : reason === "no_session" ? t("ctxNoSession") : null;
+	const run = () => {
+		const r = compressFocused(topic);
+		if (r.ok) {
+			setStage("idle");
+			setTopic("");
+			close();
+		}
+	};
+	if (stage !== "confirm") {
+		return jsxs("div", {
+			"data-ctx-compress": "idle",
+			style: { ...UI.row, gap: 8, justifyContent: "space-between" },
+			children: [
+				jsx("span", { style: { ...UI.tiny, ...UI.ellipsis }, children: hint || "" }, "hint"),
+				jsx("button", {
+					type: "button",
+					"data-ctx-action": "compress",
+					disabled,
+					className: disabled ? undefined : "qm-sb-row cursor-pointer hover:bg-(--chrome-action-hover) transition-colors",
+					onClick: disabled ? undefined : () => setStage("confirm"),
+					style: { ...CARD_BUTTON, opacity: disabled ? 0.45 : 1, cursor: disabled ? "default" : "pointer" },
+					children: t("ctxCompress"),
+				}, "go"),
+			],
+		});
+	}
+	return jsxs("div", {
+		"data-ctx-compress": "confirm",
+		style: { ...UI.col, gap: 6, padding: "8px 9px", borderRadius: 8, background: "var(--ui-bg-tertiary)" },
+		children: [
+			jsx("span", { style: { ...UI.meta, color: "var(--ui-text-secondary)", lineHeight: 1.35 }, children: t("ctxConfirm") }, "q"),
+			jsx(Input, {
+				value: topic,
+				placeholder: t("ctxTopicPlaceholder"),
+				"data-ctx-topic": true,
+				maxLength: 200,
+				onChange: (e) => setTopic(e && e.target ? e.target.value : String(e || "")),
+				onKeyDown: (e) => {
+					if (e && e.key === "Enter" && !disabled) run();
+					if (e && e.key === "Escape") setStage("idle");
+				},
+				className: "h-6 text-xs",
+			}, "topic"),
+			hint ? jsx("span", { style: { ...UI.tiny, color: "var(--ui-yellow)" }, children: hint }, "hint") : null,
+			jsxs("div", {
+				style: { display: "flex", justifyContent: "flex-end", gap: 6 },
+				children: [
+					jsx("button", {
+						type: "button",
+						"data-ctx-action": "cancel",
+						className: "qm-sb-row cursor-pointer hover:bg-(--chrome-action-hover) transition-colors",
+						onClick: () => setStage("idle"),
+						style: { ...CARD_BUTTON, border: "1px solid transparent", color: "var(--ui-text-secondary)", cursor: "pointer" },
+						children: t("ctxCancel"),
+					}, "no"),
+					jsx("button", {
+						type: "button",
+						"data-ctx-action": "confirm",
+						disabled,
+						onClick: disabled ? undefined : run,
+						style: {
+							...CARD_BUTTON,
+							border: "1px solid var(--ui-accent)",
+							background: "var(--ui-accent)",
+							color: "var(--dt-midground-foreground, var(--ui-bg-editor))",
+							opacity: disabled ? 0.45 : 1,
+							cursor: disabled ? "default" : "pointer",
+						},
+						children: t("ctxCompressNow"),
+					}, "yes"),
+				],
+			}, "buttons"),
+		],
+	});
+}
+
+function ContextOtherRow({ item, onPick }) {
+	const t = usePluginI18n(ID);
+	const r = item.row;
+	const pct = Math.round(item.pct);
+	return jsxs("button", {
+		type: "button",
+		"data-ctx-row": r.id,
+		className: "qm-sb-row cursor-pointer rounded hover:bg-(--chrome-action-hover) transition-colors",
+		title: t("openSessionTip"),
+		onClick: () => onPick(r),
+		style: { ...UI.row, gap: 8, width: "100%", padding: "4px 6px", border: 0, background: "transparent", color: "inherit", textAlign: "left", boxSizing: "border-box" },
+		children: [
+			jsx(Ring, { value: pct, color: contextColor(item.level), size: 18, stroke: 3, label: `${pct}%` }, "ring"),
+			jsxs("span", {
+				style: { ...UI.col, flex: "1 1 auto", gap: 1 },
+				children: [
+					jsx("span", { style: { ...UI.text, ...UI.ellipsis }, children: r.title || t("untitled") }),
+					jsx("span", {
+						style: { ...UI.tiny, ...UI.ellipsis, ...UI.num },
+						children: [r.profile || "default", r.model, r.context_max ? `${fmtTokens(r.context_tokens)} / ${fmtTokens(r.context_max)}` : null].filter(Boolean).join(" · "),
+					}),
+				],
+			}, "text"),
+			jsx("span", { style: { ...UI.num, fontSize: "0.75rem", fontWeight: 650, color: contextColor(item.level), flexShrink: 0 }, children: `${pct}%` }, "pct"),
+		],
+	});
+}
+
+function ContextCard({ snapshot, scope, close, stage: initialStage = "idle", topic: initialTopic = "" }) {
+	const t = usePluginI18n(ID);
+	const warn = useValue(contextWarnAtom);
+	const usage = useValue(hostAtom("focusedUsage"));
+	const storedId = useValue(hostAtom("focusedStoredSessionId"));
+	const runtimeId = useValue(hostAtom("focusedSessionId"));
+	const busy = useValue(hostAtom("busy", FALSE_ATOM));
+	const [stage, setStage] = useState(initialStage);
+	const [topic, setTopic] = useState(initialTopic);
+	const g = contextGuard({ usage, focusedStoredId: storedId, live: snapshot && snapshot.live, warn });
+	const reason = !(runtimeId || storedId) ? "no_session" : busy ? "busy" : null;
+	const pick = (row) => {
+		close();
+		void openMonitorTarget(scope, { open: row.open, row, sessionId: row.id, profile: row.profile, source: "hermes" }, snapshot);
+	};
+	const f = g.focus;
+	const pct = f ? Math.round(f.pct) : null;
+	return jsxs(ChipCard, {
+		kind: "context",
+		title: t("ctxCardTitle"),
+		sub: t("ctxWarnSub", warn),
+		link: t("cardOpenLive"),
+		onLink: () => {
+			close();
+			openMonitorTab("live");
+		},
+		children: [
+			jsxs("div", {
+				"data-ctx-focused": f ? f.level || "ok" : "none",
+				style: { ...UI.col, gap: 8 },
+				children: [
+					jsxs("div", {
+						style: { ...UI.row, gap: 10 },
+						children: [
+							jsx(Ring, {
+								value: pct,
+								color: contextColor(f && f.level),
+								size: 46,
+								stroke: 4,
+								label: pct == null ? "—" : `${pct}%`,
+								children: jsx("span", { style: { fontSize: 11, fontWeight: 650, color: "var(--ui-text-primary)", ...UI.num }, children: pct == null ? "—" : `${pct}%` }),
+							}, "ring"),
+							jsxs("div", {
+								style: { ...UI.col, gap: 2, flex: "1 1 auto" },
+								children: [
+									jsx("span", { style: { ...UI.text, fontWeight: 600 }, children: t("ctxFocused") }, "h"),
+									f && f.used != null && f.max
+										? jsxs("span", {
+												"data-ctx-tokens": true,
+												style: { ...UI.meta, ...UI.num, color: "var(--ui-text-secondary)" },
+												title: f.estimated ? t("ctxEstimated") : undefined,
+												children: [`${f.estimated ? "≈ " : ""}${t("ctxTokensOf", fmtTokens(f.used), fmtTokens(f.max))}`, f.estimated ? jsx("span", { style: { ...UI.tiny, marginLeft: 4 }, children: `(${t("ctxEstimated")})` }, "e") : null],
+											}, "tok")
+										: jsx("span", { style: UI.meta, children: f ? "" : t(storedId || runtimeId ? "ctxNoUsage" : "ctxNoSession") }, "tok"),
+									f && f.compressions != null ? jsx("span", { "data-ctx-compressions": f.compressions, style: { ...UI.tiny, ...UI.num }, children: t("ctxCompressions", f.compressions) }, "c") : null,
+								],
+							}, "text"),
+						],
+					}, "head"),
+					jsx(CompressControls, { stage, setStage, topic, setTopic, disabled: Boolean(reason), reason, close }, "compress"),
+				],
+			}, "focused"),
+			g.others.length
+				? jsxs("div", {
+						"data-ctx-others": g.others.length,
+						style: { ...UI.col, gap: 1, paddingTop: 8, borderTop: "1px solid var(--ui-stroke-tertiary)" },
+						children: [
+							jsx("span", { style: { ...UI.faint, padding: "0 0 3px" }, children: t("ctxOthersTitle", warn) }, "h"),
+							...g.others.slice(0, AGENT_CARD_ROWS).map((item) => jsx(ContextOtherRow, { item, onPick: pick }, item.row.id)),
+							g.others.length > AGENT_CARD_ROWS ? jsx("span", { style: { ...UI.tiny, padding: "1px 6px" }, children: t("moreDetails", g.others.length - AGENT_CARD_ROWS) }, "more") : null,
+						],
+					}, "others")
+				: f && f.level
+					? null
+					: jsx(Empty, { children: t("ctxNothing", warn) }, "none"),
+		],
+	});
+}
+
+function ContextChip() {
+	const t = usePluginI18n(ID);
+	const show = useValue(contextChipAtom);
+	const showBar = useValue(showStatusBarAtom);
+	const warn = useValue(contextWarnAtom);
+	const usage = useValue(hostAtom("focusedUsage"));
+	const storedId = useValue(hostAtom("focusedStoredSessionId"));
+	const mon = useMonitor();
+	if (!show || !showBar) return null;
+	const g = contextGuard({ usage, focusedStoredId: storedId, live: mon.snapshot && mon.snapshot.live, warn });
+	if (!g.visible) return null;
+	const ringPct = g.focus && g.focus.level ? g.focus.pct : g.others[0].pct;
+	const text = contextChipText(g, t);
+	const tip = [
+		g.focus ? t("ctxTipFocused", Math.round(g.focus.pct), fmtTokens(g.focus.used), fmtTokens(g.focus.max)) : null,
+		g.others.length ? t("ctxTipOthers", g.others.length, warn) : null,
+		t("ctxTipOpen"),
+	].filter(Boolean);
+	const color = contextColor(g.level);
+	const button = jsxs("button", {
+		type: "button",
+		"aria-label": [g.focus && g.focus.level ? t("ctxChipAria", Math.round(g.focus.pct)) : null, g.others.length ? t("ctxTipOthers", g.others.length, warn) : null, t("ctxTipOpen")].filter(Boolean).join(" · "),
+		"data-context-chip": g.level,
+		className: cn(
+			"qm-sb-chip inline-flex h-full items-center gap-1 px-1.5 text-[0.6875rem]",
+			"text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground transition-colors",
+		),
+		style: { ...CHIP_NOWRAP, gap: 4 },
+		children: [
+			jsx(Ring, { value: Math.round(ringPct), color, size: 11, stroke: 2, label: `${Math.round(ringPct)}%` }, "ring"),
+			jsx("span", { className: "tabular-nums", "data-ctx-text": true, style: { color, fontWeight: 600 }, children: text }, "text"),
+		],
+	});
+	return jsx(ChipPopover, {
+		tip: tip.join("\n"),
+		kind: "context",
+		width: 320,
+		card: (close) => jsx(ContextCard, { snapshot: mon.snapshot, scope: mon.scope, close }),
+		children: button,
+	});
+}
+
 // ---- quota card ----
 
 function QuotaCardWindow({ w, nowMs }) {
@@ -4613,6 +5071,30 @@ function CostChipControl() {
 		hint: t("costChipHint"),
 		checked: costChipEnabled(stored, daily, monthly),
 		onChange: (v) => setStored(COST_CHIP_KEY, !!v, costChipAtom),
+	});
+}
+
+function ContextChipControl() {
+	const t = usePluginI18n(ID);
+	const on = useValue(contextChipAtom);
+	return jsx(SettingSwitch, { label: t("contextChipLabel"), hint: t("contextChipHint"), checked: on, onChange: (v) => setStored(CONTEXT_CHIP_KEY, !!v, contextChipAtom) });
+}
+
+function ContextWarnControl() {
+	const t = usePluginI18n(ID);
+	const warn = useValue(contextWarnAtom);
+	return jsx(SettingRow, {
+		label: t("contextWarnLabel"),
+		hint: t("contextWarnHint", CONTEXT_DANGER),
+		children: jsx(SegmentedControl, {
+			value: String(warn),
+			"data-context-warn": warn,
+			onChange: (v) => {
+				const n = Number(v);
+				setStored(CONTEXT_WARN_KEY, CONTEXT_WARN_OPTIONS.includes(n) ? n : CONTEXT_WARN_DEFAULT, contextWarnAtom);
+			},
+			options: CONTEXT_WARN_OPTIONS.map((n) => ({ id: String(n), label: `${n}%` })),
+		}),
 	});
 }
 
@@ -4982,7 +5464,7 @@ const I18N_EN = {
 	historyRangeLabel: "History range",
 	liveIntervalLabel: "Live refresh",
 	navBadgeLabel: "Live counts in the sidebar",
-	navBadgeHint: "Shows working agents, approvals and a low quota next to the Quota menu entry.",
+	navBadgeHint: "Shows working agents, approvals, a low quota and a nearly full chat context next to the Quota menu entry.",
 	navWorking: (n) => `${n} active`,
 	navYourTurn: (n) => `${n} your turn`,
 	navApproval: (n) => `${n} approval`,
@@ -5009,6 +5491,40 @@ const I18N_EN = {
 	settingsGroupStatusBar: "Status bar & sidebar",
 	settingsGroupQuota: "Quota view",
 	subagentsN: (n) => `${n} subagents running`,
+	// ---- context guard ----
+	ctxChipOthers: (n, w) => `${n} ${n === 1 ? "session" : "sessions"} ≥ ${w}%`,
+	ctxChipAria: (pct) => `Context ${pct}% full`,
+	ctxTipFocused: (pct, used, max) => `This chat: context ${pct}% full (${used} / ${max})`,
+	ctxTipOthers: (n, w) => `${n} other open ${n === 1 ? "session" : "sessions"} ≥ ${w}%`,
+	ctxTipOpen: "Click for details and /compress",
+	ctxCardTitle: "Context",
+	ctxWarnSub: (w) => `warns at ${w}%`,
+	ctxFocused: "This chat",
+	ctxTokensOf: (used, max) => `${used} / ${max} tokens`,
+	ctxEstimated: "estimated",
+	ctxCompressions: (n) => (n ? `compressed ${n}× so far` : "not compressed yet"),
+	ctxCompress: "Compress…",
+	ctxCompressNow: "Compress",
+	ctxCancel: "Cancel",
+	ctxConfirm: "Summarises older turns to free context — the same as typing /compress in this chat.",
+	ctxTopicPlaceholder: "Focus topic (optional)",
+	ctxBusy: "Wait until the current turn finishes.",
+	ctxNoSession: "Open a chat to compress it.",
+	ctxNoUsage: "No context reading for this chat yet.",
+	ctxOthersTitle: (w) => `Other sessions ≥ ${w}%`,
+	ctxNothing: (w) => `No open session is at ${w}% or more.`,
+	ctxCompressSent: "Compressing this chat's context…",
+	ctxCompressFailed: "Couldn't reach this chat's composer — open the chat and try again.",
+	ctxRowTip: (used, max) => `Context ${used} / ${max}`,
+	contextOfN: (used, max) => `ctx ${used}/${max}`,
+	contextChipLabel: "Show context warning chip in the status bar",
+	contextChipHint: "Only while a chat's context is at or above the threshold — the core bar already shows the focused chat's usage.",
+	contextWarnLabel: "Context warning at",
+	contextWarnHint: (d) => `Chip, Live view and notifications; ${d}% and over is red.`,
+	notify_context: "Context window filling up (threshold / 90%)",
+	notifyContextTitle: (pct) => `Context ${pct}% full`,
+	notifyContextBody: "compress it (/compress) or start a new chat",
+	navContext: (pct) => `ctx ${pct}%`,
 };
 
 const I18N_TR = {
@@ -5227,7 +5743,7 @@ const I18N_TR = {
 	historyRangeLabel: "Geçmiş aralığı",
 	liveIntervalLabel: "Canlı yenileme",
 	navBadgeLabel: "Kenar menüde canlı sayılar",
-	navBadgeHint: "Quota menüsünün yanında çalışan ajanları, onay bekleyenleri ve azalan kotayı gösterir.",
+	navBadgeHint: "Quota menüsünün yanında çalışan ajanları, onay bekleyenleri, azalan kotayı ve dolmak üzere olan sohbet bağlamını gösterir.",
 	navWorking: (n) => `${n} aktif`,
 	navYourTurn: (n) => `${n} sıra sende`,
 	navApproval: (n) => `${n} onay`,
@@ -5254,6 +5770,40 @@ const I18N_TR = {
 	settingsGroupStatusBar: "Durum çubuğu ve kenar çubuğu",
 	settingsGroupQuota: "Kota görünümü",
 	subagentsN: (n) => `${n} alt ajan çalışıyor`,
+	// ---- context guard ----
+	ctxChipOthers: (n, w) => `${n} oturum ≥ %${w}`,
+	ctxChipAria: (pct) => `Bağlam %${pct} dolu`,
+	ctxTipFocused: (pct, used, max) => `Bu sohbet: bağlam %${pct} dolu (${used} / ${max})`,
+	ctxTipOthers: (n, w) => `≥ %${w} olan ${n} açık oturum daha`,
+	ctxTipOpen: "Ayrıntı ve /compress için tıkla",
+	ctxCardTitle: "Bağlam",
+	ctxWarnSub: (w) => `uyarı %${w}`,
+	ctxFocused: "Bu sohbet",
+	ctxTokensOf: (used, max) => `${used} / ${max} token`,
+	ctxEstimated: "tahmini",
+	ctxCompressions: (n) => (n ? `şimdiye dek ${n}× sıkıştırıldı` : "henüz sıkıştırılmadı"),
+	ctxCompress: "Sıkıştır…",
+	ctxCompressNow: "Sıkıştır",
+	ctxCancel: "Vazgeç",
+	ctxConfirm: "Eski turlar özetlenir, bağlam boşalır — bu sohbete /compress yazmakla aynı.",
+	ctxTopicPlaceholder: "Odak konusu (isteğe bağlı)",
+	ctxBusy: "Süren tur bitene kadar bekle.",
+	ctxNoSession: "Sıkıştırmak için bir sohbet aç.",
+	ctxNoUsage: "Bu sohbet için henüz bağlam ölçümü yok.",
+	ctxOthersTitle: (w) => `≥ %${w} olan diğer oturumlar`,
+	ctxNothing: (w) => `Hiçbir açık oturum %${w} veya üstünde değil.`,
+	ctxCompressSent: "Sohbetin bağlamı sıkıştırılıyor…",
+	ctxCompressFailed: "Sohbetin yazma alanına ulaşılamadı — sohbeti açıp yeniden dene.",
+	ctxRowTip: (used, max) => `Bağlam ${used} / ${max}`,
+	contextOfN: (used, max) => `bağlam ${used}/${max}`,
+	contextChipLabel: "Durum çubuğunda bağlam uyarısını göster",
+	contextChipHint: "Yalnızca bir sohbetin bağlamı eşikte ya da üstündeyken — odaktaki sohbetin kullanımını çekirdek çubuk zaten gösteriyor.",
+	contextWarnLabel: "Bağlam uyarı eşiği",
+	contextWarnHint: (d) => `Çip, Canlı görünüm ve bildirimler; %${d} ve üstü kırmızı.`,
+	notify_context: "Bağlam penceresi doluyor (eşik / %90)",
+	notifyContextTitle: (pct) => `Bağlam %${pct} dolu`,
+	notifyContextBody: "sıkıştır (/compress) ya da yeni sohbet aç",
+	navContext: (pct) => `bağlam %${pct}`,
 };
 
 // ---- registration ---------------------------------------------------------
@@ -5350,17 +5900,29 @@ function navLowestQuota() {
 }
 
 /** Label + icon for the nav row; pure, so tests can pin the format. */
-function navBadge(counts, lowestLeft, t) {
+function navBadge(counts, lowestLeft, t, focusCtxPct = null) {
 	const parts = [];
 	if (counts.approval) parts.push(t("navApproval", counts.approval));
 	if (counts.working) parts.push(t("navWorking", counts.working));
 	else if (counts.yourTurn) parts.push(t("navYourTurn", counts.yourTurn));
 	if (counts.stalled && parts.length < 2) parts.push(t("navStalled", counts.stalled));
 	if (lowestLeft != null && lowestLeft <= NAV_LOW_QUOTA_PCT) parts.push(`⚠ ${lowestLeft}%`);
+	// A nearly full focused chat outranks everything but an approval; the label
+	// then stays at three parts in total ("Quota · 2 active · ctx 92%").
+	const ctxPct = finiteNumber(focusCtxPct);
+	if (ctxPct != null && Math.round(ctxPct) >= CONTEXT_DANGER) {
+		parts.splice(counts.approval ? 1 : 0, 0, t("navContext", Math.round(ctxPct)));
+		parts.splice(2);
+	}
 	return {
 		label: ["Quota", ...parts.slice(0, 3)].join(" · "),
 		codicon: counts.approval ? "bell-dot" : counts.working ? "sync codicon-modifier-spin" : "pulse",
 	};
+}
+
+function navFocusContextPct() {
+	const f = focusedContext(readHostState("focusedUsage", null));
+	return f ? f.pct : null;
 }
 
 function startNavBadge(ctx) {
@@ -5368,7 +5930,7 @@ function startNavBadge(ctx) {
 	const update = () => {
 		const t = (key, ...args) => ctx.i18n.t(key, ...args);
 		const next = navBadgeAtom.get()
-			? navBadge(navCounts(), navLowestQuota(), t)
+			? navBadge(navCounts(), navLowestQuota(), t, navFocusContextPct())
 			: { label: "Quota", codicon: "pulse" };
 		const sig = `${next.label}|${next.codicon}`;
 		if (sig === last) return;
@@ -5394,6 +5956,14 @@ function startNavBadge(ctx) {
 		offs.push(host.state.busyBySession.listen(schedule));
 	} catch {
 		/* older host */
+	}
+	for (const name of ["focusedUsage", "focusedStoredSessionId"]) {
+		try {
+			const a = host.state[name];
+			if (a && typeof a.listen === "function") offs.push(a.listen(schedule));
+		} catch {
+			/* older host */
+		}
 	}
 	try {
 		offs.push(navBadgeAtom.listen(schedule));
@@ -5451,6 +6021,16 @@ export default {
 			area: STATUSBAR_AREAS.right,
 			order: 124,
 			render: () => jsx(MonitorStatus, {}),
+		});
+
+		// Context guard chip, left of the agents chip. Hidden unless some
+		// chat's context is at/over the warn threshold (the core bar already
+		// shows the focused chat's usage, so a calm chip would duplicate it).
+		ctx.register({
+			id: "context",
+			area: STATUSBAR_AREAS.right,
+			order: 123,
+			render: () => jsx(ContextChip, {}),
 		});
 
 		// Spend-today chip, right of the quota chips. Off unless a budget is

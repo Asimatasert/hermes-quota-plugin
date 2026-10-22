@@ -154,6 +154,128 @@ class LiveTest(unittest.TestCase):
         self.assertEqual(self.home.clis.claude_open_sessions(), None)
 
 
+class ContextWindowTest(unittest.TestCase):
+    """context_tokens from the usage anchor, context_max / context_percent from (patched) Hermes metadata."""
+
+    def setUp(self) -> None:
+        self.home = Home(profiles=("work",))
+        self.now = time.time()
+        self.ctx = live.context
+        self.ctx.clear_cache()
+        from unittest import mock
+        self.windows = {"model-a": 100_000, "model-b": 1_000_000}
+        self.calls = []
+
+        def window(model, provider, base_url):
+            self.calls.append((model, provider, base_url))
+            return self.windows.get(model)
+
+        self.patch = mock.patch.object(self.ctx, "_hermes_window", side_effect=window)
+        self.patch.start()
+
+    def tearDown(self) -> None:
+        self.patch.stop()
+        self.ctx.clear_cache()
+        self.home.close()
+
+    def _open(self, sid, model="model-a", anchor=None, profile="default", messages=3, tail=400):
+        h, now = self.home, self.now
+        h.session(sid, "desktop", profile, started=now - 900, last=now - 30, model=model)
+        for i in range(messages - 1):
+            h.message(sid, "user" if i % 2 == 0 else "assistant", now - 300 + i, "y" * 40, profile=profile)
+        h.message(sid, "assistant", now - 30, "z" * tail, profile=profile)
+        h.lease(sid, ME, profile)
+        if anchor is not None:
+            with h.state(profile) as c:
+                c.execute("UPDATE sessions SET model_config = ? WHERE id = ?",
+                          (json.dumps({"service_tier": "normal", "_usage_anchor": anchor}), sid))
+
+    def _row(self, sid):
+        data = live.live(common.profile_homes(), self.now, record_sample=False)
+        return next(r for r in data["running"] if r["id"] == sid)
+
+    def test_anchor_plus_tail_estimate_and_percent(self):
+        self._open("s-anch", anchor={"prompt_tokens": 90_000, "completion_tokens": 1000, "base_count": 2})
+        row = self._row("s-anch")
+        self.assertEqual(row["context_tokens"], 90_000 + 1000 + 100, "anchor + chars/4 of the message after it")
+        self.assertFalse(row["context_estimated"])
+        self.assertEqual(row["context_max"], 100_000)
+        self.assertEqual(row["context_percent"], 91.1)
+
+    def test_no_anchor_falls_back_to_estimate(self):
+        self._open("s-est", model="model-b", tail=4000)
+        row = self._row("s-est")
+        self.assertEqual(row["context_tokens"], (40 * 2 + 4000) // 4)
+        self.assertTrue(row["context_estimated"])
+        self.assertEqual(row["context_max"], 1_000_000)
+        self.assertEqual(row["context_percent"], 0.1)
+
+    def test_stale_anchor_is_ignored(self):
+        # base_count beyond the active transcript (e.g. after a compression rewrote it): not usable.
+        self._open("s-stale", anchor={"prompt_tokens": 500_000, "completion_tokens": 0, "base_count": 99})
+        row = self._row("s-stale")
+        self.assertTrue(row["context_estimated"])
+        self.assertLess(row["context_tokens"], 1000)
+
+    def test_unknown_model_is_null_not_a_guess(self):
+        self._open("s-unk", model="mystery-model")
+        row = self._row("s-unk")
+        self.assertIsNotNone(row["context_tokens"])
+        self.assertIsNone(row["context_max"])
+        self.assertIsNone(row["context_percent"])
+
+    def test_resolver_failure_is_fail_open(self):
+        self.patch.stop()
+        from unittest import mock
+        self.ctx.clear_cache()
+        with mock.patch.object(self.ctx, "_hermes_window", side_effect=RuntimeError("boom")):
+            self._open("s-boom")
+            row = self._row("s-boom")
+        self.patch.start()
+        self.assertIsNone(row["context_max"])
+        self.assertIsNone(row["context_percent"])
+        self.assertIsNotNone(row["context_tokens"])
+
+    def test_profile_pin_wins_for_its_model_only(self):
+        if not self._yaml():
+            self.skipTest("no YAML parser in this interpreter")
+        self.home.write("config.yaml", "model:\n  default: model-a\n  context_length: 50000\n", profile="work")
+        self._open("s-pin", profile="work", anchor={"prompt_tokens": 40_000, "completion_tokens": 0,
+                                                    "base_count": 3})
+        self._open("s-other", model="model-b", profile="work")
+        self.assertEqual(self._row("s-pin")["context_max"], 50_000)
+        self.assertEqual(self._row("s-pin")["context_percent"], 80.0)
+        self.assertEqual(self._row("s-other")["context_max"], 1_000_000, "pin is for the configured model")
+
+    def test_window_lookups_are_cached(self):
+        self._open("s-a1")
+        self._open("s-a2")
+        live.live(common.profile_homes(), self.now, record_sample=False)
+        live.live(common.profile_homes(), self.now, record_sample=False)
+        self.assertEqual(self.calls.count(("model-a", "anthropic", "")), 1)
+
+    def test_rows_without_context_carry_null_keys(self):
+        h, now = self.home, self.now
+        h.session("s-parent", "desktop", started=now - 900, last=now - 30)
+        h.message("s-parent", "assistant", now - 30, "done")
+        h.lease("s-parent", ME)
+        h.session("s-sub", "desktop", started=now - 600, last=now - 20, parent="s-parent")
+        data = live.live(common.profile_homes(), now, record_sample=False)
+        sub = next(r for r in data["running"] if r["id"] == "s-sub")
+        self.assertIsNone(sub["context_max"])
+        self.assertIsNone(sub["context_percent"])
+
+    @staticmethod
+    def _yaml() -> bool:
+        for mod in ("ruamel.yaml", "yaml"):
+            try:
+                __import__(mod)
+                return True
+            except ImportError:
+                continue
+        return False
+
+
 class KanbanGlanceTest(unittest.TestCase):
     def setUp(self) -> None:
         self.home = Home()

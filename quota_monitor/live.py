@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
-from . import clis, store
+from . import clis, context, store
 from .common import (cost_expr, kanban_dbs, num, pid_alive, profile_homes, read_json, ro, row_cost,
                      session_costs, table_cols, usage_cost_expr)
 
@@ -253,8 +253,8 @@ def card_only_row(card: Dict[str, Any], now: float) -> Dict[str, Any]:
             "subagent": False, "status": "running", "end_reason": None, "working": alive, "activity": None,
             "tokens": 0, "cost": 0.0, "tools": 0, "messages": 0, "parent_model": None, "origin": "kanban",
             "interactive": False, "state": "working" if alive else "stalled", "state_since": None if alive else last,
-            "waiting_for": None, "context_tokens": None, "context_estimated": True, "loop_max": 0,
-            "long_tool_call": None, "kind": "hermes", "source_name": "Hermes",
+            "waiting_for": None, "context_tokens": None, "context_estimated": True, "context_max": None,
+            "context_percent": None, "loop_max": 0, "long_tool_call": None, "kind": "hermes", "source_name": "Hermes",
             "kanban": {"id": card["id"], "board": card["board"], "status": card["status"], "title": card["title"],
                        "block_kind": card["block_kind"]},
             "kanban_card": card["title"], "kanban_status": card["status"]}
@@ -313,8 +313,10 @@ def token_rate(samples: List[Tuple[float, Dict[str, List[float]]]], now: Optiona
 
 # ---------- one Hermes session's state ----------
 
-def hermes_state(c: sqlite3.Connection, sid: str, act: Optional[str], now: float) -> Dict[str, Any]:
-    """state / since / context estimate / loop for one open Hermes session (same rules as Agent Monitor)."""
+def hermes_state(c: sqlite3.Connection, sid: str, act: Optional[str], now: float,
+                 model_config: Any = None) -> Dict[str, Any]:
+    """state / since / context size / loop for one open Hermes session (same rules as Agent Monitor; the
+    context size prefers Hermes' persisted usage anchor, see ``context.used_tokens``)."""
     last = c.execute("""SELECT role, tool_calls IS NULL final, timestamp, tool_calls FROM messages
                         WHERE session_id = ? AND active = 1 ORDER BY id DESC LIMIT 1""", (sid,)).fetchone()
     pending_tool = None
@@ -342,9 +344,7 @@ def hermes_state(c: sqlite3.Connection, sid: str, act: Optional[str], now: float
         state, since = "stalled", last_ts
     else:
         state, since = "working", None
-    size = c.execute("""SELECT SUM(LENGTH(COALESCE(api_content, content, '')) + COALESCE(LENGTH(tool_calls), 0)
-                                + COALESCE(LENGTH(reasoning_content), 0))
-                        FROM messages WHERE session_id = ? AND active = 1""", (sid,)).fetchone()[0] or 0
+    ctx_tokens, ctx_estimated = context.used_tokens(c, sid, model_config)
     try:
         loop = c.execute("""WITH calls AS (
                               SELECT a.id msg, CAST(tc.key AS INT) idx, json_extract(tc.value, '$.function.name') name,
@@ -358,8 +358,8 @@ def hermes_state(c: sqlite3.Connection, sid: str, act: Optional[str], now: float
                          (sid, now - 1800)).fetchone()[0] or 0
     except sqlite3.Error:  # no JSON1 / window functions in this sqlite build
         loop = 0
-    return {"state": state, "state_since": since, "context_tokens": int(size / 4) if size else None,
-            "context_estimated": True, "loop_max": loop,
+    return {"state": state, "state_since": since, "context_tokens": ctx_tokens,
+            "context_estimated": ctx_estimated, "loop_max": loop,
             "waiting_for": "approval" if state == "needs_approval" else None,
             "long_tool_call": pending_tool if state in ("working", "stalled") and quiet > 60 else None}
 
@@ -493,6 +493,9 @@ def live(homes: Optional[List[Tuple[str, Path]]] = None, now: Optional[float] = 
                 held = list(opened)
                 hold = ",".join("?" * len(held))
                 in_open = "id IN (%s)" % hold if held else "0"
+                scols = table_cols(c, "sessions")
+                mcfg = "model_config" if "model_config" in scols else "NULL AS model_config"
+                burl = "billing_base_url" if "billing_base_url" in scols else "'' AS billing_base_url"
                 sub_open = "parent_session_id IN (%s)" % hold if held else "0"
                 for s in c.execute(
                         """SELECT id, parent_session_id parent, title, model, started_at, ended_at, end_reason,
@@ -500,14 +503,14 @@ def live(homes: Optional[List[Tuple[str, Path]]] = None, now: Optional[float] = 
                                   coalesce(last_activity_at, started_at) t, last_activity_description act,
                                   coalesce(input_tokens,0)+coalesce(output_tokens,0) tok, %s cost,
                                   coalesce(tool_call_count,0) tools, coalesce(message_count,0) msgs,
-                                  coalesce(billing_provider,'') prov, source,
+                                  coalesce(billing_provider,'') prov, source, %s, %s,
                                   (SELECT p.source FROM sessions p WHERE p.id = sessions.parent_session_id) psource,
                                   (SELECT p.model FROM sessions p WHERE p.id = sessions.parent_session_id) pmodel
                            FROM sessions
                            WHERE (ended_at IS NULL AND (coalesce(last_activity_at, started_at) > ? OR %s))
                               OR (ended_at IS NULL AND %s AND coalesce(last_activity_at, started_at) > ?)
                               OR (parent_session_id IS NOT NULL AND coalesce(ended_at, last_activity_at) > ?)"""
-                        % (cost_expr(), in_open, sub_open),
+                        % (cost_expr(), mcfg, burl, in_open, sub_open),
                         (now - ACTIVE_WINDOW, *held, *held, now - SUBAGENT_OPEN_WINDOW, now - 900)):
                     t = num(s["t"]) or 0
                     if s["parent"] is None:
@@ -519,10 +522,14 @@ def live(homes: Optional[List[Tuple[str, Path]]] = None, now: Optional[float] = 
                             t > now - ACTIVE_WINDOW or (s["parent"] in opened and t > now - SUBAGENT_OPEN_WINDOW))
                         if s["psource"] in LEASED_SOURCES and s["parent"] not in opened:
                             is_running = False
-                    extra = (hermes_state(c, s["id"], s["act"], now) if is_running and s["parent"] is None else
+                    extra = (hermes_state(c, s["id"], s["act"], now, s["model_config"])
+                             if is_running and s["parent"] is None else
                              {"state": "working" if is_running else "ended", "state_since": None,
                               "context_tokens": None, "context_estimated": True, "loop_max": 0,
                               "waiting_for": None, "long_tool_call": None})
+                    extra["context_max"] = (context.context_max(home, s["model"], s["prov"], s["billing_base_url"])
+                                            if extra["context_tokens"] else None)
+                    extra["context_percent"] = context.context_percent(extra["context_tokens"], extra["context_max"])
                     extra["origin"] = s["source"]
                     extra["interactive"] = s["source"] in INTERACTIVE_SOURCES
                     row = dict(extra)
@@ -593,7 +600,8 @@ def live(homes: Optional[List[Tuple[str, Path]]] = None, now: Optional[float] = 
                         "state": s.get("state") if s["running"] else "ended", "state_since": s.get("state_since"),
                         "waiting_for": "approval" if s.get("state") == "needs_approval" else None,
                         "waiting_detail": s.get("waiting_for"), "context_tokens": s.get("context_tokens"),
-                        "context_estimated": s.get("context_estimated", False), "loop_max": s.get("loop_max", 0),
+                        "context_estimated": s.get("context_estimated", False), "context_max": None,
+                        "context_percent": None, "loop_max": s.get("loop_max", 0),
                         "tokens": s["total_tokens"], "cost": s["total_cost"], "tools": s["calls"], "messages": 0,
                         "parent_model": None, "kanban_card": None, "kanban_status": None})
 

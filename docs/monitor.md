@@ -87,7 +87,7 @@ exact (from transcript timestamps) and need no sampling.
 `running[]` rows: `id, parent, parent_title, profile, title, model, provider,
 started, last, subagent, status (running|ended), end_reason, working, state
 (working|needs_approval|waiting|stalled|ended), state_since, waiting_for,
-long_tool_call, context_tokens, context_estimated, loop_max, origin,
+long_tool_call, context_tokens, context_estimated, context_max, context_percent, loop_max, origin,
 interactive, activity, tokens, cost, tools, messages, parent_model, kanban,
 kanban_card, kanban_status, kind (hermes|claude-code|copilot-cli),
 source_name, open, account_provider, account`. `open` is `{kind, url,
@@ -95,6 +95,23 @@ command, label, running, pid, tty, app, app_pid, background, attach}`
 (`url` = `hermes://open/<id>` only when Hermes.app is installed on macOS;
 process facts come from `ps` and are empty where it is unavailable).
 `account_provider` / `account` are always `null` here.
+
+Context of an open main Hermes session (`null` everywhere else):
+
+- `context_tokens`: the provider-reported prompt size of the session's last API
+  call (Hermes persists it as `sessions.model_config._usage_anchor`) plus
+  chars / 4 for the messages appended since — the same rule as Hermes' own
+  anchored estimate. Without a usable anchor (older Hermes, a fresh or just
+  compressed session) it is chars / 4 of the whole active transcript and
+  `context_estimated` is `true`.
+- `context_max`: the profile's `model.context_length` when it pins the
+  session's model, else Hermes' own model metadata from local sources only
+  (Codex OAuth static table for `openai-codex`, then
+  `agent.context_pin.advertised_context_length`: the persisted context cache,
+  the models.dev disk cache and the built-in catalog). Never a network probe or
+  a cache write; cached per process; `null` when unknown or when Hermes'
+  package cannot be imported.
+- `context_percent`: `context_tokens / context_max`, 0-100, one decimal.
 
 ### `attention[]`
 
@@ -106,7 +123,7 @@ Agent Bar's attention rules over running main sessions, most urgent first:
 | `your_turn` | finished and waiting — only interactive sources (desktop, cli, tui, telegram, slack, discord, agent CLIs); kanban / cron workers never |
 | `stalled` | a turn claims to run but wrote nothing for 10 min (30 min with a tool call in flight) |
 | `loop` | 3+ identical consecutive tool calls in the last 30 min |
-| `big_context` | context ≥ 200 000 tokens (estimated as chars / 4 for Hermes) |
+| `big_context` | context ≥ 200 000 tokens (see `context_tokens` above) |
 
 Item: `{id, kind, session_id, profile, title, since, detail, source, value}`.
 `id` is stable (`<kind>:<source>:<profile>:<session id>`) for notification

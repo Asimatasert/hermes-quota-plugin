@@ -3,7 +3,9 @@
 // hook boundaries stubbed), plus what the monitor needs: queries dispatched by
 // key (quota status vs `quota monitor snapshot` vs history), a focused profile
 // route, ctx.storage backed by a map, captured OS notifications / clipboard /
-// openSession calls, and a locale switch (en | tr).
+// openSession calls, a locale switch (en | tr), and the focused chat
+// (`focus: {usage, sessionId, storedId, busy}` -> host.state atoms, plus a
+// recorded host.composer.submit answering `submitResult`, default true).
 //
 // stdin: JSON options; stdout: JSON {tree?, value?, notified, clipboard,
 // opened, toasts, cli, storage, queries}.
@@ -41,7 +43,9 @@ async function run(options = {}) {
     return typeof v === 'function' ? v(...args) : v != null ? v : key;
   };
   const storage = new Map(Object.entries(options.storage || {}));
-  const record = {notified: [], clipboard: [], opened: [], toasts: [], cli: [], queries: []};
+  const record = {notified: [], clipboard: [], opened: [], toasts: [], cli: [], queries: [], submitted: []};
+  const focus = options.focus || {};
+  const ro = value => ({get: () => value, listen: () => () => {}, subscribe: () => () => {}});
   const scope = options.noScope ? null : {connectionId: 'local', profile: 'work'};
   const routes = [{connectionId: 'local', profile: 'work', targetProfile: 'work', mode: 'local'},
                   {connectionId: 'local', profile: 'home', targetProfile: 'home', mode: 'local'}];
@@ -57,7 +61,16 @@ async function run(options = {}) {
     return {data: options.data, isError: !!options.isError, isPlaceholderData: false, isLoading: false};
   };
   const host = {
-    state: {focusedSessionOwner: {get: () => scope, set: () => {}, subscribe: () => () => {}}},
+    state: {
+      focusedSessionOwner: {get: () => scope, set: () => {}, subscribe: () => () => {}},
+      focusedUsage: ro(focus.usage ?? null),
+      focusedSessionId: ro(focus.sessionId ?? null),
+      focusedStoredSessionId: ro(focus.storedId ?? null),
+      busy: ro(Boolean(focus.busy)),
+    },
+    composer: {
+      submit: (sessionId, text) => { record.submitted.push({sessionId, text}); return options.submitResult ?? true; },
+    },
     profileRoutes: async () => routes,
     requestProfile: async (route, method, params) => {
       record.cli.push({route: route.profile, method, argv: params.argv});
@@ -107,6 +120,8 @@ async function run(options = {}) {
     cost: 'CostChip()',
     status: 'StatusBar()',
     live: 'LiveView({mon: useMonitor()})',
+    context: 'ContextChip()',
+    contextCard: `ContextCard({snapshot: useMonitor().snapshot, scope: useMonitor().scope, close() {}, stage: ${JSON.stringify(options.stage || 'idle')}, topic: ${JSON.stringify(options.topic || '')}})`,
   };
   const out = {registered};
   if (options.expr) {

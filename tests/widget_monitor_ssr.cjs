@@ -4,7 +4,7 @@
 // this runs the actual hooks and the jsx runtime, so hook-order mistakes,
 // invalid element types and render-time throws surface here.
 //
-// stdin: {data, monitor, history, storage, locale, views: [..]}
+// stdin: {data, monitor, history, storage, locale, views: [..], focus: {usage, sessionId, storedId, busy}}
 // stdout: {html: {view: markup}, errors: [console.error lines]}
 const babel = require('@babel/core');
 const React = require('react');
@@ -53,12 +53,19 @@ const translate = (key, ...args) => {
 };
 const el = tag => props => React.createElement(tag, {className: props && props.className}, props && props.children);
 const atoms = [];
+const focus = options.focus || {};
+const ro = value => ({get: () => value, listen: () => () => {}, subscribe: () => () => {}});
 const sdk = {
   atom: v => { const a = {get: () => v, set: n => { v = n; }, subscribe: () => () => {}}; atoms.push(a); return a; },
   cn: (...a) => a.filter(Boolean).join(' '),
   fmtDayTime: new Intl.DateTimeFormat('en-US'),
   host: {
-    state: {focusedSessionOwner: {get: () => ({connectionId: 'local', profile: 'work'}), set: () => {}, subscribe: () => () => {}}},
+    state: {
+      focusedSessionOwner: {get: () => ({connectionId: 'local', profile: 'work'}), set: () => {}, subscribe: () => () => {}},
+      focusedUsage: ro(focus.usage ?? null), focusedSessionId: ro(focus.sessionId ?? null),
+      focusedStoredSessionId: ro(focus.storedId ?? null), busy: ro(Boolean(focus.busy)),
+    },
+    composer: {submit: () => true},
     navigate: () => {}, openExternal: () => {}, notify: () => {}, openSession: async () => {},
     profileRoutes: async () => [], requestProfile: async () => ({code: 0, output: '{}'}),
   },
@@ -114,11 +121,20 @@ for (const view of options.views || ['quota', 'live', 'health', 'usage', 'kanban
     errors.push('render ' + view + ': ' + (e && e.stack || e));
   }
 }
-for (const id of ['agents', 'cost']) {
+for (const id of ['agents', 'cost', 'context']) {
   try {
     html[id] = ReactDOMServer.renderToStaticMarkup(items.find(i => i.id === id).render());
   } catch (e) {
     errors.push('render ' + id + ': ' + (e && e.stack || e));
+  }
+}
+for (const stage of ['idle', 'confirm']) {
+  try {
+    const snap = options.monitor && options.monitor.monitor_version ? options.monitor : null;
+    html['contextCard_' + stage] = ReactDOMServer.renderToStaticMarkup(React.createElement(vm.runInContext('ContextCard', context),
+      {snapshot: snap, scope: {connectionId: 'local', profile: 'work'}, close() {}, stage}));
+  } catch (e) {
+    errors.push('render contextCard ' + stage + ': ' + (e && e.stack || e));
   }
 }
 try {
