@@ -10,6 +10,7 @@ See provider quotas, reset times and account balances in Hermes Desktop and the 
 - Model-specific quota windows and reset times when the vendor supplies them.
 - Separate, configurable Claude account cards; no summed or invented allowances.
 - Honest unavailable states and opt-in access to sensitive credential sources.
+- Optional Ink TUI quota chip with an interactive account picker and theme colors.
 
 ## Install
 
@@ -26,6 +27,21 @@ hermes plugins doctor quota --ci
 hermes quota refresh
 hermes quota status
 ```
+
+## Optional terminal panel
+
+After installing the backend, copy the optional widget into one profile:
+
+```bash
+mkdir -p "${HERMES_HOME:-$HOME/.hermes}/tui-widgets"
+cp tui/quota-panel.mjs "${HERMES_HOME:-$HOME/.hermes}/tui-widgets/quota-panel.mjs"
+hermes --tui
+```
+
+Run `/quota-select` to choose a provider/account; `/quota-panel` hides or reopens
+the right-aligned, theme-colored quota chip. Requires Hermes' Ink user-widget SDK;
+the classic CLI continues to use `/quota`. The main installer does not enable this
+widget automatically. [TUI setup, commands and limitations](docs/tui-panel.md).
 
 ## Multiple Claude accounts
 

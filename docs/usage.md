@@ -1,5 +1,13 @@
 # Usage
 
+## Terminal UI
+
+The optional Ink TUI widget provides a one-line, right-aligned quota chip above
+the composer. `/quota-select` opens a provider/account picker; `/quota-panel`
+toggles the display. See [TUI setup and commands](tui-panel.md).
+
+## Hermes Desktop
+
 ### Status-bar chip
 
 - Compact chip with your **lowest remaining quota**, or every provider side by
