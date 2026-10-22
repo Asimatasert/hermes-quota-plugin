@@ -178,7 +178,9 @@ def _usage_url(base_url, pooled):
         from hermes_cli.auth_codex import _codex_pool_route_base_url
     except ImportError:
         _codex_pool_route_base_url = None
-    if pooled and _codex_pool_route_base_url is not None:
+    # A saved host owns this account's usage; ambient inference proxies may not
+    # implement usage endpoints. Preserve saved gateway hosts for their keys too.
+    if not base_url and pooled and _codex_pool_route_base_url is not None:
         base_url = _codex_pool_route_base_url(base_url)
     elif not base_url:
         # Older cores exposed the base helper through auth.py. Explicit pool
