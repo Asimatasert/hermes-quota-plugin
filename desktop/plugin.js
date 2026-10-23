@@ -1670,7 +1670,6 @@ function StatusBar() {
 						key: group.entries[0][0],
 					}),
 		),
-		),
 	});
 }
 
