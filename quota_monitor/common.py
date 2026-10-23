@@ -127,11 +127,12 @@ def read_config(home: Path) -> Dict[str, Any]:
         return {}
     try:
         from ruamel.yaml import YAML
-        return YAML(typ="safe").load(text) or {}
-    except ImportError:
-        pass
+        data = YAML(typ="safe").load(text)
+        return data if isinstance(data, dict) else {}
     except Exception:
-        return {}
+        # ImportError, or a ruamel that cannot load (e.g. its modules were re-imported next to stale copies and
+        # the safe constructor lost its tags): try the next parser instead of reporting an empty config.
+        pass
     try:
         import yaml  # type: ignore
         data = yaml.safe_load(text)

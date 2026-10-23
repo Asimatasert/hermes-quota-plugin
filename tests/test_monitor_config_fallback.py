@@ -91,6 +91,21 @@ class MiniYamlFallbackTest(unittest.TestCase):
         cfg = self.read('toolsets: [terminal, "web"]\nmodel: {"default": "claude-test-model"}\n')
         self.assertEqual(cfg, {"toolsets": ["terminal", "web"], "model": {"default": "claude-test-model"}})
 
+    def test_broken_ruamel_falls_through_to_the_next_parser(self):
+        # A ruamel whose safe loader raises (not an ImportError) must not mask the config as empty.
+        def broken_ruamel(name, *args, **kwargs):
+            if name.startswith("ruamel"):
+                raise RuntimeError("could not determine a constructor for the tag 'None'")
+            if name == "yaml":
+                raise ImportError(name)
+            return _real_import(name, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "config.yaml").write_text(BLOCK, encoding="utf-8")
+            with mock.patch.object(builtins, "__import__", broken_ruamel):
+                cfg = common.read_config(Path(d))
+        self.assertEqual(cfg["model"], {"default": "claude-test-model", "provider": "anthropic"})
+
 
 if __name__ == "__main__":
     unittest.main()
