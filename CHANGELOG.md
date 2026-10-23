@@ -3,6 +3,25 @@
 Newest first. Each entry matches an annotated `vX.Y.Z` tag; the tag message is
 the release note.
 
+## 3.0.0 — 2026-10-23
+
+- Agent Monitor inside Desktop: live Hermes sessions, attention and context
+  indicators, model health, recorded usage estimates, quota history and
+  burn-rate forecasts, without a separate dashboard server (#83).
+- Localized monitor UI, status-bar chips, context guard and configurable
+  notifications. Existing quota functionality remains available without
+  enrolling in monitor collection.
+- Collection is opt-in per active profile. Preserve the hardened trial scope:
+  no sibling-profile/external CLI/shared Kanban collection, new credential-pool
+  metadata reads, account/budget mutations or monitor agent tools.
+- Usage is labeled as estimated API-price equivalents, not billed charges;
+  month-end spend projection is unavailable. Private monitor database and
+  symlink/sidecar protections retained.
+- Preserve native Hermes plugin updates and the per-card Codex reset notice.
+- README and monitor documentation now describe the shipped scope and limits.
+- A huge thank-you to @Asimatasert for the Agent Monitor contribution,
+  localization, tests and follow-up fixes that made this milestone possible.
+
 ## 2.12.0 — 2026-10-23
 
 - Desktop: one card per saved credential for multi-account providers, grouped
