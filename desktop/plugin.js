@@ -51,7 +51,7 @@ const ID = "quota";
 // gateway, so the two halves can really be different builds. `tests/test_widget_version.py`
 // fails when they drift; a mismatch found at runtime is surfaced in the pane
 // instead of looking like a broken feature.
-const WIDGET_VERSION = "2.11.3";
+const WIDGET_VERSION = "2.11.4";
 
 // Module-level ctx handle (set in register). The data hook below needs it.
 let CTX = null;
@@ -976,7 +976,23 @@ const _refreshInFlight = new Set();
 function normalizeQuotaScope(owner) {
 	const connectionId = String(owner?.connectionId || "").trim();
 	const profile = String(owner?.profile || "").trim();
-	return connectionId && profile ? { connectionId, profile } : null;
+	if (connectionId && profile) return { connectionId, profile };
+	// A legacy single connection has no registry connectionId. Fall back to the
+	// live gateway only when the host still reports an owner; a null owner means
+	// the app cannot tell which connection is focused, so guessing would mix
+	// profiles across connections.
+	if (owner && !connectionId) {
+		let liveProfile = profile;
+		try {
+			liveProfile = liveProfile || String(host.state.profile?.get?.() || "").trim();
+		} catch {
+			// Fall through to the default profile below.
+		}
+		// The legacy CLI's implicit profile is `default`; prefer the app's
+		// active profile when the owner does not carry one.
+		return { connectionId: "", profile: liveProfile || "default", live: true };
+	}
+	return null;
 }
 
 function quotaQueryKey(scope) {
@@ -1158,6 +1174,18 @@ async function quotaCli(scope, argv, timeoutMs = CLI_TIMEOUT_MS, options) {
 		const result = await Promise.race([
 			(async () => {
 				if (!scope) throw new Error("focused quota profile unavailable");
+				if (scope.live) {
+					const remainingMs = deadline - Date.now();
+					if (expired || remainingMs <= 0) {
+						throw new Error("quota cli timeout");
+					}
+					// Legacy single connection: there is no registry route to
+					// address, so use the live gateway socket. The outer race
+					// still bounds the call; host.request has no per-call timeout.
+					return host.request("cli.exec", {
+						argv: ["--profile", scope.profile, ...argv],
+					});
+				}
 				const routes = await host.profileRoutes();
 				const matches = routes.filter(
 					(route) =>
