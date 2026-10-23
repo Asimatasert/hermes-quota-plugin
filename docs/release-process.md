@@ -47,7 +47,8 @@ or the live cache.
 - Semver: patch = bug fix, minor = new provider or feature, major = breaking
   config or cache contract.
 - Bump `plugin.yaml` in a `chore(release): X.Y.Z` commit, never inside the
-  behavior commit.
+  behavior commit. Bump `desktop/plugin.js` `WIDGET_VERSION` in the same commit:
+  `tests/test_widget_version.py` fails on a skew, and 2.11.1 shipped one.
 
 ## 6. Release notes and tag
 
