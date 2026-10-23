@@ -3,6 +3,14 @@
 Newest first. Each entry matches an annotated `vX.Y.Z` tag; the tag message is
 the release note.
 
+## 2.11.4 — 2026-10-23
+
+- Desktop: a legacy single connection reports an owner without a registry
+  `connectionId`; the widget now routes through the live gateway instead of
+  failing with "focused quota profile unavailable". A `null` owner still keeps
+  the query disabled, so an ambiguous multi-connection never guesses a profile
+  (#79).
+
 ## 2.11.3 — 2026-10-23
 
 - Cache: a carried record (incomplete sweep) now drops its windows and balances,
