@@ -63,6 +63,7 @@ Extra Claude accounts are opt-in and read-only: no refresh-token exchange, crede
 - [Codex special-reset announcements and source limitations](docs/codex-special-reset.md)
 - [Troubleshooting—including remote names/icons](docs/troubleshooting.md)
 - [Development and tests](docs/development.md) · [Add a provider](docs/add-provider.md)
+- [Release process](docs/release-process.md)
 - [Acknowledgements](docs/contributors.md)
 
 MIT · [License](LICENSE)
