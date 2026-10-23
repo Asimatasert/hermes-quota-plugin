@@ -3,6 +3,14 @@
 Newest first. Each entry matches an annotated `vX.Y.Z` tag; the tag message is
 the release note.
 
+## 2.11.5 — 2026-10-23
+
+- Codex: a pooled account's saved upstream base URL is preserved for usage
+  requests, so a local inference proxy no longer turns a valid account into
+  `http-404` (#81).
+- Grok: reuse the Hermes `xai-oauth` bearer before the browser-cookie chain;
+  Windows Chrome v20 App-Bound cookie decryption is supported (#82).
+
 ## 2.11.4 — 2026-10-23
 
 - Desktop: a legacy single connection reports an owner without a registry
