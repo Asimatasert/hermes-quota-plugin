@@ -876,105 +876,6 @@ function formatAgeSeconds(seconds) {
 	return `${Math.floor(seconds / 3600)}h`;
 }
 
-// ---- update self-check (like Hermes's own) ---------------------------------
-
-const REPO_API_LATEST =
-	"https://api.github.com/repos/rarf/hermes-quota-plugin/commits/master";
-const REPO_MANIFEST_LATEST =
-	"https://raw.githubusercontent.com/rarf/hermes-quota-plugin/master/plugin.yaml";
-const CATALOG_ENTRY_LATEST =
-	"https://raw.githubusercontent.com/NousResearch/hermes-agent/main/plugin-catalog/quota.yaml";
-
-function versionFromYaml(text) {
-	const match = String(text || "").match(/^version:\s*["']?([0-9]+(?:\.[0-9]+){2})/m);
-	return match ? match[1] : null;
-}
-
-function isCompleteUpdateResult(result) {
-	return Boolean(result && result.catalogVersion && result.catalogSha && result.githubVersion && result.githubSha);
-}
-
-function versionRelation(remote, installed) {
-	if (!remote || !installed) return "version unavailable";
-	const a = String(remote).split(".").map(part => Number.parseInt(part, 10));
-	const b = String(installed).split(".").map(part => Number.parseInt(part, 10));
-	if ([...a, ...b].some(value => !Number.isFinite(value))) return "differs from installed";
-	for (let i = 0; i < Math.max(a.length, b.length); i++) {
-		const left = a[i] || 0;
-		const right = b[i] || 0;
-		if (left !== right) return left > right ? "newer than installed" : "older than installed";
-	}
-	return "matches installed";
-}
-
-// Keep the Hermes catalog pin and upstream GitHub default branch as separate
-// signals; the community catalog can intentionally lag upstream releases.
-function useUpdateCheck(installedSha, installedVersion) {
-	const [update, setUpdate] = useState(null);
-	useEffect(() => {
-		let alive = true;
-		const CHECK_KEY = "updateCheck";
-		const ONE_HOUR = 60 * 60 * 1000;
-		const run = async () => {
-			if (!installedSha || installedSha === "unknown") return;
-			try {
-				const previous = CTX.storage.get(CHECK_KEY);
-				if (previous) {
-					const cached = JSON.parse(previous);
-					if (cached.at && Date.now() - cached.at < ONE_HOUR && cached.seen === installedSha && cached.seenVersion === (installedVersion || "") && isCompleteUpdateResult(cached)) {
-						if (alive) setUpdate(cached);
-						return;
-					}
-				}
-			} catch { /* ignore bad or unavailable cache */ }
-			const responses = await Promise.allSettled([
-				fetch(REPO_API_LATEST, { headers: { Accept: "application/vnd.github+json" } }).then(res => res.ok ? res.json() : Promise.reject(new Error(`GitHub commit ${res.status}`))),
-				fetch(REPO_MANIFEST_LATEST).then(res => res.ok ? res.text() : Promise.reject(new Error(`GitHub manifest ${res.status}`))),
-				fetch(CATALOG_ENTRY_LATEST).then(res => res.ok ? res.text() : Promise.reject(new Error(`catalog ${res.status}`))),
-			]);
-			const githubSha = responses[0].status === "fulfilled" ? responses[0].value?.sha || null : null;
-			const githubVersion = responses[1].status === "fulfilled" ? versionFromYaml(responses[1].value) : null;
-			const catalogYaml = responses[2].status === "fulfilled" ? responses[2].value : "";
-			const catalogVersion = versionFromYaml(catalogYaml);
-			const catalogMatch = catalogYaml.match(/^sha:\s*["']?([0-9a-f]{40})/m);
-			const result = {
-				at: Date.now(), seen: installedSha, seenVersion: installedVersion || "",
-				installedVersion: installedVersion || "unknown",
-				catalogVersion, catalogSha: catalogMatch ? catalogMatch[1] : null,
-				githubVersion, githubSha,
-			};
-			if (!catalogVersion && !githubVersion && !githubSha) return;
-			if (isCompleteUpdateResult(result)) {
-				try { CTX.storage.set(CHECK_KEY, JSON.stringify(result)); } catch { /* best-effort cache */ }
-			}
-			if (alive) setUpdate(result);
-		};
-		run().catch(() => {});
-		return () => { alive = false; };
-	}, [installedSha, installedVersion]);
-	return update;
-}
-
-function UpdateBanner({ update }) {
-	if (!update) return null;
-	const catalogStatus = versionRelation(update.catalogVersion, update.installedVersion);
-	const githubStatus = update.githubSha && update.githubSha !== update.seen
-		? "newer commit available" : versionRelation(update.githubVersion, update.installedVersion);
-	return jsxs("div", {
-		className: "flex flex-col gap-1 rounded px-3 py-2 text-[0.6875rem] bg-(--chrome-action) text-(--ui-text-secondary)",
-		children: [
-			jsx("div", { children: `Catalog: ${update.catalogVersion || "unavailable"} · ${catalogStatus}` }),
-			jsx("div", { children: `GitHub: ${update.githubVersion || "unavailable"} · ${githubStatus}` }),
-			jsx("button", {
-				type: "button",
-				className: "self-start underline underline-offset-2 hover:text-(--ui-text-primary)",
-				onClick: () => { void CTX?.os?.openExternal?.("https://github.com/rarf/hermes-quota-plugin/releases"); },
-				children: "Open GitHub releases ↗",
-			}),
-		],
-	});
-}
-
 // ---- data hook (cli.exec instead of REST) ----------------------------------
 //
 // Two-phase by design. The POLL reads the backend cache (`--cached`, never the
@@ -2153,7 +2054,6 @@ function QuotaPane() {
 	const qc = useQueryClient();
 	const [view, setView] = useState("list"); // 'list' | 'settings'
 	const { data, isError, isLoading } = useQuota();
-	const update = useUpdateCheck(data && data.installed_sha, data && data.plugin_version);
 	// Footer honesty: the backend reports the cache age (authoritative across
 	// machines, no clock skew), the ticker keeps it live, and the configured
 	// cadence is shown next to it so "60s" is verifiable at a glance.
@@ -2386,7 +2286,7 @@ function QuotaPane() {
 				className: "min-h-0 flex-1",
 				"data-quota-scroll": true,
 				style: { minHeight: 0, minWidth: 0, overflowY: "auto", overflowX: "hidden", flex: "1 1 0%" },
-				children: jsxs("div", { children: [body, jsx(UpdateBanner, { update }), versionSkew] }),
+				children: jsxs("div", { children: [body, versionSkew] }),
 			}),
 			data && data.fetched_at
 				? jsx("div", {
