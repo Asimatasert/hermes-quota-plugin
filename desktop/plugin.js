@@ -748,7 +748,7 @@ function codexSpecial(data) {
 function openSpecialLink(url) {
 	if (url !== SPECIAL_RESET_CREDIT && !SPECIAL_RESET_SOURCE.test(url)) return;
 	try {
-		host.openExternal?.(url);
+		CTX?.os?.openExternal?.(url);
 	} catch {
 		/* opening a link must never break quota rendering */
 	}
@@ -874,104 +874,6 @@ function formatAgeSeconds(seconds) {
 	if (seconds < 60) return `${Math.round(seconds)}s`;
 	if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
 	return `${Math.floor(seconds / 3600)}h`;
-}
-
-// ---- update self-check (like Hermes's own) ---------------------------------
-
-const REPO_API_LATEST =
-	"https://api.github.com/repos/rarf/hermes-quota-plugin/commits/master";
-
-// Compare the installed commit stamp against GitHub master. One cheap
-// request per hour, cached in storage; never blocks rendering. The cache
-// entry is bound to the stamp it was taken with (`seen`) — so installing
-// a new version invalidates it immediately instead of serving a stale
-// "update available" verdict for the rest of the hour.
-function useUpdateCheck(installedSha) {
-	const [update, setUpdate] = useState(null);
-	useEffect(() => {
-		let alive = true;
-		const CHECK_KEY = "updateCheck";
-		const ONE_HOUR = 60 * 60 * 1000;
-		const run = async () => {
-			// The stamp rides on the status payload — no second CLI spawn on
-			// mount, which is what made a reload (or a gateway switch, where
-			// every plugin re-mounts) feel sluggish.
-			if (!installedSha || installedSha === "unknown") return;
-			// Throttle: at most one GitHub call per hour. The cached verdict
-			// is only valid for the installed stamp it was taken with — a
-			// fresh install must re-check immediately.
-			try {
-				const prev = CTX.storage.get(CHECK_KEY);
-				if (prev) {
-					const p = JSON.parse(prev);
-					if (
-						p.at &&
-						Date.now() - p.at < ONE_HOUR &&
-						p.latest &&
-						p.seen === installedSha
-					) {
-						if (p.latest !== installedSha) {
-							setUpdate({ latest: p.latest });
-						}
-						return;
-					}
-				}
-			} catch {
-				/* noop */
-			}
-			try {
-				const res = await fetch(REPO_API_LATEST, {
-					headers: { Accept: "application/vnd.github+json" },
-				});
-				if (!res.ok) return;
-				const j = await res.json();
-				const latest = j && j.sha;
-				if (!latest) return;
-				try {
-					CTX.storage.set(
-						CHECK_KEY,
-						JSON.stringify({
-							at: Date.now(),
-							latest,
-							seen: installedSha,
-						}),
-					);
-				} catch {
-					/* noop */
-				}
-				if (alive && latest !== installedSha) {
-					setUpdate({ latest });
-				}
-			} catch {
-				/* offline / rate-limited — stay quiet */
-			}
-		};
-		run();
-		return () => {
-			alive = false;
-		};
-	}, [installedSha]);
-	return update;
-}
-
-function UpdateBanner({ update }) {
-	if (!update) return null;
-	return jsxs("button", {
-		type: "button",
-		className: cn(
-			"flex w-full items-center justify-between gap-2 rounded px-3 py-2 text-left text-[0.6875rem]",
-			"bg-(--chrome-action) text-(--ui-text-secondary) hover:bg-(--chrome-action-hover) transition-colors",
-		),
-		onClick: () =>
-			host.openExternal?.("https://github.com/rarf/hermes-quota-plugin"),
-		children: [
-			jsx("span", {
-				className: "font-medium",
-				children: "⬆ Update available — run ./install.sh to get it",
-			}),
-			jsx("span", { className: "text-(--ui-text-tertiary)", children: "↗" }),
-		],
-	});
 }
 
 // ---- data hook (cli.exec instead of REST) ----------------------------------
@@ -1692,7 +1594,7 @@ function QuotaBar({ value, tone }) {
 // banked resets). Unavailable providers render as a muted card. `headerExtra`
 // renders next to the provider name — card groups put their per-card buttons
 // there.
-function ProviderRow({ id, provider, headerExtra }) {
+function ProviderRow({ id, provider, headerExtra, special }) {
 	const t = usePluginI18n(ID);
 	const resetFormat = useValue(resetFormatAtom);
 	// 'dense' = every window, reset time and detail line; 'clean' = just the
@@ -1747,6 +1649,7 @@ function ProviderRow({ id, provider, headerExtra }) {
 							],
 						})
 					: null,
+				special ? jsx(SpecialResetNotice, { special, key: "codex-special-reset" }) : null,
 			],
 		});
 	}
@@ -1768,6 +1671,7 @@ function ProviderRow({ id, provider, headerExtra }) {
 					children: t("noData"),
 				}),
 				headerExtra || null,
+				special ? jsx(SpecialResetNotice, { special, key: "codex-special-reset" }) : null,
 			],
 		});
 	}
@@ -1856,6 +1760,7 @@ function ProviderRow({ id, provider, headerExtra }) {
 							`${id}-d-${i}`,
 						),
 				),
+			special ? jsx(SpecialResetNotice, { special, key: "codex-special-reset" }) : null,
 		],
 	});
 }
@@ -1866,7 +1771,7 @@ function ProviderRow({ id, provider, headerExtra }) {
 // is still rendered by the same ProviderRow as every single-card provider,
 // so the detail keeps the full single-card completeness. A lone row never
 // reaches this component; the pane keeps its plain card path as-is.
-function ProviderCardGroup({ entries }) {
+function ProviderCardGroup({ entries, special }) {
 	const [selected, setSelected] = useState(0);
 	// A refresh can remove or reorder rows: clamp instead of blanking the UI.
 	const index = Math.max(0, Math.min(selected, entries.length - 1));
@@ -1902,7 +1807,7 @@ function ProviderCardGroup({ entries }) {
 			);
 		}),
 	});
-	return jsx(ProviderRow, { id: selectedId, provider: selectedProvider, headerExtra }, selectedId);
+	return jsx(ProviderRow, { id: selectedId, provider: selectedProvider, headerExtra, special }, selectedId);
 }
 
 function ResetFormatControl() {
@@ -2149,7 +2054,6 @@ function QuotaPane() {
 	const qc = useQueryClient();
 	const [view, setView] = useState("list"); // 'list' | 'settings'
 	const { data, isError, isLoading } = useQuota();
-	const update = useUpdateCheck(data && data.installed_sha);
 	// Footer honesty: the backend reports the cache age (authoritative across
 	// machines, no clock skew), the ticker keeps it live, and the configured
 	// cadence is shown next to it so "60s" is verifiable at a glance.
@@ -2260,11 +2164,11 @@ function QuotaPane() {
 		body = jsxs("div", {
 			className: "flex flex-col gap-2",
 			children: [
-				special ? jsx(SpecialResetNotice, { special, key: "codex-special-reset" }) : null,
 				...visible.map((group, index) => {
 					if (group.entries.length >= 2) {
 						return jsx(ProviderCardGroup, {
 							entries: group.entries,
+							special: group.base === "openai-codex" ? special : null,
 							key: group.base,
 						});
 					}
@@ -2272,6 +2176,7 @@ function QuotaPane() {
 					return jsx(ProviderRow, {
 						id,
 						provider: p,
+						special: id === "openai-codex" ? special : null,
 						key: id === "openai-codex" ? `${id}-${index}` : id,
 					});
 				}),
@@ -2381,7 +2286,7 @@ function QuotaPane() {
 				className: "min-h-0 flex-1",
 				"data-quota-scroll": true,
 				style: { minHeight: 0, minWidth: 0, overflowY: "auto", overflowX: "hidden", flex: "1 1 0%" },
-				children: jsxs("div", { children: [body, jsx(UpdateBanner, { update }), versionSkew] }),
+				children: jsxs("div", { children: [body, versionSkew] }),
 			}),
 			data && data.fetched_at
 				? jsx("div", {
