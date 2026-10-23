@@ -890,6 +890,10 @@ function versionFromYaml(text) {
 	return match ? match[1] : null;
 }
 
+function isCompleteUpdateResult(result) {
+	return Boolean(result && result.catalogVersion && result.catalogSha && result.githubVersion && result.githubSha);
+}
+
 function versionRelation(remote, installed) {
 	if (!remote || !installed) return "version unavailable";
 	const a = String(remote).split(".").map(part => Number.parseInt(part, 10));
@@ -917,7 +921,7 @@ function useUpdateCheck(installedSha, installedVersion) {
 				const previous = CTX.storage.get(CHECK_KEY);
 				if (previous) {
 					const cached = JSON.parse(previous);
-					if (cached.at && Date.now() - cached.at < ONE_HOUR && cached.seen === installedSha && cached.seenVersion === (installedVersion || "") && (cached.catalogVersion || cached.githubVersion)) {
+					if (cached.at && Date.now() - cached.at < ONE_HOUR && cached.seen === installedSha && cached.seenVersion === (installedVersion || "") && isCompleteUpdateResult(cached)) {
 						if (alive) setUpdate(cached);
 						return;
 					}
@@ -940,7 +944,9 @@ function useUpdateCheck(installedSha, installedVersion) {
 				githubVersion, githubSha,
 			};
 			if (!catalogVersion && !githubVersion && !githubSha) return;
-			try { CTX.storage.set(CHECK_KEY, JSON.stringify(result)); } catch { /* best-effort cache */ }
+			if (isCompleteUpdateResult(result)) {
+				try { CTX.storage.set(CHECK_KEY, JSON.stringify(result)); } catch { /* best-effort cache */ }
+			}
 			if (alive) setUpdate(result);
 		};
 		run().catch(() => {});

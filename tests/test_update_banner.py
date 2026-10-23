@@ -6,6 +6,19 @@ from widget_harness import render, text
 
 
 class UpdateBannerTests(unittest.TestCase):
+    def test_only_complete_source_checks_are_cacheable(self):
+        self.assertFalse(render(component="update-cacheable", update={
+            "catalogVersion": "2.10.0",
+            "githubVersion": "2.12.0",
+            "githubSha": "abc",
+        }))
+        self.assertTrue(render(component="update-cacheable", update={
+            "catalogVersion": "2.10.0",
+            "catalogSha": "a" * 40,
+            "githubVersion": "2.12.0",
+            "githubSha": "b" * 40,
+        }))
+
     def test_banner_shows_catalog_and_latest_github_versions_separately(self):
         tree = render(component="update", update={
             "catalogVersion": "2.10.0",

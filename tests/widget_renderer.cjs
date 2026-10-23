@@ -36,7 +36,7 @@ function renderWidget(options = {}) {
   vm.runInContext('statusbarModeAtom.set(TEST_STATUS_MODE); disabledProvidersAtom.set(TEST_DISABLED);', Object.assign(context, { TEST_STATUS_MODE: options.statusMode || 'all', TEST_DISABLED: options.disabled || [] }));
   context.PROVIDER = options.provider;
   context.WIDGET_ID = options.id || 'deepseek';
-  const expression = options.component === 'update' ? 'UpdateBanner({update: TEST_UPDATE})' : options.component === 'status' ? 'StatusBar()' : options.component === 'chip' ? 'ProviderChip({pid:WIDGET_ID,provider:PROVIDER})' : options.component === 'row' ? 'ProviderRow({id:WIDGET_ID,provider:PROVIDER})' : options.component === 'worst' ? 'QuotaChipWithBar()' : 'QuotaPane()';
+  const expression = options.component === 'update-cacheable' ? 'isCompleteUpdateResult(TEST_UPDATE)' : options.component === 'update' ? 'UpdateBanner({update: TEST_UPDATE})' : options.component === 'status' ? 'StatusBar()' : options.component === 'chip' ? 'ProviderChip({pid:WIDGET_ID,provider:PROVIDER})' : options.component === 'row' ? 'ProviderRow({id:WIDGET_ID,provider:PROVIDER})' : options.component === 'worst' ? 'QuotaChipWithBar()' : 'QuotaPane()';
   const tree = vm.runInContext(expression, Object.assign(context, { TEST_UPDATE: options.update || null }));
   if (options.clickLinks) {
     const visit = node => {
