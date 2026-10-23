@@ -748,7 +748,7 @@ function codexSpecial(data) {
 function openSpecialLink(url) {
 	if (url !== SPECIAL_RESET_CREDIT && !SPECIAL_RESET_SOURCE.test(url)) return;
 	try {
-		host.openExternal?.(url);
+		CTX?.os?.openExternal?.(url);
 	} catch {
 		/* opening a link must never break quota rendering */
 	}
@@ -880,96 +880,91 @@ function formatAgeSeconds(seconds) {
 
 const REPO_API_LATEST =
 	"https://api.github.com/repos/rarf/hermes-quota-plugin/commits/master";
+const REPO_MANIFEST_LATEST =
+	"https://raw.githubusercontent.com/rarf/hermes-quota-plugin/master/plugin.yaml";
+const CATALOG_ENTRY_LATEST =
+	"https://raw.githubusercontent.com/NousResearch/hermes-agent/main/plugin-catalog/quota.yaml";
 
-// Compare the installed commit stamp against GitHub master. One cheap
-// request per hour, cached in storage; never blocks rendering. The cache
-// entry is bound to the stamp it was taken with (`seen`) — so installing
-// a new version invalidates it immediately instead of serving a stale
-// "update available" verdict for the rest of the hour.
-function useUpdateCheck(installedSha) {
+function versionFromYaml(text) {
+	const match = String(text || "").match(/^version:\s*["']?([0-9]+(?:\.[0-9]+){2})/m);
+	return match ? match[1] : null;
+}
+
+function versionRelation(remote, installed) {
+	if (!remote || !installed) return "version unavailable";
+	const a = String(remote).split(".").map(part => Number.parseInt(part, 10));
+	const b = String(installed).split(".").map(part => Number.parseInt(part, 10));
+	if ([...a, ...b].some(value => !Number.isFinite(value))) return "differs from installed";
+	for (let i = 0; i < Math.max(a.length, b.length); i++) {
+		const left = a[i] || 0;
+		const right = b[i] || 0;
+		if (left !== right) return left > right ? "newer than installed" : "older than installed";
+	}
+	return "matches installed";
+}
+
+// Keep the Hermes catalog pin and upstream GitHub default branch as separate
+// signals; the community catalog can intentionally lag upstream releases.
+function useUpdateCheck(installedSha, installedVersion) {
 	const [update, setUpdate] = useState(null);
 	useEffect(() => {
 		let alive = true;
 		const CHECK_KEY = "updateCheck";
 		const ONE_HOUR = 60 * 60 * 1000;
 		const run = async () => {
-			// The stamp rides on the status payload — no second CLI spawn on
-			// mount, which is what made a reload (or a gateway switch, where
-			// every plugin re-mounts) feel sluggish.
 			if (!installedSha || installedSha === "unknown") return;
-			// Throttle: at most one GitHub call per hour. The cached verdict
-			// is only valid for the installed stamp it was taken with — a
-			// fresh install must re-check immediately.
 			try {
-				const prev = CTX.storage.get(CHECK_KEY);
-				if (prev) {
-					const p = JSON.parse(prev);
-					if (
-						p.at &&
-						Date.now() - p.at < ONE_HOUR &&
-						p.latest &&
-						p.seen === installedSha
-					) {
-						if (p.latest !== installedSha) {
-							setUpdate({ latest: p.latest });
-						}
+				const previous = CTX.storage.get(CHECK_KEY);
+				if (previous) {
+					const cached = JSON.parse(previous);
+					if (cached.at && Date.now() - cached.at < ONE_HOUR && cached.seen === installedSha && cached.seenVersion === (installedVersion || "") && (cached.catalogVersion || cached.githubVersion)) {
+						if (alive) setUpdate(cached);
 						return;
 					}
 				}
-			} catch {
-				/* noop */
-			}
-			try {
-				const res = await fetch(REPO_API_LATEST, {
-					headers: { Accept: "application/vnd.github+json" },
-				});
-				if (!res.ok) return;
-				const j = await res.json();
-				const latest = j && j.sha;
-				if (!latest) return;
-				try {
-					CTX.storage.set(
-						CHECK_KEY,
-						JSON.stringify({
-							at: Date.now(),
-							latest,
-							seen: installedSha,
-						}),
-					);
-				} catch {
-					/* noop */
-				}
-				if (alive && latest !== installedSha) {
-					setUpdate({ latest });
-				}
-			} catch {
-				/* offline / rate-limited — stay quiet */
-			}
+			} catch { /* ignore bad or unavailable cache */ }
+			const responses = await Promise.allSettled([
+				fetch(REPO_API_LATEST, { headers: { Accept: "application/vnd.github+json" } }).then(res => res.ok ? res.json() : Promise.reject(new Error(`GitHub commit ${res.status}`))),
+				fetch(REPO_MANIFEST_LATEST).then(res => res.ok ? res.text() : Promise.reject(new Error(`GitHub manifest ${res.status}`))),
+				fetch(CATALOG_ENTRY_LATEST).then(res => res.ok ? res.text() : Promise.reject(new Error(`catalog ${res.status}`))),
+			]);
+			const githubSha = responses[0].status === "fulfilled" ? responses[0].value?.sha || null : null;
+			const githubVersion = responses[1].status === "fulfilled" ? versionFromYaml(responses[1].value) : null;
+			const catalogYaml = responses[2].status === "fulfilled" ? responses[2].value : "";
+			const catalogVersion = versionFromYaml(catalogYaml);
+			const catalogMatch = catalogYaml.match(/^sha:\s*["']?([0-9a-f]{40})/m);
+			const result = {
+				at: Date.now(), seen: installedSha, seenVersion: installedVersion || "",
+				installedVersion: installedVersion || "unknown",
+				catalogVersion, catalogSha: catalogMatch ? catalogMatch[1] : null,
+				githubVersion, githubSha,
+			};
+			if (!catalogVersion && !githubVersion && !githubSha) return;
+			try { CTX.storage.set(CHECK_KEY, JSON.stringify(result)); } catch { /* best-effort cache */ }
+			if (alive) setUpdate(result);
 		};
-		run();
-		return () => {
-			alive = false;
-		};
-	}, [installedSha]);
+		run().catch(() => {});
+		return () => { alive = false; };
+	}, [installedSha, installedVersion]);
 	return update;
 }
 
 function UpdateBanner({ update }) {
 	if (!update) return null;
-	return jsxs("button", {
-		type: "button",
-		className: cn(
-			"flex w-full items-center justify-between gap-2 rounded px-3 py-2 text-left text-[0.6875rem]",
-			"bg-(--chrome-action) text-(--ui-text-secondary) hover:bg-(--chrome-action-hover) transition-colors",
-		),
-		onClick: () =>
-			host.openExternal?.("https://github.com/rarf/hermes-quota-plugin"),
+	const catalogStatus = versionRelation(update.catalogVersion, update.installedVersion);
+	const githubStatus = update.githubSha && update.githubSha !== update.seen
+		? "newer commit available" : versionRelation(update.githubVersion, update.installedVersion);
+	return jsxs("div", {
+		className: "flex flex-col gap-1 rounded px-3 py-2 text-[0.6875rem] bg-(--chrome-action) text-(--ui-text-secondary)",
 		children: [
-			jsx("span", {
-				className: "font-medium",
-				children: "⬆ Update available — run ./install.sh to get it",
+			jsx("div", { children: `Catalog: ${update.catalogVersion || "unavailable"} · ${catalogStatus}` }),
+			jsx("div", { children: `GitHub: ${update.githubVersion || "unavailable"} · ${githubStatus}` }),
+			jsx("button", {
+				type: "button",
+				className: "self-start underline underline-offset-2 hover:text-(--ui-text-primary)",
+				onClick: () => { void CTX?.os?.openExternal?.("https://github.com/rarf/hermes-quota-plugin/releases"); },
+				children: "Open GitHub releases ↗",
 			}),
-			jsx("span", { className: "text-(--ui-text-tertiary)", children: "↗" }),
 		],
 	});
 }
@@ -1692,7 +1687,7 @@ function QuotaBar({ value, tone }) {
 // banked resets). Unavailable providers render as a muted card. `headerExtra`
 // renders next to the provider name — card groups put their per-card buttons
 // there.
-function ProviderRow({ id, provider, headerExtra }) {
+function ProviderRow({ id, provider, headerExtra, special }) {
 	const t = usePluginI18n(ID);
 	const resetFormat = useValue(resetFormatAtom);
 	// 'dense' = every window, reset time and detail line; 'clean' = just the
@@ -1747,6 +1742,7 @@ function ProviderRow({ id, provider, headerExtra }) {
 							],
 						})
 					: null,
+				special ? jsx(SpecialResetNotice, { special, key: "codex-special-reset" }) : null,
 			],
 		});
 	}
@@ -1768,6 +1764,7 @@ function ProviderRow({ id, provider, headerExtra }) {
 					children: t("noData"),
 				}),
 				headerExtra || null,
+				special ? jsx(SpecialResetNotice, { special, key: "codex-special-reset" }) : null,
 			],
 		});
 	}
@@ -1856,6 +1853,7 @@ function ProviderRow({ id, provider, headerExtra }) {
 							`${id}-d-${i}`,
 						),
 				),
+			special ? jsx(SpecialResetNotice, { special, key: "codex-special-reset" }) : null,
 		],
 	});
 }
@@ -1866,7 +1864,7 @@ function ProviderRow({ id, provider, headerExtra }) {
 // is still rendered by the same ProviderRow as every single-card provider,
 // so the detail keeps the full single-card completeness. A lone row never
 // reaches this component; the pane keeps its plain card path as-is.
-function ProviderCardGroup({ entries }) {
+function ProviderCardGroup({ entries, special }) {
 	const [selected, setSelected] = useState(0);
 	// A refresh can remove or reorder rows: clamp instead of blanking the UI.
 	const index = Math.max(0, Math.min(selected, entries.length - 1));
@@ -1902,7 +1900,7 @@ function ProviderCardGroup({ entries }) {
 			);
 		}),
 	});
-	return jsx(ProviderRow, { id: selectedId, provider: selectedProvider, headerExtra }, selectedId);
+	return jsx(ProviderRow, { id: selectedId, provider: selectedProvider, headerExtra, special }, selectedId);
 }
 
 function ResetFormatControl() {
@@ -2149,7 +2147,7 @@ function QuotaPane() {
 	const qc = useQueryClient();
 	const [view, setView] = useState("list"); // 'list' | 'settings'
 	const { data, isError, isLoading } = useQuota();
-	const update = useUpdateCheck(data && data.installed_sha);
+	const update = useUpdateCheck(data && data.installed_sha, data && data.plugin_version);
 	// Footer honesty: the backend reports the cache age (authoritative across
 	// machines, no clock skew), the ticker keeps it live, and the configured
 	// cadence is shown next to it so "60s" is verifiable at a glance.
@@ -2260,11 +2258,11 @@ function QuotaPane() {
 		body = jsxs("div", {
 			className: "flex flex-col gap-2",
 			children: [
-				special ? jsx(SpecialResetNotice, { special, key: "codex-special-reset" }) : null,
 				...visible.map((group, index) => {
 					if (group.entries.length >= 2) {
 						return jsx(ProviderCardGroup, {
 							entries: group.entries,
+							special: group.base === "openai-codex" ? special : null,
 							key: group.base,
 						});
 					}
@@ -2272,6 +2270,7 @@ function QuotaPane() {
 					return jsx(ProviderRow, {
 						id,
 						provider: p,
+						special: id === "openai-codex" ? special : null,
 						key: id === "openai-codex" ? `${id}-${index}` : id,
 					});
 				}),

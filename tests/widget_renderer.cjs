@@ -25,18 +25,30 @@ function renderWidget(options = {}) {
     fmtDayTime: new Intl.DateTimeFormat('en-US'), console,
     Date, Intl, setTimeout, clearTimeout,
   };
+  const openedExternal = [];
   const file = options.source || require('node:path').join(__dirname, '../desktop/plugin.js');
   const source = fs.readFileSync(file, 'utf8').replace(/^import[\s\S]*?from ["'][^"']+["'];/gm, '').replace('export default {', 'const plugin = {');
   vm.createContext(context);
   vm.runInContext(source + '\nplugin.register(TEST_CTX); paneDetailAtom.set(TEST_MODE);', Object.assign(context, {
     TEST_MODE: options.mode || 'dense',
-    TEST_CTX: {storage: {get: () => undefined}, i18n: {register: v => {translations = v.en;}}, register: () => () => {}},
+    TEST_CTX: {storage: {get: () => undefined}, os: {openExternal: async url => { openedExternal.push(url); return true; }}, i18n: {register: v => {translations = v.en;}}, register: () => () => {}},
   }));
   vm.runInContext('statusbarModeAtom.set(TEST_STATUS_MODE); disabledProvidersAtom.set(TEST_DISABLED);', Object.assign(context, { TEST_STATUS_MODE: options.statusMode || 'all', TEST_DISABLED: options.disabled || [] }));
   context.PROVIDER = options.provider;
   context.WIDGET_ID = options.id || 'deepseek';
-  const expression = options.component === 'status' ? 'StatusBar()' : options.component === 'chip' ? 'ProviderChip({pid:WIDGET_ID,provider:PROVIDER})' : options.component === 'row' ? 'ProviderRow({id:WIDGET_ID,provider:PROVIDER})' : options.component === 'worst' ? 'QuotaChipWithBar()' : 'QuotaPane()';
-  return vm.runInContext(expression, context);
+  const expression = options.component === 'update' ? 'UpdateBanner({update: TEST_UPDATE})' : options.component === 'status' ? 'StatusBar()' : options.component === 'chip' ? 'ProviderChip({pid:WIDGET_ID,provider:PROVIDER})' : options.component === 'row' ? 'ProviderRow({id:WIDGET_ID,provider:PROVIDER})' : options.component === 'worst' ? 'QuotaChipWithBar()' : 'QuotaPane()';
+  const tree = vm.runInContext(expression, Object.assign(context, { TEST_UPDATE: options.update || null }));
+  if (options.clickLinks) {
+    const visit = node => {
+      if (Array.isArray(node)) return node.forEach(visit);
+      if (!node || typeof node !== 'object') return;
+      if ((node.type === 'a' || (options.component === 'update' && node.type === 'button')) && typeof node.props.onClick === 'function') node.props.onClick({preventDefault() {}});
+      visit(node.props?.children);
+    };
+    visit(tree);
+  }
+  tree.openedExternal = openedExternal;
+  return tree;
 }
 module.exports = {renderWidget};
 if (require.main === module) process.stdout.write(JSON.stringify(renderWidget(JSON.parse(fs.readFileSync(0, 'utf8')))));

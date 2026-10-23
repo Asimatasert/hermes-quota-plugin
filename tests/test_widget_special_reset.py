@@ -216,6 +216,30 @@ class SpecialResetDesktopTests(unittest.TestCase):
         bad = special_root(announcement(source_url="https://evil.example/status/1"))
         self.assertEqual(self.hrefs(bad), [])
 
+    def test_special_reset_links_open_through_desktop_os_bridge(self):
+        tree = render(data=payload(root=special_root()), clickLinks=True)
+        self.assertEqual(tree["openedExternal"], [CREDIT, SOURCE])
+
+    def test_special_reset_notice_is_inside_openai_card_when_another_provider_precedes_it(self):
+        data = payload(root=special_root())
+        data["providers"] = {"anthropic": data["providers"]["anthropic"],
+                             "openai-codex": data["providers"]["openai-codex"]}
+        tree = render(data=data)
+
+        def subtree_text(node):
+            if isinstance(node, dict):
+                children = node.get("props", {}).get("children")
+                return (str(children) if isinstance(children, str) else "") + " " + subtree_text(children)
+            if isinstance(node, list):
+                return " ".join(subtree_text(child) for child in node)
+            return "" if node is None else str(node)
+
+        cards = [node for node in nodes(tree)
+                 if "rounded-lg border" in node.get("props", {}).get("className", "")]
+        self.assertTrue(any("OpenAI Codex" in subtree_text(card)
+                            and "Special reset announcement" in subtree_text(card)
+                            for card in cards), "announcement should be nested in OpenAI Codex card")
+
     def hrefs(self, data):
         tree = render(data=data)
         return [
