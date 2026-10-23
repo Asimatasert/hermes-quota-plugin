@@ -72,6 +72,130 @@ def _load_cookies() -> Optional[str]:
     return load_chrome_grok_cookies()
 
 
+def _token_from_auth_json(path: str) -> Optional[str]:
+    """Read one Hermes ``xai-oauth`` access token without caching it."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    providers = data.get("providers")
+    state = providers.get("xai-oauth") if isinstance(providers, dict) else None
+    tokens = state.get("tokens") if isinstance(state, dict) else None
+    if isinstance(tokens, dict):
+        token = tokens.get("access_token")
+        if isinstance(token, str) and token.strip():
+            return token.strip()
+
+    pool = data.get("credential_pool")
+    entries = pool.get("xai-oauth") if isinstance(pool, dict) else None
+    for entry in entries if isinstance(entries, list) else ():
+        if not isinstance(entry, dict):
+            continue
+        token = entry.get("access_token")
+        if isinstance(token, str) and token.strip():
+            return token.strip()
+    return None
+
+
+def _hermes_xai_access_token() -> Optional[str]:
+    """Read Hermes' xAI OAuth token, then the local auth-store fallbacks."""
+    for module_name in ("hermes_cli.auth_xai", "hermes_cli.auth"):
+        try:
+            module = __import__(module_name, fromlist=["_read_xai_oauth_tokens"])
+            reader = getattr(module, "_read_xai_oauth_tokens")
+            state = reader()
+            tokens = state.get("tokens") if isinstance(state, dict) else None
+            token = tokens.get("access_token") if isinstance(tokens, dict) else None
+            if isinstance(token, str) and token.strip():
+                return token.strip()
+        except Exception:
+            continue
+
+    candidates: list[str] = []
+    configured_home = os.environ.get("HERMES_HOME")
+    if configured_home:
+        candidates.append(os.path.join(configured_home, "auth.json"))
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        candidates.append(os.path.join(local_app_data, "hermes", "auth.json"))
+    try:
+        from hermes_constants import get_hermes_home
+
+        home = os.path.abspath(str(get_hermes_home()))
+        candidates.append(os.path.join(home, "auth.json"))
+        parts = os.path.normpath(home).split(os.sep)
+        if len(parts) >= 2 and parts[-2].lower() == "profiles":
+            candidates.append(os.path.join(os.sep.join(parts[:-2]), "auth.json"))
+    except Exception:
+        pass
+
+    seen: set[str] = set()
+    for path in candidates:
+        key = os.path.normcase(os.path.abspath(path))
+        if key in seen:
+            continue
+        seen.add(key)
+        token = _token_from_auth_json(path)
+        if token:
+            return token
+    return None
+
+
+def _grok_grpc_headers(*, cookies: Optional[str] = None, bearer: Optional[str] = None) -> dict[str, str]:
+    headers = {
+        "accept": "*/*",
+        "content-type": "application/grpc-web+proto",
+        "origin": "https://grok.com",
+        "referer": "https://grok.com/?_s=usage",
+        "user-agent": _BROWSER_UA,
+        "x-grpc-web": "1",
+        "x-user-agent": "connect-es/2.1.1",
+        "cache-control": "no-cache",
+        "pragma": "no-cache",
+    }
+    if cookies:
+        headers["cookie"] = cookies
+    if bearer:
+        headers["Authorization"] = f"Bearer {bearer}"
+    return headers
+
+
+def _fetch_grok_grpc(headers: dict[str, str]) -> Optional[QuotaResult]:
+    """Fetch and parse the Grok billing gRPC response for one credential."""
+    req = urllib.request.Request(
+        _GROK_ENDPOINT,
+        data=_EMPTY_GRPCWEB_BODY,
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urlopen_no_redirect(req, timeout=15) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return build_unavailable("grok", "cloudflare-blocked" if e.code == 403 else "auth-failed")
+        return build_unavailable("grok", f"http-{e.code}")
+    except Exception as e:
+        return build_unavailable("grok", f"fetch-error:{type(e).__name__}")
+    if os.environ.get("HERMES_QUOTA_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}:
+        try:
+            _write_private_debug(_RAW_DEBUG_PATH, raw)
+        except Exception:
+            pass
+    return _parse_grok_protobuf(raw)
+
+
+def _is_grok_auth_failure(result: Optional[QuotaResult]) -> bool:
+    return bool(
+        result is not None
+        and result.unavailable_reason in {"auth-failed", "cloudflare-blocked", "http-401", "http-403"}
+    )
+
+
 def _parse_grok_protobuf(raw: bytes) -> Optional[QuotaResult]:
     import struct
 
@@ -259,6 +383,18 @@ def _fetch_grok_rest(cookies: str) -> Optional[QuotaResult]:
 
 
 def fetch_grok_quota() -> QuotaResult:
+    # Hermes' xai-oauth bearer is the primary credential path. Only an
+    # authentication failure falls through to the browser-cookie chain below;
+    # transport and parse failures stay visible instead of masking the OAuth
+    # result with a second request.
+    token = _hermes_xai_access_token()
+    if token:
+        oauth_result = _fetch_grok_grpc(_grok_grpc_headers(bearer=token))
+        if oauth_result is None:
+            return build_unavailable("grok", "parse-pending")
+        if not _is_grok_auth_failure(oauth_result):
+            return oauth_result
+
     try:
         cookies = _load_cookies()
     except ChromeCookieError as exc:
@@ -270,34 +406,7 @@ def fetch_grok_quota() -> QuotaResult:
     # usage screen (percent used + reset). Verified 1:1 against the grok.com
     # usage panel: same percentages, same reset instant. Fields the panel does
     # not render (fn11/fn13 flags) are deliberately not reported.
-    headers = {
-        "accept": "*/*",
-        "content-type": "application/grpc-web+proto",
-        "origin": "https://grok.com",
-        "referer": "https://grok.com/?_s=usage",
-        "user-agent": _BROWSER_UA,
-        "x-grpc-web": "1",
-        "x-user-agent": "connect-es/2.1.1",
-        "cache-control": "no-cache",
-        "pragma": "no-cache",
-        "cookie": cookies,
-    }
-    req = urllib.request.Request(_GROK_ENDPOINT, data=_EMPTY_GRPCWEB_BODY, headers=headers, method="POST")
-    try:
-        with urlopen_no_redirect(req, timeout=15) as resp:
-            raw = resp.read()
-    except urllib.error.HTTPError as e:
-        if e.code in (401, 403):
-            return build_unavailable("grok", "cloudflare-blocked" if e.code == 403 else "auth-failed")
-        return build_unavailable("grok", f"http-{e.code}")
-    except Exception as e:
-        return build_unavailable("grok", f"fetch-error:{type(e).__name__}")
-    if os.environ.get("HERMES_QUOTA_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}:
-        try:
-            _write_private_debug(_RAW_DEBUG_PATH, raw)
-        except Exception:
-            pass
-    result = _parse_grok_protobuf(raw)
+    result = _fetch_grok_grpc(_grok_grpc_headers(cookies=cookies))
     if result is not None:
         return result
 
@@ -312,8 +421,8 @@ def fetch_grok_quota() -> QuotaResult:
 
 from .registry import register as _register  # noqa: E402
 
-# Grok is opt-in: reads browser cookies (Firefox grok.com, then Chrome on
-# macOS). Disabled by default; enable with:
+# Grok is opt-in: reuses the Hermes xai-oauth token first, then reads the
+# grok.com cookie fallback chain. Disabled by default; enable with:
 #   hermes config set plugins.entries.quota.settings.grokEnabled true
 import os as _os
 
