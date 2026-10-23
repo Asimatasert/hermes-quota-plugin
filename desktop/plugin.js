@@ -51,7 +51,7 @@ const ID = "quota";
 // gateway, so the two halves can really be different builds. `tests/test_widget_version.py`
 // fails when they drift; a mismatch found at runtime is surfaced in the pane
 // instead of looking like a broken feature.
-const WIDGET_VERSION = "2.11.5";
+const WIDGET_VERSION = "2.12.0";
 
 // Module-level ctx handle (set in register). The data hook below needs it.
 let CTX = null;

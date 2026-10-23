@@ -3,6 +3,14 @@
 Newest first. Each entry matches an annotated `vX.Y.Z` tag; the tag message is
 the release note.
 
+## 2.12.0 — 2026-10-23
+
+- Desktop: one card per saved credential for multi-account providers, grouped
+  by provider in the status bar; the pane keeps a card per account and the
+  Codex announcement once above the group (#71).
+- Skill: bundle `quota-check` (`quota:quota-check`) so agents check quota
+  before long work and ask before splitting tasks or switching models (#69).
+
 ## 2.11.5 — 2026-10-23
 
 - Codex: a pooled account's saved upstream base URL is preserved for usage
