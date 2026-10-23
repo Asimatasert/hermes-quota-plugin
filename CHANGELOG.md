@@ -3,6 +3,14 @@
 Newest first. Each entry matches an annotated `vX.Y.Z` tag; the tag message is
 the release note.
 
+## 2.11.3 — 2026-10-23
+
+- Cache: a carried record (incomplete sweep) now drops its windows and balances,
+  so the CLI cannot render stale percentages under a fresh cache timestamp; the
+  note is deduplicated instead of growing on every sweep.
+- TUI: `rememberable` tolerates a non-array selection, and a test pins the
+  persisted preference as the single string the picker resolves.
+
 ## 2.11.2 — 2026-10-23
 
 - Cache: a sweep whose provider registry is incomplete no longer deletes the
