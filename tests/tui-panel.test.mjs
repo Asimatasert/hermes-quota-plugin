@@ -71,20 +71,62 @@ test('picker excludes missing credentials and disabled rows without reading keys
 
 test('picker navigates, selects one account, and cancel never opens a panel', async () => {
   const { default: register } = await import(source);
-  const apps = [], opened = [];
-  const sdk = { defineWidgetApp: app => { apps.push(app); return app; },
-    openWidget: (app, state) => opened.push([app.id, state]) };
-  register(sdk);
-  const picker = apps.find(app => app.id === 'quota-select');
-  assert.equal(picker.mode, 'modal');
-  let state = { phase: 'ready', options: [{ id: 'first' }, { id: 'second' }], index: 0 };
-  state = picker.reduce(state, { ch: '', key: { downArrow: true } });
-  assert.equal(state.index, 1);
-  assert.equal(picker.reduce(state, { ch: '', key: { return: true } }), null);
-  assert.deepEqual(opened, [['quota-panel', { selected: ['second'] }]]);
-  assert.deepEqual(apps.find(app => app.id === 'quota-panel').init('').selected, ['second']);
-  assert.equal(picker.reduce(state, { ch: '', key: { escape: true } }), null);
-  assert.equal(opened.length, 1);
+  const { mkdtemp, rm } = await import('node:fs/promises');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  // register() persists the pick, so the test must never write the real pref.
+  const dir = await mkdtemp(join(tmpdir(), 'quota-widget-'));
+  const previous = process.env.HERMES_HOME;
+  process.env.HERMES_HOME = dir;
+  try {
+    const apps = [], opened = [];
+    const sdk = { defineWidgetApp: app => { apps.push(app); return app; },
+      openWidget: (app, state) => opened.push([app.id, state]) };
+    register(sdk);
+    const picker = apps.find(app => app.id === 'quota-select');
+    assert.equal(picker.mode, 'modal');
+    let state = { phase: 'ready', options: [{ id: 'first' }, { id: 'second' }], index: 0 };
+    state = picker.reduce(state, { ch: '', key: { downArrow: true } });
+    assert.equal(state.index, 1);
+    assert.equal(picker.reduce(state, { ch: '', key: { return: true } }), null);
+    assert.deepEqual(opened, [['quota-panel', { selected: ['second'] }]]);
+    assert.deepEqual(apps.find(app => app.id === 'quota-panel').init('').selected, ['second']);
+    assert.equal(picker.reduce(state, { ch: '', key: { escape: true } }), null);
+    assert.equal(opened.length, 1);
+    await new Promise(resolve => setTimeout(resolve, 50));
+  } finally {
+    if (previous === undefined) delete process.env.HERMES_HOME;
+    else process.env.HERMES_HOME = previous;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('the picker starts on the remembered provider instead of the first row', async () => {
+  const { rememberedIndex, pickerOptions } = await import(source);
+  const options = pickerOptions({ providers: {
+    'openai-codex': { windows: [{ used_percent: 96 }] },
+    grok: { windows: [{ used_percent: 84 }] },
+    'anthropic:work': { windows: [{ used_percent: 50 }] },
+  } });
+  assert.equal(rememberedIndex(options, 'grok'), options.findIndex(row => row.id === 'grok'));
+  assert.equal(rememberedIndex(options, 'anthropic'), options.findIndex(row => row.id === 'anthropic:work'),
+    'a saved provider still matches its account rows');
+  assert.equal(rememberedIndex(options, 'not-cached'), 0, 'an unavailable saved provider falls back to the first row');
+  assert.equal(rememberedIndex(options, null), 0);
+  assert.equal(rememberedIndex([], 'grok'), 0);
+});
+
+test('only a selection the cache still resolves is persisted', async () => {
+  const { rememberable, pickerOptions } = await import(source);
+  const options = pickerOptions({ providers: {
+    'openai-codex': { windows: [{ used_percent: 1 }] },
+    'anthropic:work': { windows: [{ used_percent: 50 }] },
+  } });
+  assert.equal(rememberable(options, ['openai-codex']), true);
+  assert.equal(rememberable(options, ['anthropic']), true, 'provider-level selection matches its account row');
+  assert.equal(rememberable(options, ['second']), false, 'a stale test artifact must never overwrite the preference');
+  assert.equal(rememberable(options, []), false);
+  assert.equal(rememberable(options, ['openai-codex', 'grok']), false);
 });
 
 test('bar meters use remaining capacity and never fill unknown or unavailable windows', async () => {
