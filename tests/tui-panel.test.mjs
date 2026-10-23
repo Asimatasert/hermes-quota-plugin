@@ -129,6 +129,32 @@ test('only a selection the cache still resolves is persisted', async () => {
   assert.equal(rememberable(options, ['openai-codex', 'grok']), false);
 });
 
+test('the persisted preference is the string the picker resolves', async () => {
+  const { mkdtemp, rm } = await import('node:fs/promises');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const { createPrefsStore, markDockVisible, readPrefs, rememberedIndex, pickerOptions } = await import(source);
+  const dir = await mkdtemp(join(tmpdir(), 'quota-widget-'));
+  const previous = process.env.HERMES_HOME;
+  process.env.HERMES_HOME = dir;
+  try {
+    const store = createPrefsStore(dir);
+    await store.load();
+    await markDockVisible(store, ['grok']);
+    const saved = await readPrefs(dir);
+    assert.equal(typeof saved.selected, 'string', 'the dock stores one selector, not an array');
+    const options = pickerOptions({ providers: {
+      'openai-codex': { windows: [{ used_percent: 96 }] },
+      grok: { windows: [{ used_percent: 84 }] },
+    } });
+    assert.equal(rememberedIndex(options, saved.selected), options.findIndex(row => row.id === 'grok'));
+  } finally {
+    if (previous === undefined) delete process.env.HERMES_HOME;
+    else process.env.HERMES_HOME = previous;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('bar meters use remaining capacity and never fill unknown or unavailable windows', async () => {
   const { meterModel } = await import(source);
   const cache = { providers: {

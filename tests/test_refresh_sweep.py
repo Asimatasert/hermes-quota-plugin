@@ -145,8 +145,15 @@ class _SweepTest(unittest.TestCase):
         self.assertIn("kept", cache["providers"])
         kept = cache["providers"]["kept"]
         self.assertEqual(kept["unavailable_reason"], "not-refreshed")
+        self.assertEqual(kept["windows"], [], "unattempted providers must not present stale numbers")
+        self.assertEqual(kept["account_balances"], [])
         self.assertIn("Not refreshed in this sweep", " ".join(kept["details"]))
         self.assertNotEqual(cache["providers"]["swept"].get("unavailable_reason"), "not-refreshed")
+
+        # A second incomplete sweep must not accumulate the note.
+        cache, _elapsed = self._run({"swept": lambda: _ok("swept")}, budget=1.0)
+        notes = [d for d in cache["providers"]["kept"]["details"] if d.startswith("Not refreshed in this sweep")]
+        self.assertEqual(len(notes), 1)
 
 
 if __name__ == "__main__":

@@ -445,10 +445,18 @@ def refresh_quota_cache(*, budget: Optional[float] = None) -> dict[str, Any]:
             record = previous_providers.get(key)
             if not isinstance(record, dict):
                 continue
+            # Keep the identity (label/plan) and the note, drop the numbers: a
+            # sweep that never tried this provider cannot claim its windows are
+            # current, and both the CLI and the widget render windows whenever
+            # they exist.
             carried = dict(record)
             carried["unavailable_reason"] = "not-refreshed"
-            details = list(carried.get("details") or [])
-            details.append("Not refreshed in this sweep: the provider registry was incomplete")
+            carried["windows"] = []
+            carried["account_balances"] = []
+            carried["api_calls_available"] = None
+            note = "Not refreshed in this sweep: the provider registry was incomplete"
+            details = [d for d in (carried.get("details") or []) if d != note]
+            details.append(note)
             carried["details"] = details
             providers[key] = carried
     if orphans:

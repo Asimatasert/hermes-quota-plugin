@@ -106,7 +106,7 @@ export function rememberedIndex(options, remembered) {
  * choice with a selector that matches nothing.
  */
 export function rememberable(options, selected) {
-  if (!Array.isArray(options) || selected.length !== 1) return false;
+  if (!Array.isArray(options) || !Array.isArray(selected) || selected.length !== 1) return false;
   return options.some(row => row && (row.id === selected[0] || String(row.id).startsWith(`${selected[0]}:`)));
 }
 
