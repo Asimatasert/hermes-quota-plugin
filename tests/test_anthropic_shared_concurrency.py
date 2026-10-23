@@ -158,7 +158,7 @@ class SharedConcurrencyTests(unittest.TestCase):
             key = provider._backoff_key('synthetic')
             (Path(directory)/provider._ANTHROPIC_SHARED_FILENAME).write_text(json.dumps({key: {'at': at, 'payload': PAYLOAD}}))
             (Path(directory)/'backoff.json').write_text(json.dumps({key: now + 100}))
-            with mock.patch.object(provider, '_backoff_state_path', return_value=str(Path(directory)/'backoff.json')), mock.patch.object(provider, '_core_anthropic_token', return_value='synthetic'), mock.patch.object(provider, '_core_anthropic_is_oauth', return_value=True), mock.patch.object(provider, 'urlopen_no_redirect') as op, mock.patch.dict(cache.PROVIDER_FETCHERS, {'anthropic': provider._fetch_anthropic_single}, clear=True):
+            with mock.patch.object(provider, '_backoff_state_path', return_value=str(Path(directory)/'backoff.json')), mock.patch.object(provider, '_core_anthropic_token', return_value='synthetic'), mock.patch.object(provider, '_core_anthropic_is_oauth', return_value=True), mock.patch.object(provider, 'urlopen_no_redirect') as op, mock.patch.object(cache, '_cache_path', return_value=str(Path(directory)/'quota_cache.json')), mock.patch.dict(cache.PROVIDER_FETCHERS, {'anthropic': provider._fetch_anthropic_single}, clear=True):
                 refreshed = cache.refresh_quota_cache(budget=1)
                 record = refreshed['providers']['anthropic']
             self.assertEqual(op.call_count, 0)

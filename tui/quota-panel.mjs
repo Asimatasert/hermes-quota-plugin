@@ -88,6 +88,28 @@ export function pickerOptions(cache) {
   return panelModel(cache).rows.filter(row => !/^(no-credentials|disabled|not-enabled|not-opted-in|opt-in-disabled)(:|$)/i.test(String(row.reason || '')));
 }
 
+/**
+ * Where the picker must start: the remembered provider/account when it is one
+ * of the cached rows, otherwise the first row. Without this the modal opened
+ * on row 0 after every restart, so it looked like nothing was selected.
+ */
+export function rememberedIndex(options, remembered) {
+  if (!Array.isArray(options) || !options.length || !remembered) return 0;
+  const at = options.findIndex(row => row && (row.id === remembered || String(row.id).startsWith(`${remembered}:`)));
+  return at < 0 ? 0 : at;
+}
+
+/**
+ * A selection worth persisting: it still resolves to a cached provider/account.
+ * Several TUI processes share one preference file, and an old process can
+ * remount a stale panel — without this check it overwrites the last good
+ * choice with a selector that matches nothing.
+ */
+export function rememberable(options, selected) {
+  if (!Array.isArray(options) || !Array.isArray(selected) || selected.length !== 1) return false;
+  return options.some(row => row && (row.id === selected[0] || String(row.id).startsWith(`${selected[0]}:`)));
+}
+
 export function meterModel(cache, selector, now = Date.now()) {
   const model = panelModel(cache, [selector], now);
   const row = model.rows.find(item => item.id === selector) || model.rows[0];
@@ -434,8 +456,14 @@ export default function register(sdk) {
         sdk.openWidget(picker, picker.init(''));
         return;
       }
-      // Showing the dock IS the preference: this is what makes it survive a restart.
-      void markDockVisible(prefs, selected);
+      // Showing the dock IS the preference: this is what makes it survive a
+      // restart. Only persist a selection the cache still resolves, so an old
+      // TUI remounting a stale panel cannot clobber the last good choice.
+      void (async () => {
+        try {
+          if (rememberable(pickerOptions(await readCache()), selected)) await markDockVisible(prefs, selected);
+        } catch { /* an unreadable cache keeps the previous preference */ }
+      })();
       const poller = createPoller({ read: readCache, refresh: refreshCache, onUpdate: setSnapshot });
       void poller.tick();
       const timer = setInterval(() => { setNow(Date.now()); void poller.tick(); }, 15000);
@@ -450,8 +478,15 @@ export default function register(sdk) {
   function Picker({ state, t, cols, rows }) {
     React.useEffect(() => {
       let mounted = true;
-      readCache().then(cache => {
-        if (mounted) sdk.updateWidget(picker, current => ({ ...current, phase: 'ready', options: pickerOptions(cache), stale: panelModel(cache).stale, special: specialNoticeText(cache, Date.now(), cols) }));
+      // Start on the remembered provider so a restart does not silently move
+      // the cursor back to the first cached row.
+      Promise.all([readCache(), prefs.load()]).then(([cache, saved]) => {
+        if (!mounted) return;
+        const options = pickerOptions(cache);
+        const remembered = chosen || saved.selected || null;
+        sdk.updateWidget(picker, current => ({ ...current, phase: 'ready', options, current: remembered,
+          index: rememberedIndex(options, remembered), stale: panelModel(cache).stale,
+          special: specialNoticeText(cache, Date.now(), cols) }));
       }, () => {
         if (mounted) sdk.updateWidget(picker, current => ({ ...current, phase: 'error' }));
       });
@@ -470,7 +505,7 @@ export default function register(sdk) {
               : !visible.length ? [h(Text, { key: 'empty' }, 'No configured providers in cache. Run /quota refresh.')]
                 : visible.map((option, index) => h(Text, { key: option.id, wrap: 'truncate-end',
                   color: start + index === state.index ? t.color.primary : t.color.text,
-                  bold: start + index === state.index }, `${start + index === state.index ? '›' : ' '} ${option.label} · ${option.unavailable ? 'unavailable' : 'cached'}`))),
+                  bold: start + index === state.index }, `${start + index === state.index ? '›' : ' '} ${option.label} · ${option.unavailable ? 'unavailable' : 'cached'}${option.id === state.current ? ' · current' : ''}`))),
           h(Text, { color: t.color.muted }, state.phase === 'ready' ? `${state.options.length ? state.index + 1 : 0}/${state.options.length}${state.stale ? ' · STALE snapshot' : ''}` : ' '),
         )),
     );

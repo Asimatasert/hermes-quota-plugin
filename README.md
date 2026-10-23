@@ -12,6 +12,8 @@ See provider quotas, reset times and account balances in Hermes Desktop and the 
 - Honest unavailable states and opt-in access to sensitive credential sources.
 - Optional Ink TUI quota chip with an interactive account picker and theme colors.
 - Codex special-reset announcements, separate from account renewals, with data from [Codex Resets](https://codex-resets.com/).
+- A bundled `quota-check` skill (`quota:quota-check`) teaching agents to check
+  quota before long work and to ask before splitting tasks or switching models.
 
 ## Install
 
@@ -54,6 +56,17 @@ Additional accounts are explicitly configured by directory and display label. La
 
 Extra Claude accounts are opt-in and read-only: no refresh-token exchange, credential write-back or tokens in the display cache. Requests identify this plugin rather than Claude Code. Primary-account resolution remains Hermes-core behavior. Other providers may use opt-in browser/OS credential-store reads and vendor client identities; see [provider disclosures](docs/providers.md). Python plugins are trusted host code, not sandboxed applications. Third-party login reads require disclosure and maintainer judgment for catalog admission. [Security details and limitations](docs/security.md).
 
+## Grok authentication
+
+Grok is opt-in. When enabled, the provider reuses Hermes' existing `xai-oauth`
+access token as a Bearer token for the Grok billing endpoint. If the token is
+unavailable or the endpoint rejects it as an authentication failure, the
+provider preserves the browser fallback chain: `~/grok_session.json`, Firefox,
+then Chromium/Chrome/Brave cookies. On Windows, Chromium cookie values use the
+current user's DPAPI-protected Local State key and AES-256-GCM `v10`/`v11`
+decryption. App-Bound `v20` cookies remain unsupported and are reported as
+`chrome-app-bound`; cookie values are never printed or written back.
+
 ## Documentation
 
 - [Installation, profiles and updates](docs/installation.md)
@@ -63,6 +76,7 @@ Extra Claude accounts are opt-in and read-only: no refresh-token exchange, crede
 - [Codex special-reset announcements and source limitations](docs/codex-special-reset.md)
 - [Troubleshooting—including remote names/icons](docs/troubleshooting.md)
 - [Development and tests](docs/development.md) · [Add a provider](docs/add-provider.md)
+- [Release process](docs/release-process.md)
 - [Acknowledgements](docs/contributors.md)
 
 MIT · [License](LICENSE)

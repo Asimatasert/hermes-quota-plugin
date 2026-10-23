@@ -433,6 +433,36 @@ def refresh_quota_cache(*, budget: Optional[float] = None) -> dict[str, Any]:
         for provider_id, _fetcher in items:
             record = results.get(provider_id) or _unavailable_record(provider_id, "timeout")
             providers.update(_expand_accounts(provider_id, record))
+        # A sweep whose registry is incomplete (a stub registry in a test, an
+        # import race) must not delete providers it never tried. Carry the
+        # previous record forward, marked so the display never presents it as
+        # current.
+        swept = {provider_id for provider_id, _fetcher in items}
+        previous_providers = read_quota_cache().get("providers") or {}
+        orphans = [key for key in previous_providers
+                   if str(key).split(":", 1)[0] not in swept]
+        for key in orphans:
+            record = previous_providers.get(key)
+            if not isinstance(record, dict):
+                continue
+            # Keep the identity (label/plan) and the note, drop the numbers: a
+            # sweep that never tried this provider cannot claim its windows are
+            # current, and both the CLI and the widget render windows whenever
+            # they exist.
+            carried = dict(record)
+            carried["unavailable_reason"] = "not-refreshed"
+            carried["windows"] = []
+            carried["account_balances"] = []
+            carried["api_calls_available"] = None
+            note = "Not refreshed in this sweep: the provider registry was incomplete"
+            details = [d for d in (carried.get("details") or []) if d != note]
+            details.append(note)
+            carried["details"] = details
+            providers[key] = carried
+    if orphans:
+        logger.warning(
+            "quota_cache ▸ sweep covered %d provider(s), kept %d from the previous cache",
+            len(swept), len(orphans))
 
     special = special_result.get("entry") if special_done.is_set() else None
     if not isinstance(special, dict):
