@@ -5,3 +5,4 @@ author: rarf
 kind: standalone
 provides_commands:
   - quota
+provides_tools: []

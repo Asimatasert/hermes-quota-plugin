@@ -21,8 +21,10 @@ DRIVER = Path(__file__).resolve().parent / 'widget_multicard.cjs'
 
 LABELS = ('alpha.gmail', 'beta.gmail', 'gamma.gmail', 'delta.mail')
 
-# toneColor() values of the shared light contract.
-GOOD, WARN, BAD = 'var(--ui-accent)', 'var(--ui-yellow)', 'var(--ui-red)'
+# toneColor() values of the shared light contract. "good" is --ui-green since
+# the Agent Bar look (same token core uses for an "ok" dot); the pane card dots
+# and the status lights share toneColor, so both surfaces follow it.
+GOOD, WARN, BAD = 'var(--ui-green)', 'var(--ui-yellow)', 'var(--ui-red)'
 GREY = 'var(--ui-stroke-tertiary)'  # toneColor('muted')
 
 
@@ -130,12 +132,21 @@ def card_buttons(tree):
 
 
 def box_with_text(tree, marker):
-    """The elevated card box of the provider whose display name is marker."""
+    """The elevated card box of the provider whose display name is marker.
+
+    The Agent Bar look paints the card with an inline
+    ``background: var(--ui-bg-elevated)`` instead of a Tailwind class (the host
+    ships a prebuilt sheet, so plugin-only utilities are not guaranteed); accept
+    either form so the assertion follows whichever frame the widget uses.
+    """
     for n in flat(tree):
-        if (isinstance(n, dict) and n.get('type') == 'div'
-                and 'bg-(--ui-bg-elevated)' in n.get('props', {}).get('className', '')
-                and marker in text(n)):
-            return n
+        if isinstance(n, dict) and n.get('type') == 'div':
+            props = n.get('props', {}) or {}
+            style = props.get('style') or {}
+            elevated = ('bg-(--ui-bg-elevated)' in (props.get('className') or '')
+                        or style.get('background') == 'var(--ui-bg-elevated)')
+            if elevated and marker in text(n):
+                return n
     raise AssertionError(f'no elevated card box for {marker!r}')
 
 
@@ -252,7 +263,7 @@ class MultiCardPaneTests(unittest.TestCase):
 
     def test_status_bar_single_row_provider_keeps_the_plain_chip(self):
         # Guard (green before and after the fix): a lone row still renders
-        # [dot, name, value] — never a multi-light row, never merged.
+        # [indicator, name, value] — never a multi-light row, never merged.
         data = {'fetched_at': '2026-01-02T03:04:05Z', 'age_s': 3, 'providers': {
             'deepseek': {'windows': [{'label': 'Weekly', 'used_percent': 10.0}]}}}
         out = render(component='status', data=data)
@@ -260,10 +271,16 @@ class MultiCardPaneTests(unittest.TestCase):
         self.assertEqual(len(buttons), 1)
         spans = buttons[0]['props']['children']
         self.assertEqual(len(spans), 3)
-        self.assertIn('h-1.5 w-1.5 rounded-full', spans[0]['props']['className'])
+        # Agent Bar look: a percentage gets the mini ring gauge; the plain dot
+        # remains for balance/availability-only chips. Both are the shared
+        # indicator, so accept either and never a merged multi-light row.
+        indicator = spans[0]
+        is_dot = 'h-1.5 w-1.5 rounded-full' in (indicator['props'].get('className') or '')
+        self.assertTrue(is_dot or 'data-ring' in indicator['props'],
+                        'the chip must lead with a dot or its ring gauge')
         self.assertEqual(spans[1]['props']['children'], 'DeepSeek')
         self.assertEqual(spans[2]['props']['children'], '90%')
-        self.assertEqual(len(lights), 1)
+        self.assertEqual(len(lights), 1 if is_dot else 0)
 
     def test_status_bar_merges_any_provider_with_siblings_not_just_commandcode(self):
         data = {'fetched_at': '2026-01-02T03:04:05Z', 'age_s': 3, 'providers': {

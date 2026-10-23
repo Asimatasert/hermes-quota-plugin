@@ -68,6 +68,13 @@ function renderWidget(options = {}) {
     }),
     useQueryClient: () => ({ invalidateQueries: () => {} }), useMutation: () => ({}),
     Tip: (props) => ({ type: 'Tip', props }),
+    // SDK surfaces the merged widget relies on (Popover*, ConfirmDialog).
+    // Radix Popover.Root renders no element; the card is only built while open
+    // (useState(false) here), so a closed chip stays Tip > trigger > button.
+    Popover: (props) => { const kids = [].concat(props.children).filter(Boolean); return kids.length === 1 ? kids[0] : { type: 'Popover', props }; },
+    PopoverTrigger: (props) => props.children,
+    PopoverContent: (props) => ({ type: 'PopoverContent', props }),
+    ConfirmDialog: (props) => ({ type: 'ConfirmDialog', props }),
     StatusDot: ({ tone }) => jsx('span', { 'data-tone': tone }),
     Input: 'input', Switch: 'input', SegmentedControl: 'span', icons: {},
     host: { state: { focusedSessionOwner: { get: () => null, set: () => {}, subscribe: () => () => {} } } },

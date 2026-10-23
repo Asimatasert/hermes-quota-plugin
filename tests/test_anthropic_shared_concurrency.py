@@ -41,8 +41,13 @@ def store_worker(directory, token, gate):
         b._open_anthropic_cooldown(token)
 
 
-def load_worker(directory, result):
+def load_worker(directory, result, ready):
     b._backoff_state_path = lambda: str(Path(directory)/'backoff.json')
+    original = b._read_anthropic_state
+    def signal_reader(path):
+        ready.set()
+        return original(path)
+    b._read_anthropic_state = signal_reader
     result.put(b._load_shared_payload('synthetic'))
 
 
@@ -100,9 +105,14 @@ class SharedConcurrencyTests(unittest.TestCase):
         ctx = multiprocessing.get_context('spawn')
         with tempfile.TemporaryDirectory() as directory:
             os.mkfifo(Path(directory)/b._ANTHROPIC_SHARED_FILENAME)
-            result = ctx.Queue()
-            process = ctx.Process(target=load_worker, args=(directory, result))
+            ready, result = ctx.Event(), ctx.Queue()
+            process = ctx.Process(target=load_worker, args=(directory, result, ready))
             process.start()
+            reached_read = ready.wait(10)
+            if not reached_read:
+                process.join(.1)
+                if process.is_alive(): process.kill(); process.join()
+                self.fail('worker did not reach the shared-state read')
             process.join(1)
             blocked = process.is_alive()
             if blocked: process.kill(); process.join()

@@ -4,6 +4,47 @@
 
 See provider quotas, reset times and account balances in Hermes Desktop and the CLI—without adding network calls to every UI render.
 
+**3.0 adds Agent Monitor:** an opt-in view of live Hermes sessions, context usage,
+model health, usage estimates and quota history inside Desktop. No separate
+monitoring server. Existing quota views remain available without enrollment.
+
+## New in 3.0
+
+- Quota history and burn-rate forecasts, when enough readings are available.
+- Live session states and attention indicators for the selected profile.
+- Model health, fallback-chain visibility and recorded usage estimates.
+- Status-bar agent chips, context guard and configurable notifications.
+- Localized monitor UI: English, Turkish, German, Spanish, French, Russian,
+  Japanese, Simplified Chinese, Traditional Chinese and Arabic (RTL).
+
+Agent Monitor ships **off by default**. Enable collection only for the profile
+that you want to monitor:
+
+```bash
+hermes config set plugins.entries.quota.settings.monitorEnabled true
+```
+
+For a named profile, use `hermes -p <profile> config set` with the same setting.
+Disable it by setting the value to `false`. Disabling stops collection; it does
+not erase previously collected history.
+
+This first release deliberately keeps the hardened read-only scope from the
+trial: no sibling-profile collection, external CLI transcripts, shared Kanban
+boards, new credential-store reads, account/budget mutations or monitor agent
+tools. Tabs for unavailable capabilities do not enable them. Usage costs are
+**estimated API-price equivalents, not invoices**; month-end spending projection
+is not provided. [Monitor behavior, privacy and limitations →](docs/monitor.md)
+
+### Thank you, @Asimatasert
+
+A huge thank-you to [@Asimatasert](https://github.com/Asimatasert) for proposing
+and implementing the Agent Monitor integration, bringing the work from
+[agent-monitor](https://github.com/Asimatasert/agent-monitor) into Hermes Quota,
+and contributing the backend, Desktop views, localization and tests. This is
+the contribution behind the 3.0 milestone. The integration retains the existing
+quota architecture and adds maintainer-side safety boundaries and fixes.
+[Original proposal #83](https://github.com/rarf/hermes-quota-plugin/issues/83).
+
 ## What you get
 
 - A docked pane and status-bar indicator with per-provider usage.

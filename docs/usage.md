@@ -55,6 +55,27 @@ Antigravity (Google AI Pro)
 - Hover for the full breakdown: **every provider and every window** (Session,
   Spark 5h, Spark Weekly…) with `% left` and time-to-reset.
 
+### Context guard
+
+The core status bar already shows the focused chat's context, so this chip only
+appears when something needs action: the focused chat at or over the warning
+threshold (`◔ 84%`, `+2` when other sessions are over too), or other open
+Hermes sessions over it (`2 sessions ≥ 80%`). Yellow from the threshold
+(70 / 80 / 90 %, default 80), red from 90 %.
+
+- Click: the focused chat's ring (used / max tokens, compressions so far, `≈`
+  when estimated), **Compress…** with a confirm step and an optional focus topic
+  — it sends `/compress [topic]` through the chat's composer, exactly like
+  typing it, and is disabled while the chat is working — plus the other
+  sessions over the threshold (click opens one) and **Open Live**.
+- Live view: a small ring and percent on each Hermes session with a known
+  window; rows over the threshold get a tone stripe and sort first within their
+  state.
+- Notifications (`Context window filling up`): once per session per level
+  (threshold, 90 %); a session that drops well below re-arms; clicking opens it.
+- Sidebar: `ctx 92%` joins the Quota entry while the focused chat is at 90 %+.
+- Settings ▸ Status bar & sidebar: the chip switch and the threshold.
+
 ### Quota pane
 
 Reachable three ways: the **docked pane** (`Placement: right`, 300px, toggled in
@@ -73,9 +94,7 @@ icon).
 - Footer: `Checked Jan 15, 2025, 12:34:56 PM UTC · 46s old · poll 60s`,
   localized with the full date, seconds and timezone. Provider cards scroll
   separately so long balance details cannot overlap the footer.
-- Notices when something is off: an **update available** banner (checked against
-  the installed build) and a **version-skew** notice when the widget and the
-  backend are not the same build.
+- A **version-skew** notice when the backend reports a different plugin version.
 
 ### Settings
 
@@ -90,6 +109,21 @@ Everything lives in the pane's **Quota Settings** view and persists locally:
 | Refresh interval | 15–600 s | `600` |
 | Enabled providers | toggle any provider on/off (cherry-pick) | all on |
 | Show docked quota pane | on · off | on |
+| Agent monitor | on · off (widget-local views and polling; backend enrollment is separate) | off |
+
+The **Agent monitor** switch only controls this widget's monitor views and CLI
+polling. Turning it on does **not** enroll backend collection; enable the
+monitor separately on the gateway for the intended profile:
+
+```bash
+hermes config set plugins.entries.quota.settings.monitorEnabled true
+# Named profile:
+hermes -p <profile> config set plugins.entries.quota.settings.monitorEnabled true
+```
+
+Turning the widget switch off stops its polling but leaves the backend setting
+unchanged. Set `monitorEnabled` to `false` on the backend profile to stop
+collection there.
 
 ### Commands
 

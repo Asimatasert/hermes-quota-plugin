@@ -622,7 +622,11 @@ class CodexWidgetTests(unittest.TestCase):
         self.assertIn("Synthetic Amber", text(pane))
         self.assertIn("Synthetic Blue", text(pane))
         self.assertIn("Synthetic Amber", json.dumps(pane))
-        self.assertEqual(len([n for n in nodes(pane) if n.get("type") == "svg"]), 1)
+        # Agent Bar look: the card's windows are ring gauges (SVGs too), so
+        # count the provider badge icon specifically instead of every <svg>.
+        badge_icons = [n for n in nodes(pane) if n.get("type") == "svg"
+                       and n.get("props", {}).get("className") == "text-[0.875rem]"]
+        self.assertEqual(len(badge_icons), 1)
         self.assertIn("79% left", text(pane))     # the selected account's detail
         self.assertNotIn("58% left", text(pane))  # the other account is a button
         worst = render(component="status", statusMode="worst", data=data)
