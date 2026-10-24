@@ -1,0 +1,33 @@
+#!/bin/sh
+# Fake `hermes` for tests and screenshots: prints the SYNTHETIC fixtures in Tests/Fixtures with their
+# __T(+s)__ / __ISO(+s)__ / __DAY__ placeholders expanded relative to now. Never touches a real Hermes.
+#   FAKE_SNAPSHOT=snapshot-off.json   pick another snapshot fixture
+#   FAKE_PLAN=unsupported             answer `monitor plan` like an older plugin (usage text, exit 2)
+#   FAKE_SLEEP=<s>                    delay every answer (timeout tests)
+#   FAKE_LOG=<file>                   append each argv (one line) to <file>
+set -eu
+DIR="$(cd "$(dirname "$0")" && pwd)/Fixtures"
+[ -n "${FAKE_LOG:-}" ] && echo "$*" >> "$FAKE_LOG"
+[ -n "${FAKE_SLEEP:-}" ] && sleep "$FAKE_SLEEP"
+[ "${1:-}" = "-p" ] && shift 2
+[ "${1:-}" = "quota" ] || { echo "fake hermes: only 'quota' is faked" >&2; exit 2; }
+shift
+case "${1:-} ${2:-}" in
+  "status "*) file="status.json" ;;
+  "monitor snapshot") file="${FAKE_SNAPSHOT:-snapshot.json}" ;;
+  "monitor history") file="history.json" ;;
+  "monitor plan")
+    if [ "${FAKE_PLAN:-}" = "unsupported" ]; then cat "$DIR/plan-unsupported.txt"; exit 2; fi
+    file="plan.json" ;;
+  *) echo "fake hermes: unsupported: $*" >&2; exit 2 ;;
+esac
+exec /usr/bin/python3 - "$DIR/$file" <<'PY'
+import datetime, re, sys, time
+now = time.time()
+text = open(sys.argv[1], encoding="utf-8").read()
+iso = lambda s: datetime.datetime.fromtimestamp(now + s, datetime.timezone.utc).isoformat()
+text = re.sub(r"__ISO\(([-+]?\d+)\)__", lambda m: iso(int(m.group(1))), text)
+text = re.sub(r"__T\(([-+]?\d+)\)__", lambda m: repr(round(now + int(m.group(1)), 3)), text)
+text = text.replace("__DAY__", datetime.date.today().isoformat())
+sys.stdout.write(text)
+PY

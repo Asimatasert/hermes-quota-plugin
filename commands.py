@@ -16,7 +16,8 @@ CLI:
     hermes quota provider X   → single provider
     hermes quota monitor ...  → Agent Monitor views as JSON (snapshot, history,
                                 recommend, budget, set-budget, accounts,
-                                set-priority, set-strategy; see docs/monitor.md)
+                                set-priority, set-strategy, companion; see
+                                docs/monitor.md)
 """
 
 from __future__ import annotations
@@ -529,6 +530,8 @@ def _setup_monitor_argparse(subs) -> None:
     setb.add_argument("--daily", type=float, default=None)
     setb.add_argument("--monthly", type=float, default=None)
     acc = msubs.add_parser("accounts", help="Credential pools, strategies, fallbacks and sign-in gaps (read-only)")
+    comp = msubs.add_parser("companion", help="The optional macOS notch / menu bar app (macos/): installed, running, notch")
+    comp.add_argument("--open", dest="open_app", action="store_true", help="Start the installed app (macOS only)")
     setp = msubs.add_parser("set-priority", help="Reorder one pooled credential via `hermes auth priority`")
     setp.add_argument("--provider", required=True)
     setp.add_argument("--target", required=True, help="Short pool id of the credential (see `accounts`)")
@@ -540,7 +543,7 @@ def _setup_monitor_argparse(subs) -> None:
         # The pool owner / profile to change. `hermes --profile X ...` also selects X when this is omitted
         # (Hermes consumes the first --profile flag as the process profile).
         p.add_argument("--profile", "--target-profile", dest="target_profile", default=None)
-    for p in (mon, snap, hist, rec, bud, setb, acc, setp, sets):
+    for p in (mon, snap, hist, rec, bud, setb, acc, comp, setp, sets):
         p.add_argument("--json", action="store_true", help="Emit JSON (the only output format)")
 
 
@@ -563,6 +566,9 @@ def _handle_monitor(args) -> int:
             payload = qm.set_budget(getattr(args, "daily", None), getattr(args, "monthly", None))
         elif cmd == "accounts":
             payload = qm.accounts_view()
+        elif cmd == "companion":
+            from .quota_monitor import companion
+            payload = companion.open_app() if getattr(args, "open_app", False) else companion.info()
         elif cmd == "set-priority":
             payload = qm.set_priority(args.provider, args.target, args.priority, getattr(args, "target_profile", None))
         elif cmd == "set-strategy":

@@ -93,7 +93,28 @@ The localized monitor UI includes English, Turkish, German, Spanish, French,
 Russian, Japanese, Simplified Chinese, Traditional Chinese and Arabic (RTL).
 Native notifications depend on SDK support, OS permission and app settings.
 Missing platform capabilities degrade to unavailable/empty values. The original
-standalone app's native menu-bar/notch widgets are not included.
+standalone app's native menu-bar/notch widgets are not part of the Desktop
+plugin; an optional native companion lives in `macos/` (below).
+
+## Notch island companion (macOS, optional)
+
+Desktop plugins cannot draw outside the Hermes window, so the notch island and
+menu bar extra ship as a separate native app, **Quota Notch**, in
+[`macos/`](../macos/README.md). It polls `hermes quota monitor snapshot --json`
+and `hermes quota status --json --cached` (plus `history`/`plan` when a panel
+opens); it has no server, no network access and reads no credentials. Install it
+with `macos/install.sh`; the plugin's own installer copies the sources but never
+builds or starts it.
+
+```bash
+hermes quota monitor companion --json          # platform, installed, running, notch
+hermes quota monitor companion --open --json   # macOS only: open -a "Quota Notch.app"
+```
+
+`notch` comes from `quota_notch.json` in the Hermes root, written by the app
+(the renderer cannot detect a notch); it is `null` until the app has run once.
+`companion` needs no monitor enrollment. Quota ▸ Settings shows a "Notch island
+(macOS)" card on Mac renderers only.
 
 ## Attribution
 

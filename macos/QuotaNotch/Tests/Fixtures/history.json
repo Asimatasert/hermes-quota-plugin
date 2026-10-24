@@ -1,0 +1,7 @@
+{"monitor_version": 1, "generated_at": __T(0)__, "days": 1,
+ "history": [
+   {"provider": "anthropic", "window": "Current session", "points": [[__T(-3600)__, 20.0], [__T(-1800)__, 41.0], [__T(-60)__, 58.0]]},
+   {"provider": "anthropic", "window": "Current week", "points": [[__T(-3600)__, 40.0], ["bad", 1], [__T(-60)__, 41.0]]},
+   {"window": "missing provider", "points": []}
+ ],
+ "burn": [], "errors": {}}

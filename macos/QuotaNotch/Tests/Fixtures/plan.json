@@ -1,0 +1,6 @@
+{"monitor_version": 1, "generated_at": __T(0)__, "plan_version": 1, "enrolled": true, "degraded": false,
+ "providers": [{"base": "anthropic", "multi": null, "accounts": [
+   {"provider": "anthropic", "plannable": true, "label": "anthropic", "pace": {"verdict": "over"},
+    "summary": "On pace to run out ~6h before the week resets; slow to about 9% per session."},
+   {"provider": "anthropic:home", "plannable": false, "reason": "no long window"}]}],
+ "errors": {}}
