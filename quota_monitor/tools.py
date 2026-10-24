@@ -5,6 +5,11 @@ agent, so other sessions' content cannot steer it.
 
 Trial contract: the tools do not register, and every handler refuses direct invocation before reading any
 monitor data (a tool registry from an older session cannot be used to bypass the backend boundary).
+
+One exception, separately opt-in: ``get_quota_plan`` registers only when
+``plugins.entries.quota.settings.planToolEnabled`` is the literal YAML boolean ``true`` (default off) and
+re-checks that setting on every call. It returns numbers and enum codes only (accounts are ``1..N`` in pool
+order; no labels, titles, ids, paths or provider error text), so an agent can pace itself.
 """
 
 from __future__ import annotations
@@ -166,16 +171,141 @@ TOOLS = (
 )
 
 
+# ---------- opt-in pacing tool (planToolEnabled) ----------
+
+PLAN_TOOL_SETTING = "planToolEnabled"
+_CODE_RE = None
+
+
+def plan_tool_enabled() -> bool:
+    """Only the literal YAML boolean ``true`` in the active profile's config enables the plan tool."""
+    from .common import hermes_home, read_config
+    node: Any = read_config(hermes_home())
+    for part in ("plugins", "entries", "quota", "settings", PLAN_TOOL_SETTING):
+        node = node.get(part) if isinstance(node, dict) else None
+    return node is True
+
+
+def _code(value: Any, fallback: str = "unavailable") -> Optional[str]:
+    """A machine code (``token-expired``, ``http-429``...) or ``fallback``; never free text."""
+    global _CODE_RE
+    import re
+    if value is None:
+        return None
+    _CODE_RE = _CODE_RE or re.compile(r"^[a-z0-9][a-z0-9_:-]{0,39}$")
+    return value if isinstance(value, str) and _CODE_RE.match(value) else fallback
+
+
+def _num(value: Any) -> Optional[float]:
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def plan_for_agent(payload: Dict[str, Any], now: Optional[float] = None) -> Dict[str, Any]:
+    """Reduce a ``plan_payload()`` to numbers and enums; accounts become 1-based pool positions."""
+    import time
+    now = time.time() if now is None else now
+
+    def rel(ts: Any) -> Optional[int]:
+        return int(round(ts - now)) if _num(ts) is not None else None
+
+    providers = []
+    for prov in payload.get("providers") or []:
+        accounts = []
+        for n, acc in enumerate(prov.get("accounts") or []):
+            row: Dict[str, Any] = {"account": n + 1, "plannable": bool(acc.get("plannable"))}
+            pool = acc.get("pool") if isinstance(acc.get("pool"), dict) else {}
+            if _num(pool.get("priority")) is not None:
+                row["pool_position"] = int(pool["priority"])
+            if not acc.get("plannable"):
+                row["reason"] = _code(acc.get("reason"))
+                accounts.append(row)
+                continue
+            win, cur, proj = acc["windows"], acc["current"], acc["projection"]
+            row.update({
+                "session_used_pct": _num(win["short"]["used"]), "session_running": bool(cur["running"]),
+                "seconds_to_session_reset": rel(cur.get("reset")),
+                "week_used_pct": _num(win["long"]["used"]), "week_left_pct": _num(acc["week_left"]),
+                "seconds_to_week_reset": rel(win["long"]["reset"]),
+                "sessions_left_calendar": acc["sessions"]["calendar"], "sessions_left_active": acc["sessions"]["active"],
+                "sessions_source": _code(acc["sessions"]["pattern"]),
+                "week_pct_per_session_pct": _num(acc["ratio"]["value"]),
+                "ratio_confidence": _code(acc["ratio"]["confidence"]),
+                "budget_week_pct_per_session": _num(acc["budget"]["week_per_session"]),
+                "budget_session_pct_per_session": _num(acc["budget"]["session_per_session"]),
+                "current_session_target_pct": _num(cur["target_used"]), "current_state": _code(cur["state"]),
+                "current_can_fill": bool(cur["can_fill"]),
+                "projected_week_at_reset_pct": _num(proj["week_at_reset"]),
+                "projection_method": _code(proj["method"]),
+                "exhausts_before_reset": bool(proj["exhausts_before_reset"]),
+                "seconds_to_exhaust": rel(proj.get("exhaust_at")),
+                "pace": _code(acc["pace"]["verdict"]),
+                "extra_session_pct": _num(acc["pace"]["extra_session_pct"]),
+                "slow_to_session_pct": _num(acc["pace"]["slow_to_session_pct"]),
+                "confidence": _code(acc["confidence"]),
+            })
+            accounts.append(row)
+        multi = prov.get("multi")
+        out_multi = None
+        if isinstance(multi, dict):
+            def pos(i: Any) -> Optional[int]:
+                return int(i) + 1 if _num(i) is not None else None
+            out_multi = {"strategy": _code(multi.get("strategy")), "use_account": pos(multi.get("use_index")),
+                         "headroom_account": pos(multi.get("headroom_index")), "advice": _code(multi.get("advice")),
+                         "combined_week_left_pct": _num(multi.get("combined_week_left")),
+                         "combined_week_pct_per_session": _num(multi.get("combined_week_per_session"))}
+        providers.append({"provider": _code(prov.get("base"), "provider"), "accounts": accounts, "multi": out_multi})
+    return {"plan_version": payload.get("plan_version"), "degraded": bool(payload.get("degraded")),
+            "history_readings": _num(payload.get("history_readings")), "providers": providers}
+
+
+def get_quota_plan(args: Optional[Dict[str, Any]] = None, **_kwargs: Any) -> str:
+    try:
+        if not plan_tool_enabled():
+            return _dump({"error": "the quota plan tool is off", "error_code": "plan-tool-disabled"})
+        from . import plan_payload
+        out = plan_for_agent(plan_payload())
+        provider = (args or {}).get("provider")
+        if isinstance(provider, str) and provider:
+            out["providers"] = [p for p in out["providers"] if p["provider"] == provider]
+        return _dump(out)
+    except Exception as e:  # never leak a traceback / upstream text: the error class is enough
+        return _dump({"error": "quota plan unavailable (%s)" % type(e).__name__})
+
+
+PLAN_TOOL = (get_quota_plan, _schema(
+    "get_quota_plan",
+    "Quota pacing for subscription accounts with a 5-hour session and a weekly window (Anthropic, Codex): "
+    "sessions left before the weekly reset, weekly %% budget per session (and as session %%), whether the "
+    "current session can be used to 100%%, projected weekly %% at reset, pace verdict (under, on_track, over) "
+    "and, for several pooled accounts, which one (1..N in pool order) to use now. Numbers and codes only; "
+    "read-only, local, no network. Call before long or expensive work to decide whether to slow down or pick a "
+    "cheaper model.".replace("%%", "%"),
+    {"provider": _str("Filter to one provider (e.g. anthropic, openai-codex).")}), "🗓️")
+
+
 def register_tools(ctx: Any) -> List[str]:
     """Register every tool on a Hermes plugin context; returns the names registered.
 
-    The read-only trial registers none: agents cannot gain monitor scope through the tool registry.
+    The read-only trial registers none of the monitor tools: agents cannot gain monitor scope through the
+    tool registry. ``get_quota_plan`` registers only while ``planToolEnabled`` is literally true.
     """
-    if not trial.AGENT_TOOLS:
-        return []
-    done = []
+    done: List[str] = []
     register = getattr(ctx, "register_tool", None)
     if not callable(register):
+        return done
+    try:
+        plan_on = plan_tool_enabled()
+    except Exception:
+        plan_on = False
+    if plan_on:
+        handler, schema, emoji = PLAN_TOOL
+        try:
+            register(name=schema["name"], toolset=TOOLSET, schema=schema, handler=handler,
+                     description=schema["description"], emoji=emoji)
+            done.append(schema["name"])
+        except Exception:
+            pass
+    if not trial.AGENT_TOOLS:
         return done
     for handler, schema, emoji in TOOLS:
         try:

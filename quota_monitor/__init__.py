@@ -6,6 +6,7 @@ Entry points (each returns one JSON-able dict carrying ``monitor_version`` and `
 * ``history_payload(days)`` — ``hermes quota monitor history --json``;
 * ``recommend_payload(...)`` — ``hermes quota monitor recommend --json``;
 * ``set_budget(daily, monthly)`` / ``budget_payload()`` — the budget the widget keeps in sync;
+* ``plan_payload()`` — ``hermes quota monitor plan --json`` (session vs week pacing, see quota_monitor/plan.py);
 * ``accounts_view()`` — ``hermes quota monitor accounts --json`` (credential pools, strategies, fallbacks,
   sign-in gaps); ``set_priority(...)`` / ``set_strategy(...)`` refuse in the trial.
 
@@ -156,6 +157,66 @@ def recommend_payload(prefer_provider: Optional[str] = None, exclude_providers: 
     inputs = _routing_inputs()
     out = advice.recommend_model(inputs["items"], inputs["burn"], inputs["health"], prefer_provider,
                                  exclude_providers, min_quota_left_pct, top)
+    return _stamp(out)
+
+
+PLAN_SETTING_ACTIVE_HOURS = "planActiveHours"
+
+
+def _quota_settings(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    node: Any = cfg
+    for part in ("plugins", "entries", "quota", "settings"):
+        node = node.get(part) if isinstance(node, dict) else None
+    return node if isinstance(node, dict) else {}
+
+
+def plan_payload(now: Optional[float] = None) -> Dict[str, Any]:
+    """``hermes quota monitor plan --json``: session vs week pacing per account (no network, no writes).
+
+    With the monitor enrolled the planner learns from ``quota_monitor.db`` history. Without enrollment it still
+    answers from the plugin's quota cache alone (the same data the Quota tab shows), marked ``degraded`` with
+    default ratios and no learned pattern; no monitor store is opened.
+    """
+    from . import plan, quotas, store
+    from .common import hermes_home, read_config
+
+    now = time.time() if now is None else float(now)
+    errors: Dict[str, str] = {}
+    timings: Dict[str, int] = {}
+    cfg = _run(errors, timings, "config", lambda: read_config(hermes_home()), {}) or {}
+    settings = _quota_settings(cfg)
+    active_hours = plan.parse_active_hours(settings.get(PLAN_SETTING_ACTIVE_HOURS))
+    tz_name = cfg.get("timezone") if isinstance(cfg.get("timezone"), str) else ""
+    tz = plan.local_tz(tz_name)
+    enrolled = trial.monitor_enrolled()
+    if enrolled:
+        cache = _run(errors, timings, "cache", quotas.read_cache, {}) or {}
+        rows = _run(errors, timings, "history",
+                    lambda: store.history_rows(now - plan.HISTORY_DAYS * 86400, now + 60), []) or []
+    else:
+        cache = _run(errors, timings, "cache", quotas.read_cache_unenrolled, {}) or {}
+        rows = []
+    items = _run(errors, timings, "items", lambda: quotas.cache_items(cache), []) or []
+    strategies = cfg.get("credential_pool_strategies") if isinstance(cfg.get("credential_pool_strategies"), dict) else {}
+    out = _run(errors, timings, "plan",
+               lambda: plan.build_plan(items, rows, now, tz, active_hours, history=enrolled,
+                                       strategies={k: v for k, v in strategies.items() if isinstance(v, str)}),
+               {"plan_version": plan.PLAN_VERSION, "providers": []})
+    for prov in out.get("providers", []):
+        for acc in prov.get("accounts", []):
+            acc["summary"] = plan.summary_sentence(acc, tz)
+    out.update({
+        "enrolled": enrolled,
+        "degraded": not enrolled,
+        "history_source": "monitor" if enrolled else "none",
+        "history_readings": len(rows),
+        "timezone": tz_name or "",
+        "fetched_at": cache.get("fetched_at") if isinstance(cache, dict) else None,
+        "settings": {"active_hours": active_hours is not None},
+        "defaults": {"ratio": plan.R_DEFAULT, "session_seconds": plan.SESSION_S, "week_seconds": plan.WEEK_S},
+        "errors": errors,
+        "timings_ms": timings,
+    })
     return _stamp(out)
 
 

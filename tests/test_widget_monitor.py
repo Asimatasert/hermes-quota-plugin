@@ -283,8 +283,8 @@ class MonitorViewsTest(unittest.TestCase):
     def test_tabs_and_settings(self):
         out = self.pane('quota')
         tabs = find(out['tree'], lambda n: 'data-tab' in n.get('props', {}))
-        self.assertEqual([n['props']['data-tab'] for n in tabs], ['quota', 'live', 'health', 'usage', 'kanban', 'accounts'])
-        self.assertEqual([n['props']['aria-selected'] for n in tabs], [True, False, False, False, False, False])
+        self.assertEqual([n['props']['data-tab'] for n in tabs], ['quota', 'plan', 'live', 'health', 'usage', 'kanban', 'accounts'])
+        self.assertEqual([n['props']['aria-selected'] for n in tabs], [True, False, False, False, False, False, False])
         settings = text(run(component='settings', data=quota_payload())['tree'])
         for expected in ('Agent monitor', 'Show working / your-turn chip', 'Burn rate, forecast and history',
                          'History range', 'Budget', 'Daily', 'Monthly', 'Notifications', 'Budget 80% / 100%',
@@ -294,8 +294,13 @@ class MonitorViewsTest(unittest.TestCase):
     def test_monitor_off_hides_tabs(self):
         out = run(component='pane', data=quota_payload(), monitor=snapshot(),
                   storage={'paneView': 'live', 'monitorEnabled': False})
-        self.assertFalse(find(out['tree'], lambda n: n.get('props', {}).get('data-monitor-tabs')))
+        # Only Quota and the cache-only Plan tab stay: the Plan tab works without the monitor.
+        tabs = find(out['tree'], lambda n: n.get('props', {}).get('data-tabs'))
+        self.assertEqual(tabs[0]['props']['data-tabs'], 'quota,plan')
         self.assertIn('Anthropic · work', text(out['tree']))  # falls back to the quota list
+        off = run(component='pane', data=quota_payload(), monitor=snapshot(),
+                  storage={'paneView': 'live', 'monitorEnabled': False, 'planTab': False})
+        self.assertFalse(find(off['tree'], lambda n: n.get('props', {}).get('data-monitor-tabs')))
 
     def test_old_backend_shows_quiet_notice(self):
         out = run(component='pane', data=quota_payload(), monitor={'unsupported': True}, storage={'paneView': 'health'})

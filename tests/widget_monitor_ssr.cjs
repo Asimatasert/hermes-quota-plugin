@@ -86,6 +86,7 @@ const sdk = {
     const key = opts.queryKey || [];
     if (key[1] === 'monitor') {
       if (key[2] === 'snapshot') return {data: options.monitor, isError: false, isLoading: false};
+      if (key[2] === 'plan') return {data: opts.enabled === false ? undefined : options.plan, isError: false, isLoading: false};
       return {data: opts.enabled === false ? undefined : options.history, isError: false};
     }
     return {data: options.data, isError: false, isLoading: false, isPlaceholderData: false};

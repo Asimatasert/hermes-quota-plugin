@@ -16,7 +16,7 @@ CLI:
     hermes quota provider X   → single provider
     hermes quota monitor ...  → Agent Monitor views as JSON (snapshot, history,
                                 recommend, budget, set-budget, accounts,
-                                set-priority, set-strategy; see docs/monitor.md)
+                                set-priority, set-strategy, plan; see docs/monitor.md)
 """
 
 from __future__ import annotations
@@ -524,6 +524,7 @@ def _setup_monitor_argparse(subs) -> None:
     rec.add_argument("--min-left", dest="min_left", type=int, default=10,
                      help="Minimum %% left in every quota window (default 10)")
     rec.add_argument("--top", type=int, default=3)
+    plan = msubs.add_parser("plan", help="Session vs week pacing per account (cache + history, no network)")
     bud = msubs.add_parser("budget", help="Spend today / month to date vs the stored budget")
     setb = msubs.add_parser("set-budget", help="Unavailable in the read-only trial (no budget writes)")
     setb.add_argument("--daily", type=float, default=None)
@@ -540,7 +541,7 @@ def _setup_monitor_argparse(subs) -> None:
         # The pool owner / profile to change. `hermes --profile X ...` also selects X when this is omitted
         # (Hermes consumes the first --profile flag as the process profile).
         p.add_argument("--profile", "--target-profile", dest="target_profile", default=None)
-    for p in (mon, snap, hist, rec, bud, setb, acc, setp, sets):
+    for p in (mon, snap, hist, rec, plan, bud, setb, acc, setp, sets):
         p.add_argument("--json", action="store_true", help="Emit JSON (the only output format)")
 
 
@@ -557,6 +558,8 @@ def _handle_monitor(args) -> int:
             exclude = [p.strip() for raw in (getattr(args, "exclude", None) or []) for p in raw.split(",") if p.strip()]
             payload = qm.recommend_payload(getattr(args, "prefer_provider", None) or None, exclude,
                                            getattr(args, "min_left", 10), getattr(args, "top", 3))
+        elif cmd == "plan":
+            payload = qm.plan_payload()
         elif cmd == "budget":
             payload = qm.budget_payload()
         elif cmd == "set-budget":

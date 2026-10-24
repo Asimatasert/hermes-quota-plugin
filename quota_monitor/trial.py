@@ -36,6 +36,17 @@ ACCOUNT_MUTATIONS = False
 BUDGET_WRITES = False
 
 
+# Opt-in widening (``monitorScope: all``, default ``active``): every Hermes profile's open sessions in the Live
+# view and the agents chip, plus Claude Code / Copilot CLI sessions (their local transcripts and session
+# stores, read-only). Only the literal string "all" in the ACTIVE profile's config widens; Kanban, credential
+# metadata, agent tools and writes stay unavailable either way.
+SCOPE_SETTING = "plugins.entries.quota.settings.monitorScope"
+SCOPE_ALL = "all"
+SCOPE_ACTIVE = "active"
+_SCOPE_TTL_S = 5.0
+_scope_cache: Dict[str, Any] = {"at": 0.0, "home": None, "value": SCOPE_ACTIVE}
+
+
 class TrialError(RuntimeError):
     """An operation the read-only trial refuses; ``code`` is machine readable."""
 
@@ -72,6 +83,63 @@ def require_enrollment() -> None:
     if not monitor_enrolled():
         raise TrialError("monitor-enrollment-off",
                          "Agent Monitor collection is off: set %s to true to enroll" % ENROLLMENT_SETTING)
+
+
+def monitor_scope(home: Optional[Path] = None) -> str:
+    """``"all"`` only when enrolled AND ``monitorScope`` is the literal string ``all``; else ``"active"``."""
+    import time
+    target = Path(home) if home is not None else hermes_home()
+    now = time.monotonic()
+    try:
+        stamp = (target / "config.yaml").stat().st_mtime_ns
+    except OSError:
+        stamp = None
+    key = "%s|%s" % (target, stamp)
+    if _scope_cache["home"] == key and now - _scope_cache["at"] < _SCOPE_TTL_S:
+        return _scope_cache["value"]
+    cfg = read_config(target)
+    value = SCOPE_ALL if (_value(cfg, ENROLLMENT_SETTING) is True
+                          and _value(cfg, SCOPE_SETTING) == SCOPE_ALL) else SCOPE_ACTIVE
+    _scope_cache.update(at=now, home=key, value=value)
+    return value
+
+
+def external_cli_collection() -> bool:
+    """Claude Code / Copilot CLI collection: off in the hardened default, on with ``monitorScope: all``."""
+    return bool(EXTERNAL_CLI_COLLECTION) or monitor_scope() == SCOPE_ALL
+
+
+def all_profile_homes() -> List[Tuple[str, Path]]:
+    """[("default", root), (name, root/profiles/name), ...]: every profile of this Hermes root."""
+    active = hermes_home()
+    root = active.parent.parent if active.parent.name == "profiles" else active
+    out = [("default", root)]
+    try:
+        profiles = root / "profiles"
+        if profiles.is_dir():
+            for p in sorted(profiles.iterdir()):
+                if p.is_dir() and not p.is_symlink() and not p.name.startswith("."):
+                    out.append((p.name, p))
+    except OSError:
+        pass
+    return out
+
+
+def live_homes(homes: Optional[Iterable[Tuple[str, Path]]] = None) -> List[Tuple[str, Path]]:
+    """Homes the Live view reads: every profile with ``monitorScope: all``, else the active one only."""
+    if monitor_scope() == SCOPE_ALL:
+        return all_profile_homes()
+    return allowed_homes(homes)
+
+
+def live_home_in_scope(home: Path) -> bool:
+    if monitor_scope() == SCOPE_ALL:
+        try:
+            target = Path(home).resolve()
+            return any(target == p.resolve() for _n, p in all_profile_homes())
+        except OSError:
+            return False
+    return home_in_scope(home)
 
 
 def active_label() -> str:

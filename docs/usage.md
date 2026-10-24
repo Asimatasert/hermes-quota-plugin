@@ -90,7 +90,15 @@ icon).
 - Providers without data collapse into a quiet **"No data (n)"** section — the
   default view shows only providers with live numbers.
 - **Pane detail**: `clean` (percentage windows and balance headlines) or `dense`
-  (every window, reset time and detail line). Dense is the default.
+  (every window and detail line). Dense is the default. Every window shows its
+  reset in both modes (and in the status-bar card); hover shows the countdown
+  and the absolute time in the Hermes timezone.
+- **Plan** tab: per account, sessions left until the weekly reset, the weekly
+  budget per session (as week % and session %), whether the current session can
+  be used to 100 %, the projected week at reset, a pace verdict, which pooled
+  account to use now and a week chart (actual vs even pace vs projection).
+  Works without the monitor (cache only, marked degraded); see
+  [monitor docs](monitor.md#plan-session-vs-week-pacing).
 - Footer: `Checked Jan 15, 2025, 12:34:56 PM UTC · 46s old · poll 60s`,
   localized with the full date, seconds and timezone. Provider cards scroll
   separately so long balance details cannot overlap the footer.
@@ -104,11 +112,12 @@ Everything lives in the pane's **Quota Settings** view and persists locally:
 | --- | --- | --- |
 | Status bar mode | `all providers` · `worst only` | `all providers` |
 | Show status bar indicator | on · off (the Hermes status bar must also be visible: ⌘K → Toggle status bar) | on |
-| Pane detail | `clean` — just the percentage bars · `dense` — windows, resets and detail lines | `dense` |
+| Pane detail | `clean` — rings with reset times · `dense` — plus detail lines | `dense` |
 | Reset format | `relative` (`2h 15m (14:30)`) · `absolute` (`14:30`) | `relative` |
 | Refresh interval | 15–600 s | `600` |
 | Enabled providers | toggle any provider on/off (cherry-pick) | all on |
 | Show docked quota pane | on · off | on |
+| Plan tab | on · off (cache-only plan without the monitor) | on |
 | Agent monitor | on · off (widget-local views and polling; backend enrollment is separate) | off |
 
 The **Agent monitor** switch only controls this widget's monitor views and CLI
@@ -137,6 +146,7 @@ collection there.
 | `hermes quota status --max-age N` | Refresh first when the cache is older than N seconds |
 | `hermes quota status --version-json` | Installed build stamp (update self-check) |
 | `hermes quota refresh` | Force a re-fetch of all providers |
+| `hermes quota monitor plan --json` | Session vs week pacing plan (no network) |
 | `hermes quota provider <name>` | One provider, e.g. `hermes quota provider anthropic` |
 | `hermes quota <provider-id>` | Shortcut, e.g. `hermes quota grok` |
 

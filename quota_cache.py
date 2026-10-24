@@ -175,6 +175,8 @@ def _result_to_record(res: QuotaResult) -> dict[str, Any]:
     }
     if res.account_label:
         record["account_label"] = res.account_label
+    if isinstance(res.pool, dict) and res.pool:
+        record["pool"] = dict(res.pool)
     if res.accounts:
         record["accounts"] = [
             ({
@@ -187,6 +189,7 @@ def _result_to_record(res: QuotaResult) -> dict[str, Any]:
                     {"label": w.label, "used_percent": w.used_percent, "reset_at": w.reset_at}
                     for w in account.windows
                 ],
+                **({"pool": dict(account.pool)} if isinstance(account.pool, dict) and account.pool else {}),
             } if isinstance(account, QuotaAccount) else _result_to_record(account))
             for account in res.accounts
         ]
@@ -264,6 +267,8 @@ def _expand_accounts(provider_id: str, record: Any) -> dict[str, Any]:
             "account_balances": [],
             "api_calls_available": None,
         }
+        if isinstance(account.get("pool"), dict) and account["pool"]:
+            rows[key]["pool"] = dict(account["pool"])
     return rows
 
 

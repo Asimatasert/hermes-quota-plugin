@@ -42,15 +42,19 @@ list are read.
 
 **Shared across profiles.** Hermes profiles usually share one Claude login, and the usage endpoint rate-limits per token, not per profile. The cooldown and the last successful usage payload are therefore kept in the Hermes root (not the active profile's home), keyed by the same token digest. A payload younger than 5 minutes is reused by every profile without a new request; while a 429 cooldown is active, the last good payload is shown for up to 60 minutes instead of an empty card. Payloads are never shared between different tokens, and a corrupt share file fails open.
 
-Concurrent refreshes for the same token take a persistent advisory file lock and
+Concurrent refreshes for the same token take an advisory file lock and
 recheck the cache before requesting usage. Different tokens serialize only their
 cache/cooldown updates, preserving one another's entries. Lock waiting and HTTP
 use one request deadline; a contending waiter that exhausts it reports `timeout`
 instead of issuing a duplicate request. The locks require a writable, trusted
 Hermes root and a filesystem that supports advisory locking; unavailable storage
 falls back to the historical uncached request behavior. Lock files contain no
-credentials and are deliberately retained (unlinking a live lock would split
-coordination).
+credentials. The two shared-state locks are fixed files and stay; the per-token
+request lock is removed by its holder on every exit path while still held, and
+a waiter that wins an already-removed lock re-opens the path, so coordination
+is never split. (Earlier releases kept one `quota_anthropic_shared.json.<digest>.lock`
+per access token, i.e. one new file every time a token rotated; unheld ones
+older than a day are pruned once per process.)
 
 Reused data keeps its original observation time in an `Observed …` detail line,
 including its age at refresh. Stale reuse is explicitly marked `stale; 429
@@ -136,6 +140,60 @@ Vendor account identity is not collected; a user-supplied label may itself ident
 computed windows and machine-readable reasons — never a token or a filesystem
 path.
 
+
+## Hermes pool accounts (`claudePoolAccounts`, opt-in)
+
+Hermes keeps its own Claude logins in the `anthropic` credential pool
+(`hermes auth add anthropic`, `hermes auth list anthropic`). With
+
+```sh
+hermes config set plugins.entries.quota.settings.claudePoolAccounts true
+```
+
+the Anthropic fetcher shows **one card per account behind that pool**, in pool
+order, next to the primary card (default: off; only a real `true` opts in).
+The grouping is ported from the original Agent Monitor:
+
+- **Rows are read, never changed.** The rows come from Hermes' profile-aware
+  reader (`hermes_cli.auth.read_credential_pool`; profiles without their own
+  rows borrow the root pool, as Hermes does). Nothing is selected, rotated,
+  written or refreshed; refresh tokens are not read.
+- **Stored access token only, while unexpired.** A row whose `expires_at_ms`
+  has passed (or passes within a minute) is never sent: it shows
+  `token-expired · Hermes refreshes it on next use`.
+- **One card per account.** Anthropic access tokens are opaque, so the account
+  behind each token is asked once from Anthropic's OAuth profile endpoint
+  (`GET https://api.anthropic.com/api/oauth/profile`, the call Claude Code
+  itself makes, redirects refused). Rows of the same account — a Hermes PKCE
+  login and the `claude_code` login, say — collapse into one card that is read
+  with one token (the next one only if that read fails). A row whose account
+  cannot be determined (e.g. HTTP 403 for a setup token without the
+  `user:profile` scope) is never its own card: it is counted as *unverified*
+  under the first card. If no row is readable at all, there is one plain card.
+  `claudePoolIdentity: false` skips the profile call; rows are then grouped by
+  exact token only.
+- **Name.** The card is named after the account's first saved pool label in
+  pool order, skipping the `claude_code` login (sanitized like Codex labels);
+  a pill shows the pool position (`#1/3 · tried first` under `fill_first`).
+- **Requests.** Profile calls: once per access token (a refreshed token is asked
+  again), 401/403 not repeated for 30 minutes, other failures for 2 minutes, a
+  429 opens that token's usage cooldown. Usage calls go through the same
+  per-token shared payload (5 minutes), 30-minute 429 cooldown and request lock
+  as every other Anthropic card, one account at a time inside the shared
+  18-second multi-account budget.
+- **What is stored.** The profile cache (`quota_cache.json`) holds, like the
+  Codex and CommandCode pool cards, the display label, windows, pool
+  position/size/strategy and credential counts. The shared state file
+  `quota_anthropic_identity.json` in the Hermes root (0600, at most 256
+  entries, 14-day retention) maps a SHA-256 digest of each token and of each
+  pool-row id to a one-way account key (`sha256(account.uuid)`, 16 hex). Tokens,
+  account ids, e-mail addresses, sources and paths are never stored.
+- `claudeAccounts` entries whose token equals a pool row's token are not shown
+  twice.
+
+Upstream 3.0 deliberately left credential-pool metadata out of the hardened
+**monitor**; this is a quota-provider read under the provider's own opt-in, and
+the monitor still reads no pool metadata.
 
 ## Friendly names and icons
 

@@ -251,12 +251,31 @@ _ANTHROPIC_SHARED_STALE_MAX_S = 60 * 60
 _ANTHROPIC_SHARED_FILENAME = "quota_anthropic_shared.json"
 
 
+def _same_lock_file(fd: int, path: str) -> bool:
+    """Whether ``path`` still names the inode behind ``fd`` (not unlinked/replaced)."""
+    try:
+        opened = os.fstat(fd)
+        current = os.lstat(path)
+    except OSError:
+        return False
+    return (opened.st_dev, opened.st_ino) == (current.st_dev, current.st_ino)
+
+
 @contextmanager
-def _anthropic_state_lock(path: str, deadline: float):
-    """Persistent advisory lock: never unlink a lock another process may hold.
+def _anthropic_state_lock(path: str, deadline: float, *, ephemeral: bool = False):
+    """Advisory lock file around one shared-state update or one usage request.
 
     Unsupported/unwritable storage preserves the historical fail-open read.
     Contention times out without issuing a duplicate HTTP request.
+
+    ``ephemeral`` locks (one per token digest) are removed by their holder on
+    every exit path. Access tokens rotate every few hours, so a retained
+    per-token lock leaked one file per rotation into the Hermes root. Removal is
+    race-free: the holder unlinks while it still holds the lock, and a waiter
+    that then wins the lock on the unlinked inode notices (``fstat`` vs
+    ``lstat``) and re-opens the path, so two processes never both believe they
+    hold the same token's lock. Where an open file cannot be unlinked (Windows)
+    the file is left in place, the historical behaviour.
     """
     import time
 
@@ -273,32 +292,103 @@ def _anthropic_state_lock(path: str, deadline: float):
                 os.lseek(fd, 0, os.SEEK_SET)
                 msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
 
-        fd = _open_anthropic_state(path, os.O_CREAT | os.O_RDWR)
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise OSError('nonregular lock')
-        if os.fstat(fd).st_size == 0:
-            os.write(fd, b'\0')
-        while True:
+        while acquired is None:
             try:
-                try_lock()
-                acquired = True
-                break
+                fd = _open_anthropic_state(path, os.O_CREAT | os.O_RDWR)
             except OSError as exc:
-                import errno
-                if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
-                    raise
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    acquired = False
+                # A holder unlinked the file between our lstat and open.
+                if (ephemeral and str(exc) == 'shared state changed during open'
+                        and deadline - time.monotonic() > 0):
+                    continue
+                raise
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError('nonregular lock')
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b'\0')
+            while True:
+                try:
+                    try_lock()
+                except OSError as exc:
+                    import errno
+                    if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                        raise
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        acquired = False
+                        break
+                    time.sleep(min(.02, remaining))
+                    continue
+                if not ephemeral or _same_lock_file(fd, path):
+                    acquired = True
                     break
-                time.sleep(min(.02, remaining))
+                # The previous holder removed this file after we opened it:
+                # the lock we won guards nothing. Re-open the current path.
+                os.close(fd)
+                fd = None
+                if deadline - time.monotonic() <= 0:
+                    acquired = False
+                break
     except (ImportError, OSError, AttributeError):
         pass
     try:
         yield acquired
     finally:
         if fd is not None:
+            if ephemeral and acquired is True and _same_lock_file(fd, path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass  # e.g. Windows: an open file cannot be removed
             os.close(fd)
+
+
+# Per-token request locks written by releases that retained them. Tokens rotate,
+# so these accumulate; a lock nobody holds and that is older than a day is safe
+# to remove (holding it while unlinking keeps the removal race-free for current
+# releases; an older release at worst issues one duplicate usage request).
+_TOKEN_LOCK_RE = re.compile(r"^quota_anthropic_shared\.json\.[0-9a-f]{24}\.lock$")
+_TOKEN_LOCK_STALE_S = 24 * 3600
+_TOKEN_LOCK_PRUNE_MAX = 64
+_token_locks_pruned = False
+
+
+def _prune_stale_token_locks(now: Optional[float] = None) -> int:
+    """Remove unheld per-token lock files older than a day; returns how many."""
+    global _token_locks_pruned
+    import time
+
+    if _token_locks_pruned:
+        return 0
+    _token_locks_pruned = True
+    try:
+        import fcntl
+    except ImportError:
+        return 0  # no portable non-blocking probe for an unlinkable lock here
+    now = time.time() if now is None else now
+    directory = os.path.dirname(_shared_payload_path()) or "."
+    removed = 0
+    try:
+        names = sorted(name for name in os.listdir(directory) if _TOKEN_LOCK_RE.match(name))
+    except OSError:
+        return 0
+    for name in names[:_TOKEN_LOCK_PRUNE_MAX]:
+        path = os.path.join(directory, name)
+        fd = None
+        try:
+            info = os.lstat(path)
+            if not stat.S_ISREG(info.st_mode) or now - info.st_mtime < _TOKEN_LOCK_STALE_S:
+                continue
+            fd = _open_anthropic_state(path, os.O_RDWR)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if _same_lock_file(fd, path):
+                os.unlink(path)
+                removed += 1
+        except OSError:
+            continue  # held, vanished or unreadable: leave it
+        finally:
+            if fd is not None:
+                os.close(fd)
+    return removed
 
 
 def _shared_payload_path() -> str:
@@ -537,7 +627,11 @@ def _request_anthropic_usage(
 
     deadline = time.monotonic() + max(0.0, timeout)
     path = _shared_payload_path() + '.' + _backoff_key(token) + '.lock'
-    with _anthropic_state_lock(path, deadline) as acquired:
+    try:
+        _prune_stale_token_locks()
+    except Exception:  # noqa: BLE001 - housekeeping must never block a read
+        pass
+    with _anthropic_state_lock(path, deadline, ephemeral=True) as acquired:
         if acquired is False:
             return None, 'timeout'
         remaining = deadline - time.monotonic()
@@ -934,6 +1028,7 @@ def _claude_account_results(
     *,
     primary_token: Optional[str],
     deadline: Deadline,
+    seen_fingerprints: Optional[set] = None,
 ) -> list[QuotaAccount]:
     """Fetch every configured extra account under one shared deadline.
 
@@ -958,6 +1053,8 @@ def _claude_account_results(
     primary_fp = _token_fingerprint(primary_token)
     if primary_fp:
         seen_tokens.add(primary_fp)
+    # Pool rows already shown (claudePoolAccounts) are the same credential.
+    seen_tokens.update(seen_fingerprints or ())
     fetched = 0
     overflow = False
     for entry in entries:
@@ -1037,19 +1134,260 @@ def _fetch_anthropic_single() -> QuotaResult:
     )
 
 
-def _fetch_anthropic_multi(entries: list[dict[str, Any]]) -> QuotaResult:
-    """Fetch the core account plus every configured extra account."""
+# -- Hermes-pool accounts (opt-in claudePoolAccounts) -------------------------
+# Ported from Agent Monitor (panel.py _anthropic_identity / _anthropic_read_creds / _group_anthropic): the
+# account behind each saved credential comes from Anthropic's OAuth profile endpoint (the call Claude Code
+# itself makes), so two credentials of one account (e.g. a Hermes PKCE login and the claude_code login)
+# collapse into ONE card, read with one token. Only a one-way key of ``account.uuid`` is kept, in the shared
+# state file below, keyed by token digest (asked again only for a refreshed token) and by pool row slot (so an
+# expired row still finds its account). Never a token, uuid, email or label.
+_ANTHROPIC_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
+_ANTHROPIC_IDENTITY_FILENAME = "quota_anthropic_identity.json"
+_IDENTITY_REFUSED_TTL_S = 1800   # 401/403 (e.g. a setup token without user:profile): not repeated for 30 min
+_IDENTITY_ERROR_TTL_S = 120      # any other failure
+_IDENTITY_KEEP_S = 14 * 86400
+_IDENTITY_MAX_ENTRIES = 256
+
+
+def _identity_path() -> str:
+    return os.path.join(os.path.dirname(_backoff_state_path()) or ".", _ANTHROPIC_IDENTITY_FILENAME)
+
+
+def _load_identities() -> dict[str, Any]:
+    try:
+        data = _read_anthropic_state(_identity_path())
+    except Exception:  # noqa: BLE001 - missing/corrupt state: nothing remembered
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_identities(updates: dict[str, Any]) -> None:
+    """Merge ``updates`` into the identity state under its lock; prune old entries; never raise."""
+    import tempfile
+    import time
+
+    if not updates:
+        return
+    path = _identity_path()
+    with _anthropic_state_lock(path + ".lock", time.monotonic() + .25) as acquired:
+        if acquired is not True or not _anthropic_state_writable(path):
+            return
+        tmp = None
+        try:
+            try:
+                data = _read_anthropic_state(path)
+            except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError):
+                data = {}
+            data = data if isinstance(data, dict) else {}
+            data.update(updates)
+            now = time.time()
+            kept = {k: v for k, v in data.items() if isinstance(v, dict)
+                    and (_state_number(v.get("at")) or 0) >= now - _IDENTITY_KEEP_S}
+            if len(kept) > _IDENTITY_MAX_ENTRIES:
+                kept = dict(sorted(kept.items(), key=lambda kv: -(_state_number(kv[1].get("at")) or 0))
+                            [:_IDENTITY_MAX_ENTRIES])
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", prefix=".anthropic_identity.", suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(kept, fh)
+            os.replace(tmp, path)
+            tmp = None
+        except Exception:  # noqa: BLE001 - failing to persist must not break a read
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
+
+def _slot_key(slot: str) -> str:
+    return "s:" + hashlib.sha256(("anthropic|" + slot).encode("utf-8")).hexdigest()[:24]
+
+
+def _anthropic_identity(token: Optional[str], slot: str, *, expired: bool, deadline: Deadline,
+                        state: dict[str, Any], updates: dict[str, Any]) -> Optional[str]:
+    """One-way account key of a Claude OAuth credential, or None when it cannot be read.
+
+    Cached per token digest (a key is kept for the token's life; 401/403 for 30 min, other failures 2 min);
+    nothing is asked for an expired token, while the token's 429 cooldown runs, or once the deadline is spent:
+    the key remembered for this pool row stands in. A 429 opens the token's usage cooldown.
+    """
+    import time
+
+    now = time.time()
+    slot_k = _slot_key(slot)
+    remembered = state.get(slot_k, {}).get("key") if isinstance(state.get(slot_k), dict) else None
+    if not token:
+        return remembered
+    tok_k = "t:" + _backoff_key(token)
+    hit = state.get(tok_k)
+    if isinstance(hit, dict):
+        ttl = _state_number(hit.get("ttl"))
+        at = _state_number(hit.get("at")) or 0
+        if hit.get("key") or (ttl is not None and now - at < ttl):
+            key = hit.get("key") if isinstance(hit.get("key"), str) else None
+            return key or (None if hit.get("refused") else remembered)
+    if expired or deadline.expired() or _anthropic_cooling_down(token):
+        return remembered
+    request = urllib.request.Request(_ANTHROPIC_PROFILE_URL, headers={
+        "Authorization": f"Bearer {token}", "Accept": "application/json",
+        "anthropic-beta": "oauth-2025-04-20", "User-Agent": "hermes-quota-plugin/3.0.0"}, method="GET")
+    try:
+        with urlopen_no_redirect(request, timeout=max(0.1, deadline.slice(_ANTHROPIC_TIMEOUT_S))) as resp:
+            body = resp.read(_MAX_HTTP_BYTES + 1)
+        payload = json.loads(body) if len(body) <= _MAX_HTTP_BYTES else None
+        account = payload.get("account") if isinstance(payload, dict) else None
+        uid = account.get("uuid") if isinstance(account, dict) else None
+    except urllib.error.HTTPError as exc:
+        if exc.code == 429:
+            _open_anthropic_cooldown(token)
+            return remembered  # not cached: asked again once the cooldown is over
+        refused = exc.code in (401, 403)
+        updates[tok_k] = {"key": None, "at": now, "refused": refused,
+                          "ttl": _IDENTITY_REFUSED_TTL_S if refused else _IDENTITY_ERROR_TTL_S}
+        return None if refused else remembered
+    except Exception:  # noqa: BLE001 - network/parse failure: remembered key, retried soon
+        updates[tok_k] = {"key": None, "at": now, "ttl": _IDENTITY_ERROR_TTL_S}
+        return remembered
+    if not isinstance(uid, str) or not uid.strip():
+        updates[tok_k] = {"key": None, "at": now, "ttl": _IDENTITY_ERROR_TTL_S}
+        return remembered
+    key = hashlib.sha256(uid.strip().encode("utf-8")).hexdigest()[:16]
+    updates[tok_k] = {"key": key, "at": now}
+    updates[slot_k] = {"key": key, "at": now}
+    return key
+
+
+def _pool_results(
+    primary_token: Optional[str], *, deadline: Deadline, strategy: str, identity: bool,
+    credentials: Optional[list[dict[str, Any]]] = None,
+) -> tuple[Optional[QuotaResult], list[QuotaAccount], set]:
+    """Primary card + one card per ACCOUNT behind the Hermes ``anthropic`` pool (claudePoolAccounts).
+
+    Read policy (Agent Monitor's _anthropic_read_creds): usage is read with ONE credential per account, in pool
+    order, the next one only when that failed; credentials whose account is unknown are read only when no
+    account yielded windows; an expired stored token is never sent (Hermes refreshes it on next use) and is
+    never refreshed here. Every request goes through ``_request_anthropic_usage`` (5-minute shared payload,
+    per-token 429 cooldown, request lock) inside the shared multi-account deadline. Grouping is
+    ``claude_pool.group_credentials``. With ``identity`` off, credentials are grouped by token only.
+    Returns (primary card or None, extra account cards, token fingerprints shown).
+    """
+    from . import claude_pool
+
+    creds = [dict(c) for c in (claude_pool.credentials() if credentials is None else credentials)]
+    size = len(creds)
+    primary_fp = _token_fingerprint(primary_token)
+    if primary_token and not any(_token_fingerprint(c["token"]) == primary_fp for c in creds):
+        creds.insert(0, {"id": "core", "label": "", "named": False, "source": "core", "slot": "core",
+                         "token": primary_token, "expired": False, "order": 0})
+    state = _load_identities() if identity else {}
+    updates: dict[str, Any] = {}
+    for c in creds:
+        c.update(wins=[], details=[], err=None, primary=_token_fingerprint(c["token"]) == primary_fp)
+        if identity:
+            c["key"] = _anthropic_identity(c["token"], c["slot"], expired=c["expired"], deadline=deadline,
+                                           state=state, updates=updates)
+        else:
+            c["key"] = "fp" + (_token_fingerprint(c["token"]) or "")[:16]
+    _save_identities(updates)
+
+    def read(c: dict[str, Any]) -> bool:
+        if c["expired"]:
+            c["err"] = claude_pool.TOKEN_EXPIRED_REASON
+            return False
+        if deadline.expired():
+            c["err"] = "timeout"
+            return False
+        if _core_anthropic_is_oauth(c["token"]) is False:
+            c["err"] = "oauth-required"
+            return False
+        payload, reason = _request_anthropic_usage(c["token"], timeout=deadline.slice(_ANTHROPIC_TIMEOUT_S))
+        if payload is None:
+            c["err"] = reason or "no-data"
+            return False
+        c["wins"], c["details"] = _parse_anthropic_usage(payload)
+        if not c["wins"] and not c["details"]:
+            c["err"] = "no-data"
+            return False
+        return True
+
+    ordered = sorted(creds, key=lambda c: (not c["primary"], c["order"]))
+    got = False
+    done: set = set()
+    for c in ordered:
+        if not c["key"] or c["key"] in done:
+            continue
+        done.add(c["key"])
+        for x in [x for x in ordered if x["key"] == c["key"]]:
+            if read(x):
+                got = True
+                break
+    if not got:
+        for c in ordered:
+            if not c["key"] and read(c):
+                break
+    groups = claude_pool.group_credentials(ordered)
+    shown = {_token_fingerprint(c["token"]) for c in creds}
+
+    primary: Optional[QuotaResult] = None
+    accounts: list[QuotaAccount] = []
+    for g in sorted(groups, key=lambda g: (not any(c["primary"] for c in g["creds"]),
+                                           min(c["order"] for c in g["creds"]))):
+        members = g["creds"]
+        verified = [c for c in members if c["status_of"] != "unverified"]
+        pooled = [c for c in (verified or members) if c["source"] != "core"]
+        meta = None
+        if pooled:
+            meta = {"priority": min(c["order"] for c in pooled), "size": size, "strategy": strategy,
+                    "credentials": len([c for c in members if c["source"] != "core"]),
+                    "unverified": len([c for c in members if c["status_of"] == "unverified"])}
+        label = claude_pool.account_name([c for c in members if c["source"] != "core"]) if pooled else None
+        reason = None if (g["wins"] or g["details"]) else (g["err"] or "no-data")
+        if reason is None and not g["wins"] and not g["details"]:
+            reason = "no-data"
+        details = list(g["details"])
+        if reason == claude_pool.TOKEN_EXPIRED_REASON:
+            details = [claude_pool.TOKEN_EXPIRED_DETAIL]
+        is_primary = primary is None and any(c["primary"] for c in members)
+        if is_primary:
+            primary = (QuotaResult(label="anthropic", windows=list(g["wins"]), details=details)
+                       if reason is None else build_unavailable("anthropic", reason, details))
+            primary.account_label = label
+            primary.pool = meta
+            continue
+        first = min(pooled or members, key=lambda c: c["order"])
+        accounts.append(QuotaAccount(id=first["id"] if first["source"] != "core" else "pool-core",
+                                     label=label or "Account", windows=list(g["wins"]), details=details,
+                                     unavailable_reason=reason, pool=meta))
+    return primary, accounts, shown
+
+
+def _fetch_anthropic_multi(entries: list[dict[str, Any]], *, pool_enabled: bool = False) -> QuotaResult:
+    """Fetch the core account plus every configured extra account (and pool accounts when opted in)."""
     deadline = Deadline(_ANTHROPIC_MULTI_BUDGET_S)
     token = _core_anthropic_token()
-    primary: Optional[QuotaResult] = None
-    primary_reason: Optional[str] = None
-    if not token:
-        primary_reason = "no-credentials"
-    elif _core_anthropic_is_oauth(token) is False:
-        primary_reason = _ANTHROPIC_OAUTH_REQUIRED_REASON
+    if token and _core_anthropic_is_oauth(token) is False:
+        oauth_token: Optional[str] = None
+        primary_reason: Optional[str] = _ANTHROPIC_OAUTH_REQUIRED_REASON
     else:
+        oauth_token, primary_reason = token, (None if token else "no-credentials")
+    primary: Optional[QuotaResult] = None
+    pool_accounts: list[QuotaAccount] = []
+    shown: set = set()
+    pool_done = False
+    if pool_enabled:
+        from . import claude_pool
+
+        try:
+            settings = claude_pool._settings()
+            primary, pool_accounts, shown = _pool_results(
+                oauth_token, deadline=deadline, strategy=claude_pool.strategy(settings),
+                identity=claude_pool.identity_enabled(settings))
+            pool_done = True
+        except Exception:  # noqa: BLE001 - a pool read failure must not hide the primary
+            primary, pool_accounts, shown = None, [], set()
+    if not pool_done and oauth_token:
         payload, reason = _request_anthropic_usage(
-            token, timeout=deadline.slice(_ANTHROPIC_TIMEOUT_S))
+            oauth_token, timeout=deadline.slice(_ANTHROPIC_TIMEOUT_S))
         if payload is None:
             primary_reason = reason or "no-data"
         else:
@@ -1058,10 +1396,9 @@ def _fetch_anthropic_multi(entries: list[dict[str, Any]]) -> QuotaResult:
                 primary = QuotaResult(label="anthropic", windows=windows, details=details)
             else:
                 primary_reason = "no-data"
-
     result = primary or build_unavailable("anthropic", primary_reason or "no-data")
-    result.accounts = _claude_account_results(
-        entries, primary_token=token, deadline=deadline)
+    result.accounts = pool_accounts + _claude_account_results(
+        entries, primary_token=token, deadline=deadline, seen_fingerprints=shown)
     return result
 
 
@@ -1072,9 +1409,15 @@ def _fetch_anthropic() -> QuotaResult:
     historical single-account fetch: same request, same result, no accounts.
     """
     entries, configured = _claude_accounts_setting()
-    if not configured or not entries:
+    try:
+        from . import claude_pool
+
+        pool_enabled = claude_pool.enabled()
+    except Exception:  # noqa: BLE001 - unreadable config keeps the default path
+        pool_enabled = False
+    if not pool_enabled and (not configured or not entries):
         return _fetch_anthropic_single()
-    return _fetch_anthropic_multi(entries)
+    return _fetch_anthropic_multi(entries if configured else [], pool_enabled=pool_enabled)
 
 
 _register("anthropic")(_fetch_anthropic)

@@ -108,7 +108,7 @@ def claude_open_sessions():
     """{session id: {"status", "waiting_for", "since"}} of Claude Code processes that are still alive, or None if
     the registry is missing. status: busy (working on a turn), waiting (permission prompt or dialog, reason in
     waiting_for), idle / shell (turn finished, waiting for a new prompt); since = last status change."""
-    if not trial.EXTERNAL_CLI_COLLECTION:
+    if not trial.external_cli_collection():
         return None  # trial: another app's process registry is out of scope
     if not CLAUDE_SESSIONS.is_dir():
         return None
@@ -142,7 +142,7 @@ def loop_max(tools, since):
 
 def claude_turns(since):
     """(model, seconds) of main-session turns finished after `since` (from transcripts already parsed)."""
-    if not trial.EXTERNAL_CLI_COLLECTION:
+    if not trial.external_cli_collection():
         return []
     with _claude_lock:
         return [(m, sec) for cf in _claude_cache.values() if not cf.subagent
@@ -187,7 +187,7 @@ def _user_text(msg):
 
 def _read_claude_file(path: Path, st):
     cf = _claude_cache.get(path)
-    if not trial.EXTERNAL_CLI_COLLECTION:
+    if not trial.external_cli_collection():
         return cf if cf is not None else _ClaudeFile()
     if cf is None or st.st_size < cf.offset:
         cf = _ClaudeFile()
@@ -265,7 +265,7 @@ def claude_sessions(since, always=()):
     """Every Claude Code transcript (main + subagent) touched since `since`, plus those of the session ids in
     `always` (open windows stay listed however long they have been quiet)."""
     out = []
-    if not trial.EXTERNAL_CLI_COLLECTION:
+    if not trial.external_cli_collection():
         return out  # trial: never enumerate ~/.claude/projects
     if not CLAUDE_DIR.is_dir():
         return out
@@ -292,7 +292,7 @@ def claude_sessions(since, always=()):
 # ---------- Copilot CLI ----------
 
 def copilot_events(start, end):
-    if not trial.EXTERNAL_CLI_COLLECTION:
+    if not trial.external_cli_collection():
         return [], {}  # trial: never open ~/.copilot/session-store.db
     if not COPILOT_DB.exists():
         return [], {}
@@ -325,7 +325,7 @@ def copilot_events(start, end):
 
 def _copilot_lock_alive(sid):
     """Best effort (unverified here): Copilot CLI is believed to leave `inuse.<pid>.lock` in its session folder."""
-    if not trial.EXTERNAL_CLI_COLLECTION:
+    if not trial.external_cli_collection():
         return False
     try:
         for f in (COPILOT_STATE / sid).glob("inuse.*.lock"):
@@ -358,7 +358,7 @@ def _latest_mtime(root: Path, depth=3):
 
 
 def presence():
-    if not trial.EXTERNAL_CLI_COLLECTION:
+    if not trial.external_cli_collection():
         return []  # trial: no binary probe, no ~/.claude / ~/.copilot / ~/.gemini / ~/.factory scan
     items = []
     for key, binary, root in (("claude-code", "claude", HOME / ".claude" / "projects"),
@@ -382,7 +382,7 @@ def _day(ts):
 
 def collect(start, end):
     """Normalized per-session rows + per-event list for [start, end). Empty in this trial."""
-    if not trial.EXTERNAL_CLI_COLLECTION:
+    if not trial.external_cli_collection():
         return [], []
     now = time.time()
     sessions = []
@@ -459,7 +459,7 @@ def collect(start, end):
 
 def summary(start, end, days):
     sessions, events = collect(start, end)
-    disabled = not trial.EXTERNAL_CLI_COLLECTION
+    disabled = not trial.external_cli_collection()
     by_source = defaultdict(lambda: {"tokens": 0, "cost": 0.0, "calls": 0, "sessions": 0, "subagents": 0,
                                      "input": 0, "output": 0, "cache_read": 0})
     for s in sessions:
@@ -493,7 +493,7 @@ def summary(start, end, days):
 
 def live(minute_starts):
     """Per-minute CLI tokens (exact, from event timestamps) + running sessions."""
-    if not trial.EXTERNAL_CLI_COLLECTION:
+    if not trial.external_cli_collection():
         return {m: {} for m in minute_starts}, []
     start = minute_starts[0]
     sessions, events = collect(start - 900, time.time() + 60)

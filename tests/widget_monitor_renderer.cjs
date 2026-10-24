@@ -53,6 +53,9 @@ async function run(options = {}) {
     const key = opts.queryKey || [];
     record.queries.push({key, enabled: opts.enabled !== false});
     if (key[1] === 'monitor') {
+      if (key[2] === 'plan') {
+        return {data: opts.enabled === false ? undefined : options.plan, isError: false, isLoading: false};
+      }
       if (key[2] === 'accounts') {
         return {data: opts.enabled === false ? undefined : options.accounts, isError: false, isLoading: false, isFetching: false};
       }

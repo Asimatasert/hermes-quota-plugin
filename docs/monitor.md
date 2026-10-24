@@ -33,12 +33,12 @@ is not a list of capabilities all enabled in this release.
 | Context guard | Local estimates; `/compress` uses the Desktop composer path |
 | Usage costs | Estimated API-price equivalents, not invoices or billed charges |
 | Month-end spending projection | Unavailable; no projected amount rendered |
-| Sibling profiles | Not collected |
-| External CLI transcripts (Claude Code, Copilot, etc.) | Collection disabled |
+| Sibling profiles | Not collected (opt-in `monitorScope: all` adds their open sessions to Live) |
+| External CLI transcripts (Claude Code, Copilot, etc.) | Collection disabled (opt-in `monitorScope: all`) |
 | Shared Kanban boards | Collection disabled |
 | New credential-pool metadata reads | Unavailable; monitor does not read auth.json or credential stores |
 | Account priority/strategy and budget writes | Refused with `trial-read-only` |
-| Monitor agent tools | Not registered; direct calls refuse with `trial-tools-disabled` |
+| Monitor agent tools | Not registered; direct calls refuse with `trial-tools-disabled`. Exception: the separately opt-in, read-only `get_quota_plan` (`planToolEnabled`) |
 
 Unavailable tabs do not enable these capabilities. Unavailable account metadata
 is not evidence of an empty credential pool. Machine-readable `trial-*` codes
@@ -57,6 +57,7 @@ hermes quota monitor history --json --days 7
 hermes quota monitor recommend --json
 hermes quota monitor budget --json
 hermes quota monitor accounts --json
+hermes quota monitor plan --json
 ```
 
 Payloads carry `monitor_version` and `generated_at`. The monitor schema version
@@ -64,6 +65,112 @@ remains `1`, independently of the plugin release version. Snapshot sections fail
 independently; inspect `errors` and `timings_ms` instead of interpreting missing
 data as zero activity. Recommendations are advisory and do not switch models.
 `set-budget`, `set-priority` and `set-strategy` are unavailable in this release.
+
+## Scope: `monitorScope` (opt-in)
+
+`plugins.entries.quota.settings.monitorScope` is `active` by default: the
+hardened 3.0 boundary above. Setting it to the literal string `all` (and only
+together with `monitorEnabled: true` in the same profile) restores what the
+pre-3.0 Agent Monitor showed:
+
+```bash
+hermes config set plugins.entries.quota.settings.monitorScope all
+```
+
+- **Live view and agents chip** list the open sessions of **every Hermes
+  profile** under this Hermes root (`<root>/state.db`, `<root>/profiles/*/state.db`,
+  their `runtime/active_sessions.json` leases; SQLite read-only), grouped by
+  profile.
+- **Claude Code and Copilot CLI** sessions are collected again from this user's
+  local files: `~/.claude/projects/**/*.jsonl` transcripts and
+  `~/.claude/sessions` (Claude Code), `~/.copilot/session-store.db` and
+  `~/.copilot/session-state` (Copilot CLI); the CLI-presence probe looks for the
+  `claude`, `copilot`, `gemini` and `droid` binaries (and the `~/.gemini`, `~/.factory` folders). Session titles, models,
+  token counts and working directories of those sessions then appear in Live and
+  Usage. Nothing is written to those stores and nothing is sent anywhere.
+- Kanban, credential-pool metadata in the monitor, account writes and the
+  monitor agent tools stay unavailable in both scopes. The monitor database is
+  still the active profile's.
+
+Privacy: `all` shows content of sessions that belong to other profiles and to
+other apps (titles, models, sizes, paths) inside this profile's Desktop pane.
+Keep `active` on shared machines or when profiles separate people or clients.
+
+The Live view and the agents card pin a **Now** block at the top (accent
+stripe): the focused chat (`focusedStoredSessionId`) when it is open, and the
+Anthropic account Hermes would use now (under `fill_first` the first account in
+pool order whose windows are below 100 %; with `round_robin`/`random` the block
+says requests are spread). The remaining sessions follow, grouped by source:
+each Hermes profile, then Claude Code, then Copilot CLI.
+
+## Plan: session vs week pacing
+
+`hermes quota monitor plan --json` (also the **Plan** tab) answers, per account
+with a short (5 h session) and a long (weekly) window — Anthropic
+`Current session`/`Current week`, Codex `Session`/`Weekly`, CommandCode
+`5h`/`Weekly` — how to spend the week across the sessions that are left. It is
+pure: no network, no writes; it reads the quota cache and, when the monitor is
+enrolled, up to 14 days of `quota_history` from `quota_monitor.db`.
+
+Without enrollment the command still answers from the quota cache alone
+(the same data the Quota tab shows), with `degraded: true`, the default ratio
+and every 5 h window counted. No monitor store is opened.
+
+### Formulas
+
+| Quantity | Definition |
+| --- | --- |
+| `r` (`ratio.value`) | weekly % per 1 % of session. Per past session window (same week window, no reset inside, Δsession ≥ 10): Δweek/Δsession between its first and last reading; `r` = the Δsession-weighted median. Weekly % is reported as a whole percent, so short sessions are dominated by rounding; weighting lets long sessions decide. No samples: `r = 0.10`, confidence `low`. Confidence `high` with ≥ 3 samples and an inter-quartile range ≤ 0.6·r. |
+| `typical_fill` | median of the highest session % in each finished session window |
+| `pattern.hours` | per local hour (Hermes `timezone`, else the system zone): share of observed days on which the session % rose in that hour; ≥ 0.5 = active. Needs ≥ 2 observed days. `planActiveHours` (e.g. `"09-23"` or `["9-12","14-22"]`) overrides it. |
+| `sessions.calendar` | running session (1 if its reset is in the future) + ⌈(week reset − session reset)/5 h⌉ (a final partial window counts) |
+| `sessions.active` | windows the pattern would start: from the end of the running session, a window starts at the first active hour and occupies 5 h, until the week resets |
+| `budget.week_per_session` | `week_left / sessions.active` |
+| `budget.session_per_session` | `budget.week_per_session / r` (≥ 100 means every session can be used fully) |
+| `current.target_used` | `min(100, session_used + budget.session_per_session)`; `can_fill` when it reaches 100; `state`: `keep_going`, `near_target` (≤ 5 points left), `over_target`, `unknown` |
+| `projection.week_at_reset` | with history: `week_used + r·(max(0, fill − session_used) + fill·(sessions.active − 1))`; without: the week's straight-line rate so far. `exhaust_at` when it crosses 100 before the reset |
+| `pace.verdict` | with history: expected use / week left `< 0.75` → `under` (`extra_session_pct` = budget − typical fill), `> 1.0` → `over` (`slow_to_session_pct` = budget), else `on_track`. Without: week used vs the even pace to reset, `over` above +5 points, `under` below −10 |
+| `multi` | for ≥ 2 accounts of one provider (pool order): `use_index` (first account with session and week room), `headroom_index` (most weekly room per session), `advice` (`use_first`, `reorder`, `switch_now`, `spread` for non-fill-first strategies, `all_exhausted`), `switch` (session % at which to move on, and the next account), `combined_week_left` (sum of week left, one account = 100) |
+
+`chart` carries the current week's `actual` readings, the `ideal` straight line
+from week start (0 %) to reset (100 %) and the `projected` line. Every account
+also gets an English `summary` sentence, e.g. *"6 sessions left until Fri 13:00;
+you can use ~6.67% of the week per session (~55% of a session). Current
+session: 20% used - keep going."* All of it is an estimate from readings, not a
+provider guarantee; sessions start with the first message after the previous
+one expired, so the calendar count is an upper bound.
+
+Payload: `plan_version` (1), `monitor_version`, `generated_at`, `enrolled`,
+`degraded`, `history_readings`, `timezone`, `fetched_at`,
+`settings.active_hours`, `defaults`, `providers[] {base, accounts[], multi}`,
+`errors`, `timings_ms`. Unplannable accounts carry `plannable: false` and a
+`reason` (`no-window-pair`, `missing-values`, `week-reset-passed`, or the
+card's unavailable reason such as `token-expired`).
+
+### Agent tool `get_quota_plan` (opt-in)
+
+```bash
+hermes config set plugins.entries.quota.settings.planToolEnabled true
+```
+
+Only the literal boolean `true` registers one read-only tool,
+`get_quota_plan` (toolset `quota_monitor`), at plugin load; the handler
+re-checks the setting on every call and answers `plan-tool-disabled` once it
+is off. It returns numbers and enum codes only: accounts are `account: 1..N` in
+pool order, with no labels, ids, titles, paths or provider error text (free-text
+reasons collapse to `unavailable`). Use it to self-pace, e.g. prefer a cheaper
+model while `pace` is `over`. `plugin.yaml` keeps `provides_tools: []` because
+the manifest has no conditional form and `hermes plugins doctor` runs without
+the setting; `hermes plugins list` therefore does not name the tool. Restart
+Hermes after changing the setting.
+
+Other agents: Hermes' MCP server is the separate official `mcp-serve` plugin
+(`hermes plugins install mcp-serve`, then `hermes mcp-serve --tools`); its
+`--tools` mode exposes a fixed allowlist (web, browser, vision, image, skills,
+TTS) and **does not expose plugin tools**, so `get_quota_plan` is not reachable
+through it. For Claude Code or any other agent with a shell, call the CLI
+instead: `hermes quota monitor plan --json` (same data, with labels; filter it
+yourself if the agent must not see them).
 
 ## Storage and estimates
 
