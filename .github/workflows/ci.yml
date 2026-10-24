@@ -79,6 +79,24 @@ jobs:
           bash tests/test_install_shell.sh
           bash tests/probe_symlink_forms.sh
 
+  # Optional native macOS companion (macos/QuotaNotch): Swift unit tests + a
+  # universal build. Nothing is installed or launched; the other jobs never
+  # read macos/, so Linux/Windows plugin users are unaffected by it.
+  macos-companion:
+    name: macOS companion (Swift)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Swift unit tests (JSON decoding, events, CLI runner)
+        run: sh macos/test.sh
+
+      - name: Build Quota Notch.app (ad-hoc signed, not installed)
+        env:
+          # runner.temp is a trusted runner-provided path, not event input.
+          OUT: ${{ runner.temp }}/quota-notch
+        run: sh macos/build.sh
+
   manifest:
     name: plugin.yaml sanity
     runs-on: ubuntu-latest

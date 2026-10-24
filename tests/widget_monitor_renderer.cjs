@@ -59,6 +59,9 @@ async function run(options = {}) {
       if (key[2] === 'accounts') {
         return {data: opts.enabled === false ? undefined : options.accounts, isError: false, isLoading: false, isFetching: false};
       }
+      if (key[2] === 'companion') {
+        return {data: opts.enabled === false ? undefined : options.companion, isError: false, isLoading: false};
+      }
       if (key[2] === 'snapshot') {
         return {data: options.monitor, isError: !!options.monitorIsError, error: options.monitorIsError ? new Error('boom') : null, isLoading: false};
       }
@@ -116,6 +119,8 @@ async function run(options = {}) {
     fmtDayTime: new Intl.DateTimeFormat('en-US'), console,
     Date: DateImpl, Intl, setTimeout, clearTimeout, setInterval, clearInterval,
   };
+  // `navigator` exists only when a test asks for a renderer platform (e.g. {platform: 'MacIntel'}).
+  if (options.navigator) context.navigator = options.navigator;
   const file = options.source || path.join(__dirname, '../desktop/plugin.js');
   const source = fs.readFileSync(file, 'utf8')
     .replace(/^import[\s\S]*?from ["'][^"']+["'];/gm, '')

@@ -2499,6 +2499,7 @@ function QuotaSettings() {
 			}),
 			jsx(DisabledProvidersControl, {}),
 			jsx(MonitorSettings, {}),
+			jsx(NotchCompanionCard, {}),
 		],
 	});
 }
@@ -5823,6 +5824,131 @@ function MonitorSettings() {
 	});
 }
 
+
+// ---- Quota Notch: the optional native macOS companion (macos/ in the repo) ----
+// Hermes Desktop plugins cannot draw outside the app window, so the notch
+// island / menu bar extra is a separate native app. This card only explains it
+// and reports `hermes quota monitor companion --json` (installed, running,
+// whether the Mac has a notch -- the app itself reports that). Shown on macOS
+// renderers only; the backend may still be another machine (remote gateway).
+
+/** True on a macOS renderer (navigator is absent in tests and non-browser hosts). */
+function isMacRenderer() {
+	try {
+		const nav = typeof navigator !== "undefined" ? navigator : null;
+		if (!nav) return false;
+		const text = `${nav.platform || ""} ${(nav.userAgentData && nav.userAgentData.platform) || ""} ${nav.userAgent || ""}`;
+		return /\bMac/i.test(text);
+	} catch {
+		return false;
+	}
+}
+
+const COMPANION_ARGV = ["quota", "monitor", "companion", "--json"];
+
+function companionButton({ label, onClick, primary = false, data, title }) {
+	return jsx("button", {
+		type: "button",
+		[data]: true,
+		title,
+		className: primary ? "hover:opacity-90 transition-opacity" : "hover:bg-(--chrome-action-hover) transition-colors",
+		onClick,
+		style: primary
+			? { border: 0, borderRadius: 5, padding: "3px 10px", fontSize: "0.6875rem", fontWeight: 600, cursor: "pointer", background: "var(--ui-accent)", color: "var(--dt-midground-foreground, var(--ui-bg-editor))" }
+			: { border: "1px solid var(--ui-stroke-tertiary)", borderRadius: 5, padding: "2px 8px", fontSize: "0.6875rem", cursor: "pointer", background: "transparent", color: "var(--ui-text-secondary)" },
+		children: label,
+	});
+}
+
+async function openCompanion(scope, queryClient) {
+	let ok = false;
+	try {
+		const result = await quotaCli(scope, ["quota", "monitor", "companion", "--open", "--json"], MONITOR_TIMEOUT_MS);
+		const payload = parseJsonOutput(result.output || "", "monitor_version");
+		ok = Boolean(payload && payload.opened);
+	} catch {
+		ok = false;
+	}
+	if (!ok) {
+		try {
+			host.notify?.({ kind: "warning", message: tr("notchOpenFailed") });
+		} catch {
+			/* noop */
+		}
+	}
+	try {
+		queryClient?.invalidateQueries?.({ queryKey: monitorQueryKey(scope, "companion") });
+	} catch {
+		/* noop */
+	}
+	return ok;
+}
+
+function NotchCompanionCard() {
+	const t = useQT();
+	const mac = isMacRenderer();
+	const owner = useValue(host.state.focusedSessionOwner);
+	const scope = normalizeQuotaScope(owner);
+	const queryClient = useQueryClient();
+	const query = useQuery({
+		queryKey: monitorQueryKey(scope, "companion"),
+		queryFn: () => fetchMonitor(scope, COMPANION_ARGV),
+		enabled: Boolean(scope) && mac,
+		refetchInterval: 30_000,
+		refetchIntervalInBackground: false,
+		staleTime: 10_000,
+		retry: 0,
+	});
+	if (!mac) return null;
+	const raw = query.data;
+	const info = raw && !raw.unsupported && raw.platform ? raw : null;
+	const rows = [jsx("div", { style: { ...UI.secondary, lineHeight: 1.45, padding: "2px 0 6px" }, children: t("notchIntro") }, "intro")];
+	if (raw && raw.unsupported) {
+		rows.push(jsx("div", { "data-notch-state": "update", style: { ...UI.meta, padding: "4px 0 8px" }, children: t("notchUpdate") }, "update"));
+	} else if (!info) {
+		rows.push(jsx("div", { "data-notch-state": "loading", style: { ...UI.meta, padding: "4px 0 8px" }, children: query.isError ? t("notchUpdate") : t("notchLoading") }, "loading"));
+	} else if (!info.supported) {
+		rows.push(jsx("div", { "data-notch-state": "remote", style: { ...UI.meta, lineHeight: 1.45, padding: "4px 0 8px" }, children: t("notchRemote", String(info.platform)) }, "remote"));
+	} else {
+		const state = info.running ? "running" : info.installed ? "stopped" : "missing";
+		const color = state === "running" ? "var(--ui-green)" : state === "stopped" ? "var(--ui-yellow)" : "var(--ui-text-tertiary)";
+		const label = state === "running" ? t("notchRunning") : state === "stopped" ? t("notchStopped") : t("notchNotInstalled");
+		rows.push(jsx(SettingRow, {
+			label: t("notchStatus"),
+			hint: info.notch === true ? t("notchHasNotch") : info.notch === false ? t("notchNoNotch") : t("notchUnknown"),
+			children: [
+				jsx(Pill, { color, dot: true, "data-notch-state": state, children: label }, "pill"),
+				info.installed
+					? companionButton({ label: t("notchOpen"), primary: !info.running, data: "data-notch-open", onClick: () => void openCompanion(scope, queryClient) })
+					: null,
+			],
+		}, "status"));
+		if (!info.installed) {
+			const cmd = info.install_command;
+			rows.push(jsx(SettingRow, {
+				label: t("notchInstallLabel"),
+				hint: cmd ? null : t("notchNoScript", info.repo_url || ""),
+				block: true,
+				children: cmd
+					? jsxs("div", {
+							style: { ...UI.row, gap: 6 },
+							children: [
+								jsx("code", { "data-notch-install": cmd, style: { ...UI.meta, ...UI.ellipsis, fontFamily: "var(--dt-font-mono)", flex: "1 1 auto", padding: "3px 6px", borderRadius: 5, background: "var(--ui-bg-quaternary, transparent)", border: "1px solid var(--ui-stroke-tertiary)" }, title: cmd, children: cmd }, "cmd"),
+								companionButton({ label: t("notchCopyInstall"), data: "data-notch-copy", title: t("copyCommandTip", cmd), onClick: () => void copyCommand(cmd) }),
+							],
+						})
+					: null,
+			}, "install"));
+		}
+	}
+	return jsxs(SettingsCard, {
+		icon: "Laptop",
+		title: t("notchTitle"),
+		footer: t("notchPrivacy"),
+		children: rows,
+	});
+}
+
 // Agent Bar's view switcher: segments sized by their label (six fit a 300px
 // pane untruncated), the active one filled with the accent. Own markup (not
 // SegmentedControl) because the labels need tighter padding than core's control.
@@ -7977,6 +8103,25 @@ const I18N_EN = {
 	nowTitle: "Now",
 	nowAccount: (name = "", s = "", w = "") => `Claude account in use: ${name} · session ${s} · week ${w}`,
 	nowAccountSpread: (strategy) => `Claude accounts: Hermes spreads requests (${strategy})`,
+	// ---- notch companion ----
+	notchTitle: "Notch island (macOS)",
+	notchIntro: "Quota Notch is an optional native Mac app: quota rings, running sessions and alerts in the MacBook notch (or the menu bar), outside the Hermes window. It reads this plugin's own JSON; the plugin works without it.",
+	notchStatus: "Companion app",
+	notchRunning: "Running",
+	notchStopped: "Installed, not running",
+	notchNotInstalled: "Not installed",
+	notchHasNotch: "This Mac has a notch: the island sits around the camera.",
+	notchNoNotch: "This Mac has no notch: the companion runs in the menu bar instead.",
+	notchUnknown: "Start it once; it then reports whether this Mac has a notch (otherwise it uses the menu bar).",
+	notchInstallLabel: "Install (builds with the Xcode Command Line Tools)",
+	notchCopyInstall: "Copy",
+	notchOpen: "Open app",
+	notchLoading: "Checking the companion…",
+	notchUpdate: "Update the quota plugin backend to manage the notch companion here.",
+	notchPrivacy: "It only runs the hermes CLI (read-only quota/monitor JSON) and opens hermes:// links. No network, no credentials.",
+	notchOpenFailed: "Could not open Quota Notch.",
+	notchNoScript: (url) => `The installed plugin has no macos/ folder. Get it from ${url} and run macos/install.sh.`,
+	notchRemote: (platform) => `This gateway's backend runs on ${platform}; install the companion on the Mac that runs Hermes.`,
 };
 
 const I18N_TR = {
@@ -8475,6 +8620,25 @@ const I18N_TR = {
 	nowTitle: "Şimdi",
 	nowAccount: (name = "", s = "", w = "") => `Kullanılan Claude hesabı: ${name} · oturum ${s} · hafta ${w}`,
 	nowAccountSpread: (strategy) => `Claude hesapları: Hermes istekleri dağıtıyor (${strategy})`,
+	// ---- notch companion ----
+	notchTitle: "Çentik adası (macOS)",
+	notchIntro: "Quota Notch isteğe bağlı yerel bir Mac uygulamasıdır: kota halkaları, çalışan oturumlar ve uyarılar Hermes penceresinin dışında, MacBook çentiğinde (ya da menü çubuğunda). Bu eklentinin kendi JSON çıktısını okur; eklenti onsuz da çalışır.",
+	notchStatus: "Yardımcı uygulama",
+	notchRunning: "Çalışıyor",
+	notchStopped: "Kurulu, çalışmıyor",
+	notchNotInstalled: "Kurulu değil",
+	notchHasNotch: "Bu Mac'te çentik var: ada kameranın çevresinde durur.",
+	notchNoNotch: "Bu Mac'te çentik yok: uygulama onun yerine menü çubuğunda çalışır.",
+	notchUnknown: "Bir kez başlat; sonra bu Mac'te çentik olup olmadığını bildirir (yoksa menü çubuğunu kullanır).",
+	notchInstallLabel: "Kurulum (Xcode Command Line Tools ile derlenir)",
+	notchCopyInstall: "Kopyala",
+	notchOpen: "Uygulamayı aç",
+	notchLoading: "Yardımcı uygulama denetleniyor…",
+	notchUpdate: "Çentik uygulamasını buradan yönetmek için quota eklentisinin backend'ini güncelle.",
+	notchPrivacy: "Yalnızca hermes CLI'yi (salt okunur kota/monitor JSON) çalıştırır ve hermes:// bağlantılarını açar. Ağ yok, kimlik bilgisi yok.",
+	notchOpenFailed: "Quota Notch açılamadı.",
+	notchNoScript: (url) => `Kurulu eklentide macos/ klasörü yok. ${url} adresinden alıp macos/install.sh çalıştır.`,
+	notchRemote: (platform) => `Bu gateway'in backend'i ${platform} üzerinde çalışıyor; uygulamayı Hermes'i çalıştıran Mac'e kur.`,
 };
 
 /** Plural pick for bundle functions: `forms` keyed by Intl.PluralRules category. */
@@ -8995,6 +9159,25 @@ const I18N_DE = {
 	nowTitle: "Jetzt",
 	nowAccount: (name = "", s = "", w = "") => `Claude-Konto in Nutzung: ${name} · Sitzung ${s} · Woche ${w}`,
 	nowAccountSpread: (strategy) => `Claude-Konten: Hermes verteilt Anfragen (${strategy})`,
+	// ---- notch companion ----
+	notchTitle: "Notch-Insel (macOS)",
+	notchIntro: "Quota Notch ist eine optionale native Mac-App: Kontingentringe, laufende Sitzungen und Hinweise in der MacBook-Notch (oder der Menüleiste), außerhalb des Hermes-Fensters. Sie liest das eigene JSON dieses Plugins; das Plugin funktioniert auch ohne sie.",
+	notchStatus: "Begleit-App",
+	notchRunning: "Läuft",
+	notchStopped: "Installiert, läuft nicht",
+	notchNotInstalled: "Nicht installiert",
+	notchHasNotch: "Dieser Mac hat eine Notch: Die Insel sitzt um die Kamera.",
+	notchNoNotch: "Dieser Mac hat keine Notch: Die App läuft stattdessen in der Menüleiste.",
+	notchUnknown: "Einmal starten; danach meldet sie, ob dieser Mac eine Notch hat (sonst nutzt sie die Menüleiste).",
+	notchInstallLabel: "Installation (baut mit den Xcode Command Line Tools)",
+	notchCopyInstall: "Kopieren",
+	notchOpen: "App öffnen",
+	notchLoading: "Begleit-App wird geprüft…",
+	notchUpdate: "Aktualisiere das Backend des Quota-Plugins, um die Notch-App hier zu verwalten.",
+	notchPrivacy: "Sie führt nur die hermes-CLI aus (schreibgeschütztes Kontingent-/Monitor-JSON) und öffnet hermes://-Links. Kein Netzwerk, keine Zugangsdaten.",
+	notchOpenFailed: "Quota Notch konnte nicht geöffnet werden.",
+	notchNoScript: (url) => `Das installierte Plugin hat keinen macos/-Ordner. Hole ihn von ${url} und führe macos/install.sh aus.`,
+	notchRemote: (platform) => `Das Backend dieses Gateways läuft auf ${platform}; installiere die App auf dem Mac, auf dem Hermes läuft.`,
 };
 
 const I18N_ES = {
@@ -9493,6 +9676,25 @@ const I18N_ES = {
 	nowTitle: "Ahora",
 	nowAccount: (name = "", s = "", w = "") => `Cuenta de Claude en uso: ${name} · sesión ${s} · semana ${w}`,
 	nowAccountSpread: (strategy) => `Cuentas de Claude: Hermes reparte las solicitudes (${strategy})`,
+	// ---- notch companion ----
+	notchTitle: "Isla del notch (macOS)",
+	notchIntro: "Quota Notch es una app nativa opcional para Mac: anillos de cuota, sesiones en curso y avisos en el notch del MacBook (o en la barra de menús), fuera de la ventana de Hermes. Lee el JSON de este plugin; el plugin funciona sin ella.",
+	notchStatus: "App complementaria",
+	notchRunning: "En ejecución",
+	notchStopped: "Instalada, detenida",
+	notchNotInstalled: "No instalada",
+	notchHasNotch: "Este Mac tiene notch: la isla rodea la cámara.",
+	notchNoNotch: "Este Mac no tiene notch: la app se ejecuta en la barra de menús.",
+	notchUnknown: "Ábrela una vez; después indica si este Mac tiene notch (si no, usa la barra de menús).",
+	notchInstallLabel: "Instalación (se compila con las Xcode Command Line Tools)",
+	notchCopyInstall: "Copiar",
+	notchOpen: "Abrir app",
+	notchLoading: "Comprobando la app complementaria…",
+	notchUpdate: "Actualiza el backend del plugin de cuota para gestionar aquí la app del notch.",
+	notchPrivacy: "Solo ejecuta la CLI de hermes (JSON de cuota/monitor de solo lectura) y abre enlaces hermes://. Sin red ni credenciales.",
+	notchOpenFailed: "No se pudo abrir Quota Notch.",
+	notchNoScript: (url) => `El plugin instalado no incluye la carpeta macos/. Descárgala de ${url} y ejecuta macos/install.sh.`,
+	notchRemote: (platform) => `El backend de este gateway se ejecuta en ${platform}; instala la app en el Mac donde se ejecuta Hermes.`,
 };
 
 const I18N_FR = {
@@ -9991,6 +10193,25 @@ const I18N_FR = {
 	nowTitle: "Maintenant",
 	nowAccount: (name = "", s = "", w = "") => `Compte Claude utilisé : ${name} · session ${s} · semaine ${w}`,
 	nowAccountSpread: (strategy) => `Comptes Claude : Hermes répartit les requêtes (${strategy})`,
+	// ---- notch companion ----
+	notchTitle: "Îlot de l'encoche (macOS)",
+	notchIntro: "Quota Notch est une app Mac native facultative : anneaux de quota, sessions en cours et alertes dans l'encoche du MacBook (ou la barre des menus), hors de la fenêtre Hermes. Elle lit le JSON de ce plugin ; le plugin fonctionne sans elle.",
+	notchStatus: "App compagnon",
+	notchRunning: "En cours",
+	notchStopped: "Installée, arrêtée",
+	notchNotInstalled: "Non installée",
+	notchHasNotch: "Ce Mac a une encoche : l'îlot entoure la caméra.",
+	notchNoNotch: "Ce Mac n'a pas d'encoche : l'app s'exécute dans la barre des menus.",
+	notchUnknown: "Lancez-la une fois ; elle indique ensuite si ce Mac a une encoche (sinon elle utilise la barre des menus).",
+	notchInstallLabel: "Installation (compilée avec les Xcode Command Line Tools)",
+	notchCopyInstall: "Copier",
+	notchOpen: "Ouvrir l'app",
+	notchLoading: "Vérification de l'app compagnon…",
+	notchUpdate: "Mettez à jour le backend du plugin de quota pour gérer l'app de l'encoche ici.",
+	notchPrivacy: "Elle n'exécute que la CLI hermes (JSON de quota/moniteur en lecture seule) et ouvre les liens hermes://. Pas de réseau, pas d'identifiants.",
+	notchOpenFailed: "Impossible d'ouvrir Quota Notch.",
+	notchNoScript: (url) => `Le plugin installé n'a pas de dossier macos/. Récupérez-le sur ${url} et lancez macos/install.sh.`,
+	notchRemote: (platform) => `Le backend de cette passerelle tourne sous ${platform} ; installez l'app sur le Mac qui exécute Hermes.`,
 };
 
 const I18N_RU = {
@@ -10489,6 +10710,25 @@ const I18N_RU = {
 	nowTitle: "Сейчас",
 	nowAccount: (name = "", s = "", w = "") => `Аккаунт Claude сейчас: ${name} · сессия ${s} · неделя ${w}`,
 	nowAccountSpread: (strategy) => `Аккаунты Claude: Hermes распределяет запросы (${strategy})`,
+	// ---- notch companion ----
+	notchTitle: "Остров в вырезе (macOS)",
+	notchIntro: "Quota Notch — необязательное нативное приложение для Mac: кольца квот, активные сессии и уведомления в вырезе MacBook (или в строке меню), вне окна Hermes. Оно читает JSON этого плагина; плагин работает и без него.",
+	notchStatus: "Приложение-компаньон",
+	notchRunning: "Запущено",
+	notchStopped: "Установлено, не запущено",
+	notchNotInstalled: "Не установлено",
+	notchHasNotch: "У этого Mac есть вырез: остров располагается вокруг камеры.",
+	notchNoNotch: "У этого Mac нет выреза: приложение работает в строке меню.",
+	notchUnknown: "Запустите его один раз; затем оно сообщит, есть ли у этого Mac вырез (иначе использует строку меню).",
+	notchInstallLabel: "Установка (сборка с Xcode Command Line Tools)",
+	notchCopyInstall: "Копировать",
+	notchOpen: "Открыть",
+	notchLoading: "Проверка приложения-компаньона…",
+	notchUpdate: "Обновите backend плагина квот, чтобы управлять приложением здесь.",
+	notchPrivacy: "Оно запускает только CLI hermes (JSON квот/монитора только для чтения) и открывает ссылки hermes://. Без сети и учётных данных.",
+	notchOpenFailed: "Не удалось открыть Quota Notch.",
+	notchNoScript: (url) => `В установленном плагине нет папки macos/. Возьмите её с ${url} и запустите macos/install.sh.`,
+	notchRemote: (platform) => `Backend этого шлюза работает на ${platform}; установите приложение на Mac, где запущен Hermes.`,
 };
 
 const I18N_JA = {
@@ -10987,6 +11227,25 @@ const I18N_JA = {
 	nowTitle: "現在",
 	nowAccount: (name = "", s = "", w = "") => `使用中のClaudeアカウント: ${name} · セッション ${s} · 週 ${w}`,
 	nowAccountSpread: (strategy) => `Claudeアカウント: Hermesがリクエストを分散（${strategy}）`,
+	// ---- notch companion ----
+	notchTitle: "ノッチアイランド (macOS)",
+	notchIntro: "Quota Notch は任意のネイティブ Mac アプリです。クォータのリング、実行中のセッション、通知を Hermes ウィンドウの外、MacBook のノッチ（またはメニューバー）に表示します。このプラグインの JSON を読み取るだけで、プラグインはアプリなしでも動作します。",
+	notchStatus: "コンパニオンアプリ",
+	notchRunning: "実行中",
+	notchStopped: "インストール済み・停止中",
+	notchNotInstalled: "未インストール",
+	notchHasNotch: "この Mac にはノッチがあります。アイランドはカメラの周りに表示されます。",
+	notchNoNotch: "この Mac にはノッチがありません。代わりにメニューバーで動作します。",
+	notchUnknown: "一度起動すると、この Mac にノッチがあるかを報告します（ない場合はメニューバーを使います）。",
+	notchInstallLabel: "インストール（Xcode Command Line Tools でビルド）",
+	notchCopyInstall: "コピー",
+	notchOpen: "アプリを開く",
+	notchLoading: "コンパニオンを確認中…",
+	notchUpdate: "ここでノッチアプリを管理するには quota プラグインの backend を更新してください。",
+	notchPrivacy: "hermes CLI（読み取り専用のクォータ／モニター JSON）の実行と hermes:// リンクを開くことのみ行います。ネットワーク通信や認証情報の読み取りはありません。",
+	notchOpenFailed: "Quota Notch を開けませんでした。",
+	notchNoScript: (url) => `インストール済みのプラグインに macos/ フォルダーがありません。${url} から取得して macos/install.sh を実行してください。`,
+	notchRemote: (platform) => `このゲートウェイの backend は ${platform} で動作しています。Hermes を実行している Mac にアプリをインストールしてください。`,
 };
 
 const I18N_ZH = {
@@ -11485,6 +11744,25 @@ const I18N_ZH = {
 	nowTitle: "当前",
 	nowAccount: (name = "", s = "", w = "") => `正在使用的 Claude 账号：${name} · 会话 ${s} · 本周 ${w}`,
 	nowAccountSpread: (strategy) => `Claude 账号：Hermes 分散请求（${strategy}）`,
+	// ---- notch companion ----
+	notchTitle: "刘海岛（macOS）",
+	notchIntro: "Quota Notch 是一个可选的原生 Mac 应用：在 Hermes 窗口之外的 MacBook 刘海（或菜单栏）中显示配额环、运行中的会话和提醒。它读取此插件自己的 JSON；没有它插件也能正常工作。",
+	notchStatus: "配套应用",
+	notchRunning: "运行中",
+	notchStopped: "已安装，未运行",
+	notchNotInstalled: "未安装",
+	notchHasNotch: "这台 Mac 有刘海：岛围绕摄像头显示。",
+	notchNoNotch: "这台 Mac 没有刘海：应用改为在菜单栏中运行。",
+	notchUnknown: "启动一次后，它会报告这台 Mac 是否有刘海（没有则使用菜单栏）。",
+	notchInstallLabel: "安装（使用 Xcode Command Line Tools 构建）",
+	notchCopyInstall: "复制",
+	notchOpen: "打开应用",
+	notchLoading: "正在检查配套应用…",
+	notchUpdate: "请更新配额插件的 backend，以便在此管理刘海应用。",
+	notchPrivacy: "它只运行 hermes CLI（只读的配额/监控 JSON）并打开 hermes:// 链接。不联网，不读取凭据。",
+	notchOpenFailed: "无法打开 Quota Notch。",
+	notchNoScript: (url) => `已安装的插件没有 macos/ 文件夹。请从 ${url} 获取并运行 macos/install.sh。`,
+	notchRemote: (platform) => `此网关的 backend 运行在 ${platform} 上；请在运行 Hermes 的 Mac 上安装该应用。`,
 };
 
 const I18N_ZH_HANT = {
@@ -11983,6 +12261,25 @@ const I18N_ZH_HANT = {
 	nowTitle: "目前",
 	nowAccount: (name = "", s = "", w = "") => `正在使用的 Claude 帳號：${name} · 工作階段 ${s} · 本週 ${w}`,
 	nowAccountSpread: (strategy) => `Claude 帳號：Hermes 分散請求（${strategy}）`,
+	// ---- notch companion ----
+	notchTitle: "瀏海島（macOS）",
+	notchIntro: "Quota Notch 是選用的原生 Mac 應用程式：在 Hermes 視窗之外的 MacBook 瀏海（或選單列）中顯示配額環、執行中的工作階段和提醒。它讀取此外掛自己的 JSON；沒有它外掛也能正常運作。",
+	notchStatus: "配套應用程式",
+	notchRunning: "執行中",
+	notchStopped: "已安裝，未執行",
+	notchNotInstalled: "未安裝",
+	notchHasNotch: "這台 Mac 有瀏海：島會圍繞相機顯示。",
+	notchNoNotch: "這台 Mac 沒有瀏海：應用程式改在選單列中執行。",
+	notchUnknown: "啟動一次後，它會回報這台 Mac 是否有瀏海（沒有則使用選單列）。",
+	notchInstallLabel: "安裝（使用 Xcode Command Line Tools 建置）",
+	notchCopyInstall: "複製",
+	notchOpen: "開啟應用程式",
+	notchLoading: "正在檢查配套應用程式…",
+	notchUpdate: "請更新配額外掛的 backend，以便在此管理瀏海應用程式。",
+	notchPrivacy: "它只執行 hermes CLI（唯讀的配額／監控 JSON）並開啟 hermes:// 連結。不連網，不讀取憑證。",
+	notchOpenFailed: "無法開啟 Quota Notch。",
+	notchNoScript: (url) => `已安裝的外掛沒有 macos/ 資料夾。請從 ${url} 取得並執行 macos/install.sh。`,
+	notchRemote: (platform) => `此閘道的 backend 執行於 ${platform}；請在執行 Hermes 的 Mac 上安裝該應用程式。`,
 };
 
 const I18N_AR = {
@@ -12481,6 +12778,25 @@ const I18N_AR = {
 	nowTitle: "الآن",
 	nowAccount: (name = "", s = "", w = "") => `حساب Claude المستخدم: ${name} · الجلسة ${s} · الأسبوع ${w}`,
 	nowAccountSpread: (strategy) => `حسابات Claude: يوزّع Hermes الطلبات (${strategy})`,
+	// ---- notch companion ----
+	notchTitle: "جزيرة النتوء (macOS)",
+	notchIntro: "Quota Notch تطبيق Mac أصلي اختياري: حلقات الحصص والجلسات الجارية والتنبيهات في نتوء MacBook (أو شريط القوائم) خارج نافذة Hermes. يقرأ JSON الخاص بهذه الإضافة فقط، وتعمل الإضافة بدونه.",
+	notchStatus: "التطبيق المرافق",
+	notchRunning: "قيد التشغيل",
+	notchStopped: "مثبّت، غير مشغّل",
+	notchNotInstalled: "غير مثبّت",
+	notchHasNotch: "لهذا الـ Mac نتوء: تظهر الجزيرة حول الكاميرا.",
+	notchNoNotch: "ليس لهذا الـ Mac نتوء: يعمل التطبيق في شريط القوائم بدلًا من ذلك.",
+	notchUnknown: "شغّله مرة واحدة؛ بعدها يبلغ إن كان لهذا الـ Mac نتوء (وإلا يستخدم شريط القوائم).",
+	notchInstallLabel: "التثبيت (يُبنى باستخدام Xcode Command Line Tools)",
+	notchCopyInstall: "نسخ",
+	notchOpen: "فتح التطبيق",
+	notchLoading: "جارٍ التحقق من التطبيق المرافق…",
+	notchUpdate: "حدّث backend إضافة الحصص لإدارة تطبيق النتوء من هنا.",
+	notchPrivacy: "لا يشغّل إلا واجهة hermes السطرية (JSON للحصص/المراقبة للقراءة فقط) ويفتح روابط hermes://. لا شبكة ولا بيانات اعتماد.",
+	notchOpenFailed: "تعذّر فتح Quota Notch.",
+	notchNoScript: (url) => `الإضافة المثبّتة لا تحتوي على مجلد macos/. احصل عليه من ${url} وشغّل macos/install.sh.`,
+	notchRemote: (platform) => `يعمل backend هذه البوابة على ${platform}؛ ثبّت التطبيق على الـ Mac الذي يشغّل Hermes.`,
 };
 
 const I18N_BUNDLES = {
