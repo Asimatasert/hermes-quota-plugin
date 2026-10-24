@@ -64,7 +64,8 @@ Payloads carry `monitor_version` and `generated_at`. The monitor schema version
 remains `1`, independently of the plugin release version. Snapshot sections fail
 independently; inspect `errors` and `timings_ms` instead of interpreting missing
 data as zero activity. Recommendations are advisory and do not switch models.
-`set-budget`, `set-priority` and `set-strategy` are unavailable in this release.
+`set-budget`, `set-priority` and `set-strategy` are unavailable in this release
+unless `fullMode` is on (see below).
 
 ## Scope: `monitorScope` (opt-in)
 
@@ -95,6 +96,38 @@ hermes config set plugins.entries.quota.settings.monitorScope all
 Privacy: `all` shows content of sessions that belong to other profiles and to
 other apps (titles, models, sizes, paths) inside this profile's Desktop pane.
 Keep `active` on shared machines or when profiles separate people or clients.
+
+## Full mode: `fullMode` (opt-in)
+
+`plugins.entries.quota.settings.fullMode`, off by default, turns every trial
+gate above on when it is the literal YAML boolean `true` in the active profile
+(strings such as `"true"` and numbers stay off; the monitor still needs
+`monitorEnabled: true`). It restores the complete pre-3.0 Agent Monitor:
+
+```bash
+hermes config set plugins.entries.quota.settings.fullMode true
+```
+
+- everything `monitorScope: all` adds, plus Usage/Health across every profile;
+- **credential-pool metadata**: each profile's `auth.json` is read as a plain
+  file (never written); only the safe row subset leaves the backend (label,
+  auth type, source, priority, short pool id, status), never tokens or keys;
+- **Accounts tab writes**: drag-and-drop / Alt+↑↓ credential order and the
+  per-profile strategy, each behind a confirm dialog that shows the exact
+  command. The backend validates the change, then runs Hermes' own CLI with a
+  fixed argv (`hermes --profile <owner> auth priority <provider> <id> <n>` /
+  `hermes --profile <profile> config set credential_pool_strategies.<provider> <s>`),
+  re-reads the result and logs it in the `account_audit` table
+  (`recent_changes` in `accounts --json`);
+- **budget writes**: `set-budget` stores the widget budget in this profile's
+  `quota_monitor.json` (0600, atomic replace), so `get_budget` sees it;
+- **shared Kanban** boards in the snapshot and the Kanban tab;
+- the seven **monitor agent tools** register; every call re-checks the setting,
+  so turning it off disables them without a restart.
+
+The widget enables writes only when the backend payload says `full_mode: true`;
+capability flags alone never do. With the setting absent or not literally
+`true`, every gate behaves exactly as in the read-only trial above.
 
 The Live view and the agents card pin a **Now** block at the top (accent
 stripe): the focused chat (`focusedStoredSessionId`) when it is open, and the

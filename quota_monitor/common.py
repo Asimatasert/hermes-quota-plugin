@@ -43,8 +43,12 @@ def profile_homes(root: Optional[Path] = None) -> List[Tuple[str, Path]]:
     """Return only the selected profile; a root argument cannot widen consent.
 
     The former machine-wide enumeration crossed profile privacy boundaries.
-    Cross-profile enrollment is deliberately unavailable in the local trial.
+    Cross-profile enrollment is deliberately unavailable in the local trial; ``fullMode: true`` restores
+    it (every profile of the active profile's own Hermes root, whatever ``root`` a caller passes).
     """
+    from . import trial  # local: trial imports this module
+    if trial.all_profiles():
+        return trial.all_profile_homes()
     home = hermes_home()
     name = home.name if home.parent.name == "profiles" else "default"
     return [(name, home)]

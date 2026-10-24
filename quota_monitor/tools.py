@@ -5,6 +5,8 @@ agent, so other sessions' content cannot steer it.
 
 Trial contract: the tools do not register, and every handler refuses direct invocation before reading any
 monitor data (a tool registry from an older session cannot be used to bypass the backend boundary).
+Full mode (``plugins.entries.quota.settings.fullMode: true``) registers the seven monitor tools; every call
+re-checks the setting (and ``monitorEnabled``), so turning it off disables them without a restart.
 
 One exception, separately opt-in: ``get_quota_plan`` registers only when
 ``plugins.entries.quota.settings.planToolEnabled`` is the literal YAML boolean ``true`` (default off) and
@@ -37,7 +39,7 @@ def _dump(payload: Dict[str, Any]) -> str:
 
 def _blocked() -> Optional[Dict[str, Any]]:
     """Why a tool call must not proceed, or None when the trial exposes this tool."""
-    if not trial.AGENT_TOOLS:
+    if not trial.agent_tools():
         return {"error": "agent tools are unavailable in the read-only trial",
                 "error_code": "trial-tools-disabled"}
     if not trial.monitor_enrolled():
@@ -305,7 +307,7 @@ def register_tools(ctx: Any) -> List[str]:
             done.append(schema["name"])
         except Exception:
             pass
-    if not trial.AGENT_TOOLS:
+    if not trial.agent_tools():
         return done
     for handler, schema, emoji in TOOLS:
         try:

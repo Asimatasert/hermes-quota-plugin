@@ -243,4 +243,29 @@ def read_prefs() -> Dict[str, Any]:
         return {}
 
 
-# Preference writes are disabled in the read-only trial: no predictable .tmp replace path is reachable.
+def write_prefs(data: Dict[str, Any]) -> None:
+    """Full mode only (``trial.budget_writes()``): replace ``quota_monitor.json`` atomically.
+
+    The temp file is an unpredictable ``mkstemp`` name in the same directory, created 0600; a symlinked
+    target is refused. Outside full mode this raises before touching the disk.
+    """
+    trial.require_enrollment()
+    if not trial.budget_writes():
+        raise trial.TrialError("trial-read-only", "Budget changes are unavailable in the read-only trial")
+    import tempfile
+    path = prefs_path()
+    if path.is_symlink():
+        raise OSError("refusing symlinked monitor prefs")
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, tmp = tempfile.mkstemp(prefix="." + PREFS_NAME + ".", suffix=".tmp", dir=str(path.parent))
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, sort_keys=True)
+        os.replace(tmp, str(path))
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise

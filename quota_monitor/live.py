@@ -191,7 +191,7 @@ def _open_for(r: Dict[str, Any], by_id: Dict, table: Dict) -> Dict[str, Any]:
 # ---------- kanban cards (running rows) ----------
 
 def kanban_cards(root: Optional[Path] = None) -> Dict[str, Dict[str, Any]]:
-    if not trial.SHARED_KANBAN:
+    if not trial.shared_kanban():
         return {}
     out = {}
     for board, db in kanban_dbs(root):

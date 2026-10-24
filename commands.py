@@ -527,7 +527,7 @@ def _setup_monitor_argparse(subs) -> None:
     rec.add_argument("--top", type=int, default=3)
     plan = msubs.add_parser("plan", help="Session vs week pacing per account (cache + history, no network)")
     bud = msubs.add_parser("budget", help="Spend today / month to date vs the stored budget")
-    setb = msubs.add_parser("set-budget", help="Unavailable in the read-only trial (no budget writes)")
+    setb = msubs.add_parser("set-budget", help="Store the daily / monthly budget (USD, 0 clears; fullMode only)")
     setb.add_argument("--daily", type=float, default=None)
     setb.add_argument("--monthly", type=float, default=None)
     acc = msubs.add_parser("accounts", help="Credential pools, strategies, fallbacks and sign-in gaps (read-only)")

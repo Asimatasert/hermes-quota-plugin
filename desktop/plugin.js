@@ -3082,7 +3082,10 @@ async function fetchMonitor(scope, argv) {
 		throw error;
 	}
 	try {
-		return parseJsonOutput(result.output || "", "monitor_version");
+		const payload = parseJsonOutput(result.output || "", "monitor_version");
+		// Only these two payloads report the backend's full mode (absent = off).
+		if (argv[2] === "snapshot" || argv[2] === "accounts") noteBackendMode(scope, payload);
+		return payload;
 	} catch {
 		// Exit 0 without a monitor payload: an older build printing help.
 		return { unsupported: true };
@@ -3136,9 +3139,34 @@ function useMonitorHistory(scope, active) {
 	return active ? asMonitorPayload(query.data) : null;
 }
 
-/** Budgets stay in widget storage; never write through a stale gateway. */
+/**
+ * Budgets live in widget storage. A backend in full mode (its monitor payloads
+ * carry `full_mode: true`) also stores them, so the `get_budget` agent tool
+ * sees them; any other gateway is never written to.
+ */
+const BACKEND_FULL_MODE = new Map();
+function scopeModeKey(scope) {
+	return scope ? `${scope.connectionId || ""}|${scope.profile || ""}` : "";
+}
+function noteBackendMode(scope, payload) {
+	if (!scope || !payload || typeof payload !== "object" || payload.unsupported) return;
+	if (payload.monitor_version == null) return;
+	BACKEND_FULL_MODE.set(scopeModeKey(scope), payload.full_mode === true);
+}
 async function syncBudgetToBackend() {
-	return false;
+	try {
+		const scope = normalizeQuotaScope(host.state.focusedSessionOwner.get());
+		if (!scope || BACKEND_FULL_MODE.get(scopeModeKey(scope)) !== true) return false;
+		await quotaCli(scope, [
+			"quota", "monitor", "set-budget",
+			"--daily", String(budgetDailyAtom.get()),
+			"--monthly", String(budgetMonthlyAtom.get()),
+			"--json",
+		]);
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 // ---- derived facts (pure) ----
@@ -6351,12 +6379,31 @@ function PlanView({ page = false }) {
 //
 // Read-only view of which credentials profiles use, pool strategies, model and
 // fallback chains, and providers that are not signed in. This widget does not
-// expose order or strategy writes, even when an older backend advertises them.
+// expose order or strategy writes, even when an older backend advertises them —
+// unless the backend runs in full mode (`fullMode: true`; the accounts payload
+// then carries `full_mode: true`). In full mode two writes are enabled, both
+// delegated by the backend to Hermes' own CLI after validation:
+//   order    -> `hermes --profile <pool owner> auth priority <provider> <id> <n>`
+//   strategy -> `hermes --profile <profile> config set credential_pool_strategies.<provider> <s>`
+// Every write is confirmed in a dialog that names exactly what changes and for
+// which profiles; the UI is optimistic and rolls back when the write fails.
 
 const ACCOUNTS_TAB_KEY = "accountsTab";
 const accountsTabAtom = atom(true);
 const ACCOUNTS_STALE_S = 600; // older data than this pauses writes until a refetch
-const ACCOUNT_MUTATIONS_ENABLED = false; // backend flags cannot grant account-write authority to the widget
+// Capability flags alone never grant account-write authority to the widget:
+// only an explicit `full_mode: true` from a backend whose fullMode setting is on.
+const ACCOUNT_MUTATIONS_ENABLED = false;
+function accountMutationsEnabled(data) {
+	return ACCOUNT_MUTATIONS_ENABLED || Boolean(data && data.full_mode === true);
+}
+/** Footer hint of a multi-row pool: read-only in the trial, the drag hint (or why it is paused) in full mode. */
+function accountsPoolHint(ctl, pool, t) {
+	if (!accountMutationsEnabled(ctl.env.data)) return t("accountsDragHint");
+	if (!pool.writable) return t("accountsNotWritable");
+	const block = ctl.blocked();
+	return block ? t(`accountsBlocked_${block}`) : t("accountsDragHintEdit");
+}
 const STRATEGY_IDS = ["fill_first", "round_robin", "least_used", "random"];
 const ACCOUNTS_SIGNIN_VISIBLE = 6;
 
@@ -6419,8 +6466,8 @@ function accountsOfficialCommand(change) {
 }
 
 /** One write through the focused profile's gateway; the backend answers one JSON object. */
-async function runAccountsWrite(scope, argv) {
-	if (!ACCOUNT_MUTATIONS_ENABLED) throw new Error("Account changes are disabled in this widget.");
+async function runAccountsWrite(scope, argv, fullMode = false) {
+	if (!ACCOUNT_MUTATIONS_ENABLED && fullMode !== true) throw new Error("Account changes are disabled in this widget.");
 	let output;
 	try {
 		const result = await quotaCli(scope, argv, MONITOR_TIMEOUT_MS, { spawnPriority: "foreground" });
@@ -6532,7 +6579,7 @@ function createAccountsController(initial) {
 		},
 		canReorder(key) {
 			const pool = ctl.pool(key);
-			return Boolean(ACCOUNT_MUTATIONS_ENABLED && pool && pool.writable && !ctl.blocked() &&
+			return Boolean(accountMutationsEnabled(ctl.env.data) && pool && pool.writable && !ctl.blocked() &&
 				ctl.env.data.capabilities && ctl.env.data.capabilities.set_priority);
 		},
 		dragStart(key, id) {
@@ -6585,7 +6632,7 @@ function createAccountsController(initial) {
 			return ctl.state.strategies[k] || (pool.strategies && pool.strategies[profile]) || "fill_first";
 		},
 		proposeStrategy(pool, profile, strategy) {
-			if (!ACCOUNT_MUTATIONS_ENABLED || !pool || ctl.blocked() ||
+			if (!accountMutationsEnabled(ctl.env.data) || !pool || ctl.blocked() ||
 				!(ctl.env.data.capabilities && ctl.env.data.capabilities.set_strategy)) return null;
 			const supported = asList(ctl.env.data.strategies);
 			if (!supported.includes(strategy)) return null;
@@ -6619,13 +6666,14 @@ function createAccountsController(initial) {
 		},
 		async confirm() {
 			const change = ctl.state.confirm;
-			if (!ACCOUNT_MUTATIONS_ENABLED || !change || ctl.state.busy) return null;
+			const fullMode = accountMutationsEnabled(ctl.env.data);
+			if (!fullMode || !change || ctl.state.busy) return null;
 			// a retry after a failed attempt re-applies the optimistic value first
 			if (change.kind === "priority") ctl.set({ orders: { ...ctl.state.orders, [change.key]: change.ids } });
 			else ctl.set({ strategies: { ...ctl.state.strategies, [change.key]: change.to } });
 			ctl.set({ busy: true, error: null });
 			try {
-				const res = await ctl.env.write(ctl.env.scope, change.argv);
+				const res = await ctl.env.write(ctl.env.scope, change.argv, fullMode);
 				ctl.set({ busy: false });
 				ctl.rollback(change); // the server's state replaces the optimistic value
 				ctl.set({ confirm: null });
@@ -6801,7 +6849,7 @@ function StrategyControl({ ctl, pool, profile, page }) {
 	const t = useQT();
 	const value = ctl.strategyFor(pool, profile);
 	const supported = asList(ctl.env.data && ctl.env.data.strategies).filter((s) => STRATEGY_IDS.includes(s));
-	const blocked = !ACCOUNT_MUTATIONS_ENABLED || Boolean(ctl.blocked());
+	const blocked = !accountMutationsEnabled(ctl.env.data) || Boolean(ctl.blocked());
 	return jsxs("div", {
 		"data-strategy-profile": profile,
 		title: t(`strategyHint_${value}`),
@@ -6915,7 +6963,7 @@ function PoolCard({ ctl, pool, nowSec, page }) {
 				style: { ...UI.col, gap: 3, padding: page ? "6px 10px 8px" : "6px 8px 7px", borderTop: "1px solid var(--ui-stroke-tertiary)", background: "var(--ui-bg-tertiary)" },
 				children: [
 					rows.length > 1
-						? jsx("span", { style: { ...UI.tiny, lineHeight: 1.4 }, children: t("accountsDragHint") }, "hint")
+						? jsx("span", { style: { ...UI.tiny, lineHeight: 1.4 }, children: accountsPoolHint(ctl, pool, t) }, "hint")
 						: jsx("span", { style: { ...UI.tiny, lineHeight: 1.4 }, children: t("accountsSingle") }, "hint"),
 					pool.shared && rows.length > 1
 						? jsx("span", { "data-shared-warning": true, style: { ...UI.tiny, lineHeight: 1.4, color: "var(--ui-orange)" }, children: t("accountsSharedWarning", pool.owner, others.join(", ")) }, "warn")
@@ -7251,7 +7299,7 @@ function AccountsView({ page = false, initialState = null, accountsOverride = nu
 				"data-accounts-explainer": true,
 				className: "rounded-lg border border-dashed px-3 py-2",
 				style: { ...UI.meta, lineHeight: 1.45, borderColor: "var(--ui-stroke-secondary)" },
-				children: t("accountsExplainer"),
+				children: t(accountMutationsEnabled(data) ? "accountsExplainerEdit" : "accountsExplainer"),
 			}, "explain"),
 			block === "stale" || block === "loading"
 				? jsx("div", { "data-accounts-paused": block, style: { ...UI.meta, color: "var(--ui-yellow)" }, children: t(`accountsBlocked_${block}`) }, "paused")
@@ -7664,6 +7712,7 @@ const I18N_EN = {
 	accountsTabLabel: "Accounts tab",
 	accountsTabHint: "Read-only view of pool metadata, strategies, fallbacks and sign-in gaps. Hide it if you do not need this information.",
 	accountsExplainer: "Hermes picks credentials from provider pools. Profiles without their own login share the default profile's pool; strategy is per profile. This view is read-only: account order and strategy cannot be changed here, regardless of backend flags.",
+	accountsExplainerEdit: "Hermes picks a credential from a provider's pool. Profiles without their own login share the default profile's pool, so its order applies to all of them; the strategy is set per profile. Changes run Hermes' own CLI after you confirm.",
 	accountsPoolsTitle: "Credential pools",
 	accountsPoolsSub: (n) => `${n} pool${n === 1 ? "" : "s"}`,
 	accountsNoPools: "No pooled credentials yet. Sign in below or run `hermes auth add <provider>`.",
@@ -7691,6 +7740,7 @@ const I18N_EN = {
 	accountsMoveUp: (label) => `Move ${label} up`,
 	accountsMoveDown: (label) => `Move ${label} down`,
 	accountsDragHint: "Read-only: account order cannot be changed from this widget.",
+	accountsDragHintEdit: "Drag a row, or use ▲▼ / Alt+↑↓, to change which account is tried first.",
 	accountsNotWritable: "This pool can't be reordered from here (a row has no pool id).",
 	accountsSingle: "One account — nothing to order. Add another with `hermes auth add <provider>`.",
 	accountsBlocked_loading: "Refreshing account data… changes are paused until it is current.",
@@ -8181,6 +8231,7 @@ const I18N_TR = {
 	accountsTabLabel: "Hesaplar sekmesi",
 	accountsTabHint: "Havuz meta verileri, stratejiler, yedekler ve giriş eksikleri için salt okunur görünüm. Bu bilgiye ihtiyacın yoksa gizleyebilirsin.",
 	accountsExplainer: "Hermes sağlayıcı havuzlarından kimlik seçer. Kendi girişi olmayan profiller default profilin havuzunu paylaşır; strateji profil başınadır. Bu görünüm salt okunurdur: hesap sırası ve strateji, backend bayrakları ne olursa olsun burada değiştirilemez.",
+	accountsExplainerEdit: "Hermes bir sağlayıcının havuzundan bir kimlik seçer. Kendi girişi olmayan profiller default profilin havuzunu paylaşır; sıralama hepsine uygulanır, strateji ise profil başınadır. Değişiklikler sen onaylayınca Hermes'in kendi CLI'ı ile yapılır.",
 	accountsPoolsTitle: "Kimlik havuzları",
 	accountsPoolsSub: (n) => `${n} havuz`,
 	accountsNoPools: "Henüz havuzda kimlik yok. Aşağıdan giriş yap ya da `hermes auth add <sağlayıcı>` çalıştır.",
@@ -8208,6 +8259,7 @@ const I18N_TR = {
 	accountsMoveUp: (label) => `${label} yukarı taşı`,
 	accountsMoveDown: (label) => `${label} aşağı taşı`,
 	accountsDragHint: "Salt okunur: hesap sırası bu widget'tan değiştirilemez.",
+	accountsDragHintEdit: "İlk denenecek hesabı değiştirmek için satırı sürükle ya da ▲▼ / Alt+↑↓ kullan.",
 	accountsNotWritable: "Bu havuz buradan sıralanamaz (bir satırın havuz kimliği yok).",
 	accountsSingle: "Tek hesap — sıralanacak bir şey yok. Bir tane daha eklemek için `hermes auth add <sağlayıcı>`.",
 	accountsBlocked_loading: "Hesap verisi yenileniyor… güncel olana kadar değişiklikler durduruldu.",
@@ -8720,6 +8772,7 @@ const I18N_DE = {
 	accountsTabLabel: "Konten-Tab",
 	accountsTabHint: "Schreibgeschützte Ansicht von Pool-Metadaten, Strategien, Fallbacks und fehlenden Anmeldungen. Ausblenden, wenn Sie diese Informationen nicht benötigen.",
 	accountsExplainer: "Hermes wählt Zugangsdaten aus Anbieter-Pools. Profile ohne eigene Anmeldung teilen den Pool des Standardprofils; die Strategie gilt pro Profil. Diese Ansicht ist schreibgeschützt: Konto-Reihenfolge und Strategie lassen sich hier unabhängig von Backend-Flags nicht ändern.",
+	accountsExplainerEdit: "Hermes wählt Zugangsdaten aus dem Pool eines Anbieters. Profile ohne eigene Anmeldung teilen den Pool des Standardprofils, seine Reihenfolge gilt also für alle; die Strategie wird pro Profil festgelegt. Änderungen laufen nach Ihrer Bestätigung über die Hermes-CLI.",
 	accountsPoolsTitle: "Zugangsdaten-Pools",
 	accountsPoolsSub: (n) => `${n} ${n === 1 ? "Pool" : "Pools"}`,
 	accountsNoPools: "Noch keine Zugangsdaten im Pool. Melden Sie sich unten an oder führen Sie `hermes auth add <provider>` aus.",
@@ -8747,6 +8800,7 @@ const I18N_DE = {
 	accountsMoveUp: (label) => `${label} nach oben`,
 	accountsMoveDown: (label) => `${label} nach unten`,
 	accountsDragHint: "Schreibgeschützt: Die Konto-Reihenfolge kann in diesem Widget nicht geändert werden.",
+	accountsDragHintEdit: "Zeile ziehen oder ▲▼ / Alt+↑↓ nutzen, um das zuerst probierte Konto zu ändern.",
 	accountsNotWritable: "Dieser Pool lässt sich hier nicht umsortieren (einer Zeile fehlt die Pool-ID).",
 	accountsSingle: "Ein Konto — nichts zu sortieren. Weitere mit `hermes auth add <provider>` hinzufügen.",
 	accountsBlocked_loading: "Kontodaten werden aktualisiert… Änderungen pausieren, bis sie aktuell sind.",
@@ -9237,6 +9291,7 @@ const I18N_ES = {
 	accountsTabLabel: "Pestaña Cuentas",
 	accountsTabHint: "Vista de solo lectura de metadatos de pools, estrategias, respaldos y accesos pendientes. Ocúltala si no necesitas esta información.",
 	accountsExplainer: "Hermes elige credenciales de los pools de cada proveedor. Los perfiles sin inicio de sesión propio comparten el pool predeterminado; la estrategia es por perfil. Esta vista es de solo lectura: aquí no se puede cambiar el orden ni la estrategia, independientemente de las capacidades del backend.",
+	accountsExplainerEdit: "Hermes elige una credencial del pool de un proveedor. Los perfiles sin inicio de sesión propio comparten el pool del perfil predeterminado, así que su orden se aplica a todos; la estrategia es por perfil. Los cambios se hacen con la CLI de Hermes cuando confirmas.",
 	accountsPoolsTitle: "Pools de credenciales",
 	accountsPoolsSub: (n) => `${n} ${n === 1 ? "pool" : "pools"}`,
 	accountsNoPools: "Aún no hay credenciales en el pool. Inicia sesión abajo o ejecuta `hermes auth add <provider>`.",
@@ -9264,6 +9319,7 @@ const I18N_ES = {
 	accountsMoveUp: (label) => `Subir ${label}`,
 	accountsMoveDown: (label) => `Bajar ${label}`,
 	accountsDragHint: "Solo lectura: no se puede cambiar el orden de las cuentas desde este widget.",
+	accountsDragHintEdit: "Arrastra una fila, o usa ▲▼ / Alt+↑↓, para cambiar qué cuenta se prueba primero.",
 	accountsNotWritable: "Este pool no se puede reordenar desde aquí (a una fila le falta el id del pool).",
 	accountsSingle: "Una sola cuenta — nada que ordenar. Añade otra con `hermes auth add <provider>`.",
 	accountsBlocked_loading: "Actualizando datos de cuentas… los cambios esperan a que estén al día.",
@@ -9754,6 +9810,7 @@ const I18N_FR = {
 	accountsTabLabel: "Onglet Comptes",
 	accountsTabHint: "Vue en lecture seule des métadonnées des pools, stratégies, secours et connexions manquantes. Masquez-la si ces informations ne vous sont pas utiles.",
 	accountsExplainer: "Hermes choisit des identifiants dans les pools des fournisseurs. Les profils sans connexion propre partagent le pool par défaut ; la stratégie est définie par profil. Cette vue est en lecture seule : l'ordre des comptes et la stratégie ne peuvent pas être modifiés ici, quelles que soient les capacités du backend.",
+	accountsExplainerEdit: "Hermes choisit un identifiant dans le pool d'un fournisseur. Les profils sans connexion propre partagent le pool du profil par défaut : son ordre s'applique donc à tous ; la stratégie se règle par profil. Les modifications passent par la CLI de Hermes après votre confirmation.",
 	accountsPoolsTitle: "Pools d'identifiants",
 	accountsPoolsSub: (n) => `${n} ${n === 1 ? "pool" : "pools"}`,
 	accountsNoPools: "Aucun identifiant dans un pool pour l'instant. Connectez-vous ci-dessous ou lancez `hermes auth add <provider>`.",
@@ -9781,6 +9838,7 @@ const I18N_FR = {
 	accountsMoveUp: (label) => `Monter ${label}`,
 	accountsMoveDown: (label) => `Descendre ${label}`,
 	accountsDragHint: "Lecture seule : l'ordre des comptes ne peut pas être modifié depuis ce widget.",
+	accountsDragHintEdit: "Faites glisser une ligne, ou utilisez ▲▼ / Alt+↑↓, pour changer le compte essayé en premier.",
 	accountsNotWritable: "Ce pool ne peut pas être réordonné d'ici (une ligne n'a pas d'id de pool).",
 	accountsSingle: "Un seul compte — rien à ordonner. Ajoutez-en un avec `hermes auth add <provider>`.",
 	accountsBlocked_loading: "Actualisation des données de compte… les modifications attendent qu'elles soient à jour.",
@@ -10271,6 +10329,7 @@ const I18N_RU = {
 	accountsTabLabel: "Вкладка «Аккаунты»",
 	accountsTabHint: "Раздел только для чтения: метаданные пулов, стратегии, резервные модели и недостающие входы. Скройте, если эта информация не нужна.",
 	accountsExplainer: "Hermes выбирает учетные данные из пулов провайдеров. Профили без собственного входа используют пул по умолчанию; стратегия задается для каждого профиля. Этот раздел доступен только для чтения: порядок учетных данных и стратегию здесь изменить нельзя независимо от флагов backend.",
+	accountsExplainerEdit: "Hermes берёт учётные данные из пула провайдера. Профили без собственного входа используют пул профиля по умолчанию, поэтому его порядок действует для всех; стратегия задаётся для каждого профиля. Изменения выполняются через CLI Hermes после вашего подтверждения.",
 	accountsPoolsTitle: "Пулы учётных данных",
 	accountsPoolsSub: (n) => ruN(n, "пул", "пула", "пулов"),
 	accountsNoPools: "В пулах пока нет учётных данных. Войдите ниже или выполните `hermes auth add <provider>`.",
@@ -10298,6 +10357,7 @@ const I18N_RU = {
 	accountsMoveUp: (label) => `Переместить ${label} выше`,
 	accountsMoveDown: (label) => `Переместить ${label} ниже`,
 	accountsDragHint: "Только чтение: порядок учетных данных нельзя изменить в этом виджете.",
+	accountsDragHintEdit: "Перетащите строку или используйте ▲▼ / Alt+↑↓, чтобы выбрать аккаунт, который пробуется первым.",
 	accountsNotWritable: "Этот пул нельзя переупорядочить отсюда (у строки нет id пула).",
 	accountsSingle: "Один аккаунт — упорядочивать нечего. Добавьте ещё: `hermes auth add <provider>`.",
 	accountsBlocked_loading: "Данные аккаунтов обновляются… изменения ждут актуальных данных.",
@@ -10788,6 +10848,7 @@ const I18N_JA = {
 	accountsTabLabel: "アカウントタブ",
 	accountsTabHint: "プールのメタデータ、戦略、代替モデル、未サインインを表示する読み取り専用の画面です。不要なら非表示にできます。",
 	accountsExplainer: "Hermes はプロバイダーのプールから認証情報を選びます。自分のログインがないプロファイルは default のプールを共有し、戦略はプロファイルごとです。この画面は読み取り専用です。backend の機能フラグにかかわらず、アカウント順序や戦略は変更できません。",
+	accountsExplainerEdit: "Hermes はプロバイダーのプールから認証情報を選びます。自分のログインを持たないプロファイルは default プロファイルのプールを共有するため、その順序はすべてに適用されます。戦略はプロファイルごとです。変更は確認後に Hermes 自身の CLI で実行されます。",
 	accountsPoolsTitle: "認証情報プール",
 	accountsPoolsSub: (n) => `${n} 個のプール`,
 	accountsNoPools: "プールに認証情報がまだありません。下でサインインするか `hermes auth add <provider>` を実行してください。",
@@ -10815,6 +10876,7 @@ const I18N_JA = {
 	accountsMoveUp: (label) => `${label} を上へ`,
 	accountsMoveDown: (label) => `${label} を下へ`,
 	accountsDragHint: "読み取り専用: このウィジェットからアカウントの順序は変更できません。",
+	accountsDragHintEdit: "行をドラッグするか ▲▼ / Alt+↑↓ で、最初に試すアカウントを変更します。",
 	accountsNotWritable: "このプールはここでは並べ替えできません（プール ID のない行があります）。",
 	accountsSingle: "アカウントは 1 つだけ — 並べ替えるものはありません。`hermes auth add <provider>` で追加できます。",
 	accountsBlocked_loading: "アカウントデータを更新中… 最新になるまで変更は保留されます。",
@@ -11305,6 +11367,7 @@ const I18N_ZH = {
 	accountsTabLabel: "账号标签页",
 	accountsTabHint: "只读查看凭据池元数据、策略、备用模型和未登录项。如果不需要这些信息，可以隐藏。",
 	accountsExplainer: "Hermes 从提供方的凭据池中选取凭据。没有自己登录的配置共用默认配置的池，策略按配置单独设置。此视图为只读：无论后端能力标志如何，都不能在此更改账号顺序或策略。",
+	accountsExplainerEdit: "Hermes 从提供方的凭据池中选取凭据。没有自己登录的配置共用默认配置的池，因此池的顺序对它们全部生效；策略按配置单独设置。确认后，变更通过 Hermes 自己的 CLI 执行。",
 	accountsPoolsTitle: "凭据池",
 	accountsPoolsSub: (n) => `${n} 个池`,
 	accountsNoPools: "池中还没有凭据。在下方登录，或运行 `hermes auth add <provider>`。",
@@ -11332,6 +11395,7 @@ const I18N_ZH = {
 	accountsMoveUp: (label) => `上移 ${label}`,
 	accountsMoveDown: (label) => `下移 ${label}`,
 	accountsDragHint: "只读：无法从此 widget 更改账号顺序。",
+	accountsDragHintEdit: "拖动一行，或使用 ▲▼ / Alt+↑↓，更改优先尝试的账号。",
 	accountsNotWritable: "无法在此调整此池的顺序（有一行缺少池 ID）。",
 	accountsSingle: "只有一个账号 — 无需排序。可用 `hermes auth add <provider>` 再添加。",
 	accountsBlocked_loading: "正在刷新账号数据… 数据最新前暂停变更。",
@@ -11822,6 +11886,7 @@ const I18N_ZH_HANT = {
 	accountsTabLabel: "帳號分頁",
 	accountsTabHint: "唯讀檢視憑證池中繼資料、策略、備用模型和未登入項。如果不需要這些資訊，可以隱藏。",
 	accountsExplainer: "Hermes 從提供方的憑證池中選取憑證。沒有自己登入的設定檔共用預設設定檔的池，策略按設定檔單獨設定。此檢視為唯讀：無論後端能力旗標如何，都不能在此變更帳號順序或策略。",
+	accountsExplainerEdit: "Hermes 從提供方的憑證池中選取憑證。沒有自己登入的設定檔共用預設設定檔的池，因此池的順序對它們全部生效；策略按設定檔單獨設定。確認後，變更通過 Hermes 自己的 CLI 執行。",
 	accountsPoolsTitle: "憑證池",
 	accountsPoolsSub: (n) => `${n} 個池`,
 	accountsNoPools: "池中還沒有憑證。在下方登入，或執行 `hermes auth add <provider>`。",
@@ -11849,6 +11914,7 @@ const I18N_ZH_HANT = {
 	accountsMoveUp: (label) => `上移 ${label}`,
 	accountsMoveDown: (label) => `下移 ${label}`,
 	accountsDragHint: "唯讀：無法從此 widget 變更帳號順序。",
+	accountsDragHintEdit: "拖動一行，或使用 ▲▼ / Alt+↑↓，更改優先嘗試的帳號。",
 	accountsNotWritable: "無法在此調整此池的順序（有一行缺少池 ID）。",
 	accountsSingle: "只有一個帳號 — 無需排序。可用 `hermes auth add <provider>` 再新增。",
 	accountsBlocked_loading: "正在重新整理帳號資料… 資料最新前暫停變更。",
@@ -12339,6 +12405,7 @@ const I18N_AR = {
 	accountsTabLabel: "تبويب الحسابات",
 	accountsTabHint: "عرض للقراءة فقط لبيانات المجمّعات والاستراتيجيات والبدائل وتسجيلات الدخول الناقصة. أخفِه إن لم تكن بحاجة إلى هذه المعلومات.",
 	accountsExplainer: "يختار Hermes بيانات اعتماد من مجمّعات المزوّدين. تتشارك الملفات التي لا تملك تسجيل دخول خاصًا بها المجمّع الافتراضي، والاستراتيجية خاصة بكل ملف. هذا العرض للقراءة فقط: لا يمكن تغيير ترتيب الحسابات أو الاستراتيجية هنا مهما كانت أعلام قدرات backend.",
+	accountsExplainerEdit: "يختار Hermes بيانات اعتماد من مجمّع المزوّد. الملفات الشخصية التي لا تملك تسجيل دخول خاصًا بها تتشارك مجمّع الملف الافتراضي، فيسري ترتيبه عليها كلها؛ أما الاستراتيجية فتُضبط لكل ملف. تُنفَّذ التغييرات عبر واجهة Hermes السطرية بعد تأكيدك.",
 	accountsPoolsTitle: "مجمّعات بيانات الاعتماد",
 	accountsPoolsSub: (n) => arN(n, "مجمّع واحد", "مجمّعان", "مجمّعات", "مجمّعًا"),
 	accountsNoPools: "لا توجد بيانات اعتماد في المجمّعات بعد. سجّل الدخول أدناه أو شغّل `hermes auth add <provider>`.",
@@ -12366,6 +12433,7 @@ const I18N_AR = {
 	accountsMoveUp: (label) => `نقل ${label} للأعلى`,
 	accountsMoveDown: (label) => `نقل ${label} للأسفل`,
 	accountsDragHint: "للقراءة فقط: لا يمكن تغيير ترتيب الحسابات من هذه الأداة.",
+	accountsDragHintEdit: "اسحب صفًا، أو استخدم ▲▼ / Alt+↑↓، لتغيير الحساب الذي يُجرَّب أولًا.",
 	accountsNotWritable: "لا يمكن إعادة ترتيب هذا المجمّع من هنا (أحد الصفوف بلا معرّف مجمّع).",
 	accountsSingle: "حساب واحد — لا شيء لترتيبه. أضف آخر عبر `hermes auth add <provider>`.",
 	accountsBlocked_loading: "جارٍ تحديث بيانات الحسابات… التغييرات متوقفة حتى تصبح حديثة.",

@@ -17,7 +17,7 @@ from typing import Optional
 from urllib.parse import quote
 
 from . import trial
-from .common import hermes_home, hermes_root, iso_ts, read_config
+from .common import hermes_home, hermes_root, iso_ts, read_config, read_json
 
 DAY = 86400
 RECENT_ERROR = 3600  # an error newer than the last success within this window marks a model failing
@@ -96,8 +96,13 @@ def _config(home: Path):
 # ---------- accounts ----------
 
 def _auth_pool(home: Path) -> dict:
-    # Pool metadata is unavailable until a supported sanitized host API exists.
-    return {}
+    # Pool metadata is unavailable until a supported sanitized host API exists — except in full mode, where
+    # auth.json is read as a plain file (never written) and only safe fields reach the payload (see _accounts).
+    if not trial.account_metadata():
+        return {}
+    data = read_json(home / "auth.json")
+    pool = data.get("credential_pool") if isinstance(data, dict) else None
+    return pool if isinstance(pool, dict) else {}
 
 
 def read_pools(home: Optional[Path] = None) -> dict:

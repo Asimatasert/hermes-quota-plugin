@@ -12,7 +12,8 @@ Entry points (each returns one JSON-able dict carrying ``monitor_version`` and `
 
 Every reader and store entry point checks enrollment first; while the monitor is OFF no
 file, sqlite database or process table is read or written. Account/budget writes, agent
-tools and shared-Kanban reads are unavailable. Costs are API-price estimates, never
+tools and shared-Kanban reads are unavailable unless ``fullMode`` is literally ``true``
+(see trial.py; writes then go through Hermes' own CLI or this plugin's own prefs file). Costs are API-price estimates, never
 billed amounts, and there is no month-end projection (``projection_available: false``).
 Network is never touched here (quota numbers come from the plugin's ``quota_cache.json``).
 See docs/monitor.md for the full contract.
@@ -115,6 +116,8 @@ def snapshot(record_sample: bool = True) -> Dict[str, Any]:
     }
     out["errors"] = errors
     out["timings_ms"] = timings
+    if trial.full_mode():
+        out["full_mode"] = True
     return _stamp(out)
 
 
@@ -233,13 +236,33 @@ def read_budget() -> Dict[str, Any]:
 
 
 def set_budget(daily: Optional[float] = None, monthly: Optional[float] = None) -> Dict[str, Any]:
-    """Unavailable in the read-only trial: no preference write path is enabled yet.
+    """Store the widget's budget in ``$HERMES_HOME/quota_monitor.json`` (full mode only). None leaves a value
+    unchanged, 0 clears it; negative values are rejected.
 
-    Returns the structured refusal (rather than raising) so the one-JSON-object CLI contract keeps the
-    machine-readable code.
+    Outside full mode this is unavailable (read-only trial) and returns the structured refusal (rather than
+    raising) so the one-JSON-object CLI contract keeps the machine-readable code.
     """
-    return _stamp({"error": "Budget changes are unavailable in the read-only trial",
-                   "error_code": "trial-read-only"})
+    if not trial.budget_writes():
+        return _stamp({"error": "Budget changes are unavailable in the read-only trial",
+                       "error_code": "trial-read-only"})
+    from . import store
+    try:
+        trial.require_enrollment()
+    except trial.TrialError as e:
+        return _disabled(e)
+    for name, v in (("daily", daily), ("monthly", monthly)):
+        if v is not None and not (isinstance(v, (int, float)) and v == v and v >= 0 and v != float("inf")):
+            return _stamp({"error": "%s budget must be a finite number >= 0" % name, "error_code": "bad-budget"})
+    prefs = store.read_prefs()
+    raw = prefs.get("budget")
+    budget: Dict[str, Any] = raw if isinstance(raw, dict) else {}
+    if daily is not None:
+        budget["daily"] = float(daily)
+    if monthly is not None:
+        budget["monthly"] = float(monthly)
+    prefs["budget"] = budget
+    store.write_prefs(prefs)
+    return _stamp({"budget": read_budget(), "full_mode": True})
 
 
 def budget_payload() -> Dict[str, Any]:
@@ -265,6 +288,13 @@ def accounts_view() -> Dict[str, Any]:
     except trial.TrialError as e:
         return _disabled(e)
     out = accounts.accounts_payload()
+    if trial.account_mutations():
+        # Full mode: the last changes this plugin made through Hermes' CLI (ids/positions only, no secrets).
+        from . import store
+        try:
+            out["recent_changes"] = store.audit_rows(10)
+        except Exception:
+            out["recent_changes"] = []
     return _stamp(out)
 
 
