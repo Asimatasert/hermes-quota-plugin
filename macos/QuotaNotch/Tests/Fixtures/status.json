@@ -1,0 +1,41 @@
+{
+  "age_s": 42.0,
+  "codex_special_reset": null,
+  "fetched_at": "__ISO(-42)__",
+  "installed_sha": null,
+  "plugin_version": "3.0.0",
+  "future_root_field": {"anything": [1, 2, 3]},
+  "providers": {
+    "anthropic": {
+      "account_balances": [], "api_calls_available": null, "details": [], "label": "anthropic",
+      "account_label": "work", "plan": "max", "unavailable_reason": null,
+      "windows": [
+        {"label": "Current session", "used_percent": 58.0, "reset_at": "__ISO(+6780)__"},
+        {"label": "Current week", "used_percent": 41.0, "reset_at": "__ISO(+302400)__"},
+        {"label": "Sonnet week", "used_percent": 3.0, "reset_at": "__ISO(+302400)__"}
+      ]
+    },
+    "anthropic:home": {
+      "provider": "anthropic", "account_label": "home", "label": "anthropic · home", "details": [],
+      "windows": [
+        {"label": "Current session", "used_percent": 12.0, "reset_at": "__ISO(+9000)__"},
+        {"label": "Current week", "used_percent": 87.5, "reset_at": "__ISO(+86400)__"}
+      ]
+    },
+    "openai-codex": {
+      "label": "openai-codex", "details": [], "plan": "plus",
+      "windows": [{"label": "Session", "used_percent": 20, "reset_at": "__ISO(+3600)__"}],
+      "accounts": [
+        {"id": "acct-a", "label": "personal", "details": [],
+         "windows": [{"label": "Session", "used_percent": 20, "reset_at": "__ISO(+3600)__"},
+                     {"label": "Weekly", "used_percent": 96, "reset_at": "__ISO(+200000)__"}]},
+        {"id": "acct-b", "label": "team", "details": ["stale: rate limited, last known value"],
+         "windows": [{"label": "Session", "used_percent": 5, "reset_at": "__ISO(+7000)__"}]}
+      ]
+    },
+    "copilot": {"label": "copilot", "details": ["not signed in"], "windows": [], "unavailable_reason": "not configured"},
+    "grok": {"label": "grok", "windows": "not-a-list", "details": null},
+    "broken": "not-an-object"
+  },
+  "timezone": "Europe/Istanbul"
+}

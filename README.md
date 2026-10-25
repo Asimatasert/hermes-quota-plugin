@@ -91,7 +91,15 @@ widget automatically. [TUI setup, commands and limitations](docs/tui-panel.md).
 
 Additional accounts are explicitly configured by directory and display label. Labels such as **Work**, **Personal** or **Account 2** are user-configurable—not hardcoded. Linux is verified; additional platform limitations are documented.
 
+Hermes' own Claude pool can be shown too: `claudePoolAccounts: true` gives one card per account behind the `anthropic` credential pool, grouped by account (same login twice = one card), with its pool position. Opt-in and read-only; it asks Anthropic's OAuth profile endpoint once per token to tell accounts apart.
+
 [Configure Claude accounts →](docs/claude-accounts.md)
+
+## Pacing plan
+
+The **Plan** tab (and `hermes quota monitor plan --json`) answers "how many sessions are left before the weekly reset, and how much of each may I use?": e.g. *6 sessions left until Fri 13:00; you can use ~6.7 % of the week per session (≈ 55 % of a session). Current session: 20 % used — keep going.* It learns how much week one session % costs, your typical session fill and active hours from the monitor's quota history (cache-only estimate without the monitor), projects the week at reset, says whether you are under or over pace and, with several pooled accounts, which one to use now. An opt-in, numbers-only agent tool `get_quota_plan` (`planToolEnabled: true`) lets agents self-pace. [Plan formulas →](docs/monitor.md#plan-session-vs-week-pacing)
+
+`monitorScope: all` (opt-in; default `active`) brings back every profile's open sessions and Claude Code / Copilot CLI sessions in the Live view, with the focused chat and the Claude account in use pinned as **Now**. [Scope and privacy →](docs/monitor.md#scope-monitorscope-opt-in)
 
 ## Privacy and security
 

@@ -9,6 +9,19 @@ Read-only trial contract:
 * ``set_priority`` / ``set_strategy`` refuse immediately: account mutations are unavailable in this trial
   and no write path (CLI child process, audit row) is reachable.
 
+Full mode (``plugins.entries.quota.settings.fullMode: true``, see ``trial.py``) restores the pre-trial view:
+
+* every profile of this Hermes root, and each pool's rows read from ``auth.json`` as a plain file (no
+  ``load_pool``, which can persist normalisations). Only the safe subset of each row is emitted (label, auth
+  type, source, priority, short pool id, status); tokens, refresh tokens and API keys never leave this module;
+* writes are validated against the current state, then delegated to Hermes' OWN CLI in a child process with a
+  fixed argv (no shell):
+
+  - order:    ``hermes --profile <pool owner> auth priority <provider> <id> <position>``
+  - strategy: ``hermes --profile <profile> config set credential_pool_strategies.<provider> <strategy>``
+
+  and the result is re-read from disk, logged in ``quota_monitor.db`` and returned with the new state.
+
 Hermes facts this module mirrors (``agent/credential_pool.py``, ``hermes_cli/auth.py``):
 
 * a named profile with no rows of its own for a provider BORROWS the root's rows (``read_credential_pool``'s
@@ -22,7 +35,13 @@ Hermes facts this module mirrors (``agent/credential_pool.py``, ``hermes_cli/aut
 
 from __future__ import annotations
 
+import json
+import logging
+import os
 import re
+import shutil
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -30,10 +49,15 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from . import trial
 from .common import hermes_home, hermes_root, iso_ts, num, profile_homes, read_config, read_json
 
+logger = logging.getLogger(__name__)
+
 ROOT_PROFILE = "default"
 DEFAULT_STRATEGY = "fill_first"
 # Hermes' SUPPORTED_POOL_STRATEGIES, in the order its own `hermes auth` menu lists them.
 FALLBACK_STRATEGIES = ("fill_first", "round_robin", "least_used", "random")
+CLI_TIMEOUT_S = 60
+_PROVIDER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,79}$")
+_PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _POOL_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 # Row fields that may leave this module. Everything else (tokens, keys, base urls, extra blobs) stays out.
 _SAFE_SOURCE_RE = re.compile(r"^[A-Za-z0-9_.:@-]{0,64}$")
@@ -96,8 +120,15 @@ def supported_strategies() -> List[str]:
 
 def _auth_pool(home: Path) -> Dict[str, List[Dict[str, Any]]]:
     # No documented sanitized pool-metadata API is wired into this trial.
-    # Never open a credential store merely to render optional account metadata.
-    return {}
+    # Never open a credential store merely to render optional account metadata — unless full mode is on,
+    # and then only the safe row subset (see _row) ever leaves this module.
+    if not trial.account_metadata():
+        return {}
+    data = read_json(home / "auth.json")
+    pool = data.get("credential_pool") if isinstance(data, dict) else None
+    if not isinstance(pool, dict):
+        return {}
+    return {str(k): [e for e in v if isinstance(e, dict)] for k, v in pool.items() if isinstance(v, list) and v}
 
 
 def _profile_name(home: Path, root: Path) -> str:
@@ -394,26 +425,193 @@ def accounts_payload(items: Optional[List[Dict[str, Any]]] = None, now: Optional
             "fallback_command": "hermes --profile %s fallback" % name,
             "strategies": _strategies(cfg), "pools": access.get(name, {}),
         })
-    return {
+    metadata = trial.account_metadata()
+    mutations = trial.account_mutations() and metadata
+    out = {
         "active_profile": active_profile(), "root_profile": ROOT_PROFILE,
         "strategies": supported_strategies(), "default_strategy": DEFAULT_STRATEGY,
         "pools": pools, "profiles": profiles, "unavailable": _unavailable(items, root, now),
         "settings_paths": {"providers": PROVIDERS_ACCOUNTS_PATH, "keys": PROVIDERS_KEYS_PATH,
                            "fallbacks": FALLBACK_SETTINGS_PATH},
-        "metadata": {"available": trial.ACCOUNT_METADATA, "reason": trial.METADATA_REASON},
-        "capabilities": {"set_priority": trial.ACCOUNT_MUTATIONS, "set_strategy": trial.ACCOUNT_MUTATIONS,
+        "metadata": {"available": metadata, "reason": None if metadata else trial.METADATA_REASON},
+        "capabilities": {"set_priority": mutations, "set_strategy": mutations,
                          "reorder_fallbacks": False, "assign_account_to_profile": False},
         "errors": errors,
     }
+    if trial.full_mode():
+        out["full_mode"] = True
+    return out
 
 
-# ---------- writes (unavailable in this trial) ----------
-
-def set_priority(provider: str, target: str, priority: Any, profile: Optional[str] = None) -> Dict[str, Any]:
-    """Refuse before any state read or child process: account mutations are unavailable in the trial."""
-    raise AccountsError("trial-read-only", "Account changes are unavailable in the read-only trial")
+# ---------- writes (full mode only) ----------
 
 
-def set_strategy(provider: str, strategy: str, profile: Optional[str] = None) -> Dict[str, Any]:
-    """Refuse before any state read or child process: account mutations are unavailable in the trial."""
-    raise AccountsError("trial-read-only", "Account changes are unavailable in the read-only trial")
+def _require_mutations() -> None:
+    """Refuse before any state read or child process unless full mode enables account writes."""
+    if not (trial.account_mutations() and trial.account_metadata()):
+        raise AccountsError("trial-read-only", "Account changes are unavailable in the read-only trial")
+
+
+Runner = Callable[[List[str], Dict[str, str]], Tuple[int, str]]
+
+
+def hermes_cli_base() -> Tuple[List[str], Dict[str, str]]:
+    """How to start Hermes' own CLI from inside a Hermes process (the same re-exec ``cli.exec`` uses)."""
+    try:
+        import hermes_cli  # type: ignore
+        agent_root = str(Path(hermes_cli.__file__).resolve().parent.parent)
+        pp = os.environ.get("PYTHONPATH", "")
+        return [sys.executable, "-m", "hermes_cli.main"], {
+            "PYTHONPATH": agent_root + (os.pathsep + pp if pp else "")}
+    except Exception:
+        exe = shutil.which("hermes")
+        if not exe:
+            raise AccountsError("hermes-cli-missing", "the Hermes CLI could not be located")
+        return [exe], {}
+
+
+def _default_runner(argv: List[str], extra_env: Dict[str, str]) -> Tuple[int, str]:
+    base, env_add = hermes_cli_base()
+    env = dict(os.environ)
+    env.update(env_add)
+    env.update(extra_env)
+    env.setdefault("NO_COLOR", "1")
+    proc = subprocess.run(base + argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          env=env, timeout=CLI_TIMEOUT_S)
+    return proc.returncode, proc.stdout.decode("utf-8", "replace")
+
+
+def _scrub(text: str) -> str:
+    """CLI output goes back to the widget: cut it short and drop anything token-shaped."""
+    text = re.sub(r"(sk-[A-Za-z0-9_-]{6,}|[A-Za-z0-9_-]{40,})", "[redacted]", text or "")
+    return text.strip()[-600:]
+
+
+def _audit(action: str, profile: str, provider: str, detail: Dict[str, Any]) -> None:
+    logger.info("quota accounts %s profile=%s provider=%s %s", action, profile, provider, json.dumps(detail))
+    try:
+        from . import store
+        store.audit(action, profile, provider, detail)
+    except Exception:  # the write already happened; a log failure must not report it as failed
+        pass
+
+
+def _check_provider(provider: Any) -> str:
+    p = str(provider or "").strip()
+    if not _PROVIDER_RE.match(p):
+        raise AccountsError("bad-provider", "invalid provider id: %r" % (provider,))
+    return p
+
+
+def _check_profile(profile: Any, state: Dict[str, Any]) -> str:
+    p = str(profile or "").strip().lower()
+    if not _PROFILE_RE.match(p):
+        raise AccountsError("bad-profile", "invalid profile name: %r" % (profile,))
+    if p not in {x["profile"] for x in state["profiles"]}:
+        raise AccountsError("unknown-profile", "no profile named %r on this machine" % p)
+    return p
+
+
+def _pool_for(state: Dict[str, Any], provider: str, owner: str) -> Optional[Dict[str, Any]]:
+    return next((p for p in state["pools"] if p["provider"] == provider and p["owner"] == owner), None)
+
+
+def set_priority(provider: str, target: str, priority: Any, profile: Optional[str] = None,
+                 runner: Optional[Runner] = None) -> Dict[str, Any]:
+    """Move pool row ``target`` (its short pool id) of ``provider`` to zero-based ``priority`` in the pool OWNED by
+    ``profile`` (default: the active profile), through ``hermes --profile <owner> auth priority``.
+
+    Full mode only: otherwise refuses before any state read or child process."""
+    _require_mutations()
+    state = accounts_payload()
+    provider = _check_provider(provider)
+    owner = _check_profile(profile or active_profile(), state)
+    pool = _pool_for(state, provider, owner)
+    if pool is None:
+        lender = next((p for p in state["pools"] if p["provider"] == provider and owner in p["used_by"]), None)
+        if lender is not None:
+            raise AccountsError(
+                "borrowed-pool",
+                "profile %r has no %s credentials of its own: it borrows the pool of %r. Reorder that pool "
+                "instead (it applies to every profile sharing it)." % (owner, provider, lender["owner"]),
+                owner=lender["owner"], used_by=lender["used_by"])
+        raise AccountsError("no-pool", "profile %r has no %s credential pool" % (owner, provider))
+    target = str(target or "").strip()
+    rows = pool["rows"]
+    match = [r for r in rows if r["id"] and r["id"] == target]
+    if len(match) != 1:
+        raise AccountsError("unknown-target", "no %s credential with pool id %r in %r's pool" % (provider, target, owner))
+    if isinstance(priority, bool):
+        raise AccountsError("bad-priority", "priority must be an integer")
+    try:
+        new_pos = int(str(priority).strip())
+    except (TypeError, ValueError):
+        raise AccountsError("bad-priority", "priority must be an integer, got %r" % (priority,))
+    if not 0 <= new_pos < len(rows):
+        raise AccountsError("bad-priority", "priority must be between 0 and %d" % (len(rows) - 1))
+    before = [r["id"] for r in rows]
+    cur_pos = before.index(target)
+    affected = list(pool["used_by"])
+    command = ["--profile", owner, "auth", "priority", provider, target, str(new_pos)]
+    result: Dict[str, Any] = {"action": "set-priority", "provider": provider, "owner": owner, "target": target,
+                              "requested": new_pos, "affected_profiles": affected, "shared": pool["shared"],
+                              "command": "hermes " + " ".join(command), "before": before}
+    if cur_pos == new_pos:
+        result.update(changed=False, after=before, effective=cur_pos, cli_output="", state=state)
+        return result
+    code, output = (runner or _default_runner)(command, {})
+    if code != 0:
+        raise AccountsError("cli-failed", "hermes auth priority failed (exit %s): %s" % (code, _scrub(output)),
+                            command=result["command"])
+    new_state = accounts_payload()
+    new_pool = _pool_for(new_state, provider, owner)
+    after = [r["id"] for r in (new_pool or {}).get("rows", [])]
+    effective = after.index(target) if target in after else None
+    result.update(changed=after != before, after=after, effective=effective, cli_output=_scrub(output),
+                  state=new_state)
+    if effective is not None and effective != new_pos:
+        result["note"] = "effective-position-differs"
+    _audit("set-priority", owner, provider, {"target": target, "from": cur_pos, "to": new_pos,
+                                             "effective": effective, "before": before, "after": after,
+                                             "affected": affected})
+    return result
+
+
+def set_strategy(provider: str, strategy: str, profile: Optional[str] = None,
+                 runner: Optional[Runner] = None) -> Dict[str, Any]:
+    """Set ``credential_pool_strategies.<provider>`` in ONE profile's config via ``hermes config set``.
+
+    Full mode only: otherwise refuses before any state read or child process."""
+    _require_mutations()
+    state = accounts_payload()
+    provider = _check_provider(provider)
+    target = _check_profile(profile or active_profile(), state)
+    strategy = str(strategy or "").strip().lower()
+    if strategy not in state["strategies"]:
+        raise AccountsError("bad-strategy", "strategy must be one of %s" % ", ".join(state["strategies"]))
+    prof = next(p for p in state["profiles"] if p["profile"] == target)
+    if provider not in prof["pools"]:
+        raise AccountsError("no-pool", "profile %r sees no %s credentials; a strategy would have no effect"
+                            % (target, provider))
+    before = prof["strategies"].get(provider, DEFAULT_STRATEGY)
+    key = "credential_pool_strategies." + provider.replace(".", "\\.")
+    command = ["--profile", target, "config", "set", key, strategy]
+    result: Dict[str, Any] = {"action": "set-strategy", "provider": provider, "profile": target,
+                              "before": before, "requested": strategy, "affected_profiles": [target],
+                              "command": "hermes " + " ".join(command)}
+    if before == strategy and prof["strategies"].get(provider) == strategy:
+        result.update(changed=False, after=before, cli_output="", state=state)
+        return result
+    code, output = (runner or _default_runner)(command, {})
+    if code != 0:
+        raise AccountsError("cli-failed", "hermes config set failed (exit %s): %s" % (code, _scrub(output)),
+                            command=result["command"])
+    new_state = accounts_payload()
+    new_prof = next((p for p in new_state["profiles"] if p["profile"] == target), {"strategies": {}})
+    after = new_prof["strategies"].get(provider, DEFAULT_STRATEGY)
+    if after != strategy:
+        raise AccountsError("not-applied", "Hermes reported success but %s's %s strategy is still %s"
+                            % (target, provider, after), command=result["command"])
+    result.update(changed=after != before, after=after, cli_output=_scrub(output), state=new_state)
+    _audit("set-strategy", target, provider, {"from": before, "to": after})
+    return result

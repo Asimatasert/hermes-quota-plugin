@@ -5,3 +5,4 @@ quota_cache.json
 quota_cache.json.tmp
 .widget-fixture.json
 node_modules/
+macos/build/

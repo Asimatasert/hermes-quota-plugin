@@ -47,7 +47,7 @@ NO_OPEN = {"kind": "none", "url": None, "command": None, "label": ""}
 def open_leases(home: Path) -> Dict[str, Any]:
     """{session id: pid} of the chat surfaces open right now (Hermes' lease registry, live pid only)."""
     trial.require_enrollment()
-    if not trial.home_in_scope(home):
+    if not trial.live_home_in_scope(home):
         return {}
     data = read_json(home / "runtime" / "active_sessions.json")
     entries = data.get("entries") if isinstance(data, dict) else None
@@ -191,7 +191,7 @@ def _open_for(r: Dict[str, Any], by_id: Dict, table: Dict) -> Dict[str, Any]:
 # ---------- kanban cards (running rows) ----------
 
 def kanban_cards(root: Optional[Path] = None) -> Dict[str, Dict[str, Any]]:
-    if not trial.SHARED_KANBAN:
+    if not trial.shared_kanban():
         return {}
     out = {}
     for board, db in kanban_dbs(root):
@@ -479,7 +479,7 @@ def attention(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def live(homes: Optional[List[Tuple[str, Path]]] = None, now: Optional[float] = None,
          record_sample: bool = True) -> Dict[str, Any]:
     trial.require_enrollment()
-    homes = trial.allowed_homes(homes if homes is not None else profile_homes())
+    homes = trial.live_homes(homes if homes is not None else profile_homes())
     now = time.time() if now is None else now
     cur = int(now // 60) * 60
     mins = [cur - 60 * i for i in range(59, -1, -1)]
@@ -633,7 +633,7 @@ def live(homes: Optional[List[Tuple[str, Path]]] = None, now: Optional[float] = 
 
     running.sort(key=lambda r: -(r["last"] or 0))
     return {
-        "now": now, "sampling_since": rate["since"], "sample_every": rate["every"],
+        "now": now, "scope": trial.monitor_scope(), "sampling_since": rate["since"], "sample_every": rate["every"],
         "activity": [dict({"t": m}, **activity[m]) for m in mins],
         "tokens": [{"t": m, "by": merged[m]} for m in mins], "providers": providers,
         "by_profile": sorted([dict({"profile": k}, **v) for k, v in rate["by_profile"].items()] +

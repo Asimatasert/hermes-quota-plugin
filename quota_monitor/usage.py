@@ -166,7 +166,7 @@ def kanban_glance(root: Optional[Path] = None, now: Optional[float] = None,
     """{"boards": [...]}: per board the status counts + only the cards a glance needs — running, blocked,
     review, and failing / recently failed — capped per board (``truncated`` = how many were left out)."""
     now = time.time() if now is None else now
-    if not trial.SHARED_KANBAN:
+    if not trial.shared_kanban():
         return {"boards": [], "available": False, "reason": trial.KANBAN_REASON}
     out = []
     for board, db in kanban_dbs(root):

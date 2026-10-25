@@ -1,0 +1,2 @@
+{"monitor_version": 1, "generated_at": __T(0)__, "enrolled": false, "collection": "disabled",
+ "error": "Agent Monitor is not enrolled for this profile", "error_code": "monitor-enrollment-off"}

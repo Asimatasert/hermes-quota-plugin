@@ -75,6 +75,10 @@ class QuotaAccount:
     plan: Optional[str] = None
     unavailable_reason: Optional[str] = None
     details: list[str] = field(default_factory=list)
+    # Hermes credential-pool position for opt-in pool accounts
+    # (``claudePoolAccounts``): {"priority": 1-based order, "size": N,
+    # "strategy": "fill_first" | ...}. Never a token, id hash or source path.
+    pool: Optional[dict] = None
 
     def has_data(self) -> bool:
         return (bool(self.windows) or bool(self.details)) and self.unavailable_reason is None
@@ -105,6 +109,8 @@ class QuotaResult:
     accounts: list[Union[QuotaAccount, QuotaResult]] = field(default_factory=list)
     # Explicit label for legacy single-account provider records (Codex).
     account_label: Optional[str] = None
+    # Credential-pool position of the primary card (see QuotaAccount.pool).
+    pool: Optional[dict] = None
 
     def has_data(self) -> bool:
         return (

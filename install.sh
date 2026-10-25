@@ -40,7 +40,7 @@ mkdir -p "$STAGE_PLUGIN" "$STAGE_DESKTOP"
 
 for item in \
   plugin.yaml __init__.py commands.py quota_cache.py codex_special_reset.py quota_providers quota_monitor \
-  LICENSE scripts skills; do
+  LICENSE scripts skills macos; do
   [ -e "$REPO_ROOT/$item" ] && cp -R "$REPO_ROOT/$item" "$STAGE_PLUGIN/"
 done
 cp "$REPO_ROOT/desktop/plugin.js" "$STAGE_DESKTOP/plugin.js"
@@ -54,7 +54,10 @@ cp "$REPO_ROOT/desktop/plugin.js" "$STAGE_DESKTOP/plugin.js"
 rm -rf \
   "$STAGE_PLUGIN/__pycache__" \
   "$STAGE_PLUGIN/quota_providers/__pycache__" \
-  "$STAGE_PLUGIN/quota_monitor/__pycache__"
+  "$STAGE_PLUGIN/quota_monitor/__pycache__" \
+  "$STAGE_PLUGIN/macos/build"
+# macos/ ships as SOURCE only (the optional notch companion; `macos/install.sh` builds it on
+# request). Nothing in it is built or started by this installer.
 
 profiles=("")
 if [ -d "$HOME_DIR/profiles" ]; then

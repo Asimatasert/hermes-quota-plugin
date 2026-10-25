@@ -8,7 +8,8 @@ on:
 jobs:
   python-tests:
     name: Python tests (${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    # ubuntu-latest (26.04) has no Python 3.9 build in setup-python; 24.04 still does.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -78,6 +79,24 @@ jobs:
           bash -n install.sh uninstall.sh scripts/hermes-config.sh scripts/hermes-home.sh tests/test_install_shell.sh tests/probe_symlink_forms.sh
           bash tests/test_install_shell.sh
           bash tests/probe_symlink_forms.sh
+
+  # Optional native macOS companion (macos/QuotaNotch): Swift unit tests + a
+  # universal build. Nothing is installed or launched; the other jobs never
+  # read macos/, so Linux/Windows plugin users are unaffected by it.
+  macos-companion:
+    name: macOS companion (Swift)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Swift unit tests (JSON decoding, events, CLI runner)
+        run: sh macos/test.sh
+
+      - name: Build Quota Notch.app (ad-hoc signed, not installed)
+        env:
+          # runner.temp is a trusted runner-provided path, not event input.
+          OUT: ${{ runner.temp }}/quota-notch
+        run: sh macos/build.sh
 
   manifest:
     name: plugin.yaml sanity

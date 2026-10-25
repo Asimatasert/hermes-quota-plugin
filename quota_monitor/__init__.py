@@ -6,12 +6,14 @@ Entry points (each returns one JSON-able dict carrying ``monitor_version`` and `
 * ``history_payload(days)`` — ``hermes quota monitor history --json``;
 * ``recommend_payload(...)`` — ``hermes quota monitor recommend --json``;
 * ``set_budget(daily, monthly)`` / ``budget_payload()`` — the budget the widget keeps in sync;
+* ``plan_payload()`` — ``hermes quota monitor plan --json`` (session vs week pacing, see quota_monitor/plan.py);
 * ``accounts_view()`` — ``hermes quota monitor accounts --json`` (credential pools, strategies, fallbacks,
   sign-in gaps); ``set_priority(...)`` / ``set_strategy(...)`` refuse in the trial.
 
 Every reader and store entry point checks enrollment first; while the monitor is OFF no
 file, sqlite database or process table is read or written. Account/budget writes, agent
-tools and shared-Kanban reads are unavailable. Costs are API-price estimates, never
+tools and shared-Kanban reads are unavailable unless ``fullMode`` is literally ``true``
+(see trial.py; writes then go through Hermes' own CLI or this plugin's own prefs file). Costs are API-price estimates, never
 billed amounts, and there is no month-end projection (``projection_available: false``).
 Network is never touched here (quota numbers come from the plugin's ``quota_cache.json``).
 See docs/monitor.md for the full contract.
@@ -114,6 +116,8 @@ def snapshot(record_sample: bool = True) -> Dict[str, Any]:
     }
     out["errors"] = errors
     out["timings_ms"] = timings
+    if trial.full_mode():
+        out["full_mode"] = True
     return _stamp(out)
 
 
@@ -159,6 +163,66 @@ def recommend_payload(prefer_provider: Optional[str] = None, exclude_providers: 
     return _stamp(out)
 
 
+PLAN_SETTING_ACTIVE_HOURS = "planActiveHours"
+
+
+def _quota_settings(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    node: Any = cfg
+    for part in ("plugins", "entries", "quota", "settings"):
+        node = node.get(part) if isinstance(node, dict) else None
+    return node if isinstance(node, dict) else {}
+
+
+def plan_payload(now: Optional[float] = None) -> Dict[str, Any]:
+    """``hermes quota monitor plan --json``: session vs week pacing per account (no network, no writes).
+
+    With the monitor enrolled the planner learns from ``quota_monitor.db`` history. Without enrollment it still
+    answers from the plugin's quota cache alone (the same data the Quota tab shows), marked ``degraded`` with
+    default ratios and no learned pattern; no monitor store is opened.
+    """
+    from . import plan, quotas, store
+    from .common import hermes_home, read_config
+
+    now = time.time() if now is None else float(now)
+    errors: Dict[str, str] = {}
+    timings: Dict[str, int] = {}
+    cfg = _run(errors, timings, "config", lambda: read_config(hermes_home()), {}) or {}
+    settings = _quota_settings(cfg)
+    active_hours = plan.parse_active_hours(settings.get(PLAN_SETTING_ACTIVE_HOURS))
+    tz_name = cfg.get("timezone") if isinstance(cfg.get("timezone"), str) else ""
+    tz = plan.local_tz(tz_name)
+    enrolled = trial.monitor_enrolled()
+    if enrolled:
+        cache = _run(errors, timings, "cache", quotas.read_cache, {}) or {}
+        rows = _run(errors, timings, "history",
+                    lambda: store.history_rows(now - plan.HISTORY_DAYS * 86400, now + 60), []) or []
+    else:
+        cache = _run(errors, timings, "cache", quotas.read_cache_unenrolled, {}) or {}
+        rows = []
+    items = _run(errors, timings, "items", lambda: quotas.cache_items(cache), []) or []
+    strategies = cfg.get("credential_pool_strategies") if isinstance(cfg.get("credential_pool_strategies"), dict) else {}
+    out = _run(errors, timings, "plan",
+               lambda: plan.build_plan(items, rows, now, tz, active_hours, history=enrolled,
+                                       strategies={k: v for k, v in strategies.items() if isinstance(v, str)}),
+               {"plan_version": plan.PLAN_VERSION, "providers": []})
+    for prov in out.get("providers", []):
+        for acc in prov.get("accounts", []):
+            acc["summary"] = plan.summary_sentence(acc, tz)
+    out.update({
+        "enrolled": enrolled,
+        "degraded": not enrolled,
+        "history_source": "monitor" if enrolled else "none",
+        "history_readings": len(rows),
+        "timezone": tz_name or "",
+        "fetched_at": cache.get("fetched_at") if isinstance(cache, dict) else None,
+        "settings": {"active_hours": active_hours is not None},
+        "defaults": {"ratio": plan.R_DEFAULT, "session_seconds": plan.SESSION_S, "week_seconds": plan.WEEK_S},
+        "errors": errors,
+        "timings_ms": timings,
+    })
+    return _stamp(out)
+
+
 def read_budget() -> Dict[str, Any]:
     from . import store
     budget = store.read_prefs().get("budget")
@@ -172,13 +236,33 @@ def read_budget() -> Dict[str, Any]:
 
 
 def set_budget(daily: Optional[float] = None, monthly: Optional[float] = None) -> Dict[str, Any]:
-    """Unavailable in the read-only trial: no preference write path is enabled yet.
+    """Store the widget's budget in ``$HERMES_HOME/quota_monitor.json`` (full mode only). None leaves a value
+    unchanged, 0 clears it; negative values are rejected.
 
-    Returns the structured refusal (rather than raising) so the one-JSON-object CLI contract keeps the
-    machine-readable code.
+    Outside full mode this is unavailable (read-only trial) and returns the structured refusal (rather than
+    raising) so the one-JSON-object CLI contract keeps the machine-readable code.
     """
-    return _stamp({"error": "Budget changes are unavailable in the read-only trial",
-                   "error_code": "trial-read-only"})
+    if not trial.budget_writes():
+        return _stamp({"error": "Budget changes are unavailable in the read-only trial",
+                       "error_code": "trial-read-only"})
+    from . import store
+    try:
+        trial.require_enrollment()
+    except trial.TrialError as e:
+        return _disabled(e)
+    for name, v in (("daily", daily), ("monthly", monthly)):
+        if v is not None and not (isinstance(v, (int, float)) and v == v and v >= 0 and v != float("inf")):
+            return _stamp({"error": "%s budget must be a finite number >= 0" % name, "error_code": "bad-budget"})
+    prefs = store.read_prefs()
+    raw = prefs.get("budget")
+    budget: Dict[str, Any] = raw if isinstance(raw, dict) else {}
+    if daily is not None:
+        budget["daily"] = float(daily)
+    if monthly is not None:
+        budget["monthly"] = float(monthly)
+    prefs["budget"] = budget
+    store.write_prefs(prefs)
+    return _stamp({"budget": read_budget(), "full_mode": True})
 
 
 def budget_payload() -> Dict[str, Any]:
@@ -204,6 +288,13 @@ def accounts_view() -> Dict[str, Any]:
     except trial.TrialError as e:
         return _disabled(e)
     out = accounts.accounts_payload()
+    if trial.account_mutations():
+        # Full mode: the last changes this plugin made through Hermes' CLI (ids/positions only, no secrets).
+        from . import store
+        try:
+            out["recent_changes"] = store.audit_rows(10)
+        except Exception:
+            out["recent_changes"] = []
     return _stamp(out)
 
 

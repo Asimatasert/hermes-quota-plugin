@@ -1041,7 +1041,25 @@ const SNAPSHOT_KEY = "lastPayload";
 const CLI_TIMEOUT_MS = 15_000;
 const _refreshInFlight = new Set();
 
+/**
+ * The host reports a null owner when the focused chat is not (yet) in its
+ * session list — e.g. on the /quota page after a gateway reconnect. Every
+ * query then stayed disabled ("Loading…" forever). Fall back to the app's
+ * active connection + profile, which is what the user is looking at.
+ */
+function ownerOrActive(owner) {
+	if (owner) return owner;
+	try {
+		const connectionId = String(host.state.connectionId?.get?.() || "").trim();
+		const profile = String(host.state.profile?.get?.() || "").trim() || "default";
+		return connectionId ? { connectionId, profile } : null;
+	} catch {
+		return null;
+	}
+}
+
 function normalizeQuotaScope(owner) {
+	owner = ownerOrActive(owner);
 	const connectionId = String(owner?.connectionId || "").trim();
 	const profile = String(owner?.profile || "").trim();
 	if (connectionId && profile) return { connectionId, profile };
@@ -2031,7 +2049,8 @@ function WindowTile({ w, size, dense, resetFormat }) {
 	const tone = toneForRemaining(r);
 	const label = w.label || "window";
 	const reset = w.reset_at ? (resetFormat === "absolute" ? absoluteReset(w.reset_at) : relativeCountdown(w.reset_at)) : "";
-	const full = w.reset_at ? t("reset", formatReset(w.reset_at, resetFormat)) : "";
+	// Hover always carries both forms: "resets in 3h 12m (Today 14:00)".
+	const full = w.reset_at ? t("reset", formatReset(w.reset_at, "relative")) : "";
 	return jsxs("div", {
 		"data-window": label,
 		title: [label, r == null ? "—" : `${fmtPct(r)} ${t("left")}`, full].filter(Boolean).join(" · "),
@@ -2048,7 +2067,9 @@ function WindowTile({ w, size, dense, resetFormat }) {
 				],
 			}),
 			jsx("span", { style: { ...UI.meta, color: "var(--ui-text-secondary)", textAlign: "center", lineHeight: 1.2, maxWidth: "100%", overflowWrap: "anywhere" }, children: label }),
-			dense && reset ? jsx("span", { style: { ...UI.tiny, ...UI.num, ...UI.ellipsis, maxWidth: "100%" }, children: reset }) : null,
+			// Reset time in both pane-detail modes (#77): the countdown is the
+			// number people act on, not a dense-only detail.
+			reset ? jsx("span", { "data-window-reset": true, title: full, style: { ...UI.tiny, ...UI.num, ...UI.ellipsis, maxWidth: "100%" }, children: reset }) : null,
 		],
 	});
 }
@@ -2086,6 +2107,7 @@ function ProviderRow({ id, provider, monitor, page = false, headerExtra, special
 					children: [
 						jsx(ProviderBadge, { pid: id }),
 						jsx("span", { style: { ...UI.text, fontWeight: 500, ...UI.ellipsis, flex: "1 1 auto" }, children: displayName }),
+						jsx(PoolPill, { pool: provider && provider.pool }),
 						jsx("span", { style: { ...UI.faint, flexShrink: 0 }, children: t("unavailable", reason) }),
 						headerExtra || null,
 					],
@@ -2143,10 +2165,10 @@ function ProviderRow({ id, provider, monitor, page = false, headerExtra, special
 		"data-provider": id,
 		children: [
 			jsxs("div", {
-				style: { ...UI.row, justifyContent: "space-between" },
+				style: { ...UI.row, justifyContent: "space-between", flexWrap: "wrap", rowGap: 4 },
 				children: [
 					jsxs("span", {
-						style: { ...UI.row, gap: 6 },
+						style: { ...UI.row, gap: 6, flexWrap: "wrap", rowGap: 4, flex: "1 1 160px" },
 						children: [
 							jsx(ProviderBadge, { pid: id }),
 							jsx("span", { style: { ...UI.title, ...UI.ellipsis }, children: displayName }),
@@ -2154,7 +2176,13 @@ function ProviderRow({ id, provider, monitor, page = false, headerExtra, special
 							headerExtra || null,
 						],
 					}),
-					provider.plan ? jsx(Pill, { color: "var(--ui-text-secondary)", children: provider.plan }) : null,
+					jsxs("span", {
+						style: { ...UI.row, gap: 4, flexShrink: 0 },
+						children: [
+							jsx(PoolPill, { pool: provider.pool }),
+							provider.plan ? jsx(Pill, { color: "var(--ui-text-secondary)", children: provider.plan }) : null,
+						],
+					}),
 				],
 			}),
 			...facts.balances.map((b) =>
@@ -2481,6 +2509,7 @@ function QuotaSettings() {
 				title: t("settingsGroupQuota"),
 				children: [
 					jsx(ShowDockedPaneControl, {}, "docked"),
+					jsx(PlanTabControl, {}, "planTab"),
 					jsx(PaneDetailControl, {}, "detail"),
 					jsx(ResetFormatControl, {}, "reset"),
 					jsx(RefreshIntervalControl, {}, "interval"),
@@ -2488,6 +2517,7 @@ function QuotaSettings() {
 			}),
 			jsx(DisabledProvidersControl, {}),
 			jsx(MonitorSettings, {}),
+			jsx(NotchCompanionCard, {}),
 		],
 	});
 }
@@ -2564,7 +2594,9 @@ function QuotaPane({ page = false } = {}) {
 	const forecastOn = useValue(quotaForecastAtom);
 	const mon = useMonitor();
 	const accountsOn = useValue(accountsTabAtom);
-	const activeTab = monitorOn && MONITOR_VIEWS.includes(tab) && (tab !== "accounts" || accountsOn) ? tab : "quota";
+	const planOn = useValue(planTabAtom);
+	const tabsOn = monitorOn || planOn;
+	const activeTab = visibleViews(monitorOn, accountsOn, planOn).includes(tab) ? tab : "quota";
 	const showForecast = Boolean(forecastOn && view !== "settings" && activeTab === "quota" && mon.snapshot);
 	const history = useMonitorHistory(mon.scope, showForecast);
 	useMonitorNotifier(mon.scope, data, mon.snapshot);
@@ -2790,7 +2822,7 @@ function QuotaPane({ page = false } = {}) {
 					}),
 				],
 			}),
-			view !== "settings" && monitorOn
+			view !== "settings" && tabsOn
 				? jsx("div", { style: { ...column, flexShrink: 0, minWidth: 0 }, "data-monitor-tabs": true, children: jsx(MonitorTabs, {}) })
 				: null,
 			view !== "settings" && monitorOn && mon.snapshot
@@ -2824,7 +2856,11 @@ function QuotaPane({ page = false } = {}) {
 // shown as a quiet "update backend" notice, never as a broken pane, and the
 // quota chip/pane keep working exactly as before.
 
-const MONITOR_VIEWS = ["quota", "live", "health", "usage", "kanban", "accounts"];
+const MONITOR_VIEWS = ["quota", "plan", "live", "health", "usage", "kanban", "accounts"];
+// The Plan tab works without monitor enrollment (cache-only plan), so it has
+// its own switch and shows even while the other monitor tabs are off.
+const PLAN_TAB_KEY = "planTab";
+const planTabAtom = atom(true);
 const PANE_VIEW_KEY = "paneView";
 const paneViewAtom = atom("quota");
 const MONITOR_ENABLED_KEY = "monitorEnabled";
@@ -2887,6 +2923,7 @@ function applyStoredMonitor() {
 	applyStored(PANE_VIEW_KEY, paneViewAtom, MONITOR_VIEWS, "quota");
 	applyStoredBoolean(MONITOR_ENABLED_KEY, monitorEnabledAtom, false);
 	applyStoredBoolean(ACCOUNTS_TAB_KEY, accountsTabAtom, true);
+	applyStoredBoolean(PLAN_TAB_KEY, planTabAtom, true);
 	applyStoredBoolean(AGENTS_CHIP_KEY, agentsChipAtom, true);
 	applyStoredBoolean(CONTEXT_CHIP_KEY, contextChipAtom, true);
 	try {
@@ -3063,7 +3100,10 @@ async function fetchMonitor(scope, argv) {
 		throw error;
 	}
 	try {
-		return parseJsonOutput(result.output || "", "monitor_version");
+		const payload = parseJsonOutput(result.output || "", "monitor_version");
+		// Only these two payloads report the backend's full mode (absent = off).
+		if (argv[2] === "snapshot" || argv[2] === "accounts") noteBackendMode(scope, payload);
+		return payload;
 	} catch {
 		// Exit 0 without a monitor payload: an older build printing help.
 		return { unsupported: true };
@@ -3117,9 +3157,34 @@ function useMonitorHistory(scope, active) {
 	return active ? asMonitorPayload(query.data) : null;
 }
 
-/** Budgets stay in widget storage; never write through a stale gateway. */
+/**
+ * Budgets live in widget storage. A backend in full mode (its monitor payloads
+ * carry `full_mode: true`) also stores them, so the `get_budget` agent tool
+ * sees them; any other gateway is never written to.
+ */
+const BACKEND_FULL_MODE = new Map();
+function scopeModeKey(scope) {
+	return scope ? `${scope.connectionId || ""}|${scope.profile || ""}` : "";
+}
+function noteBackendMode(scope, payload) {
+	if (!scope || !payload || typeof payload !== "object" || payload.unsupported) return;
+	if (payload.monitor_version == null) return;
+	BACKEND_FULL_MODE.set(scopeModeKey(scope), payload.full_mode === true);
+}
 async function syncBudgetToBackend() {
-	return false;
+	try {
+		const scope = normalizeQuotaScope(host.state.focusedSessionOwner.get());
+		if (!scope || BACKEND_FULL_MODE.get(scopeModeKey(scope)) !== true) return false;
+		await quotaCli(scope, [
+			"quota", "monitor", "set-budget",
+			"--daily", String(budgetDailyAtom.get()),
+			"--monthly", String(budgetMonthlyAtom.get()),
+			"--json",
+		]);
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 // ---- derived facts (pure) ----
@@ -3860,6 +3925,87 @@ function LiveRow({ row, children, scope, snapshot, nowSec, ctxPct = null, warn =
 	});
 }
 
+// ---- "in use now": the focused chat + the Claude account Hermes would pick ----
+
+/** The open session the user is looking at (focused chat), or null. */
+function focusedLiveRow(rows, focusId, focusProfile) {
+	if (focusId == null || focusId === "") return null;
+	return asList(rows).find((r) => r && String(r.id) === String(focusId) && (!focusProfile || !r.profile || !r.kind || r.kind !== "hermes" || r.profile === focusProfile)) || null;
+}
+
+/**
+ * The Anthropic card Hermes would use now: under fill_first the first account in
+ * pool order that is not exhausted (no window at 100 %, not unavailable). Display
+ * only; Hermes' own selection also skips credentials it has benched.
+ */
+function anthropicInUse(providers) {
+	const rows = providerEntries(providers).filter(([pid, p]) => baseProviderId(pid) === "anthropic" && p && !isUnconfigured(p));
+	if (!rows.length) return null;
+	const order = (p) => finiteNumber(p.pool && p.pool.priority) ?? 999;
+	const usable = (p) => !p.unavailable_reason && asWindowList(p.windows).length > 0 && asWindowList(p.windows).every((w) => (finiteNumber(w.used_percent) ?? 0) < 100);
+	const sorted = rows.slice().sort((a, b) => order(a[1]) - order(b[1]));
+	const strategy = (sorted[0][1].pool && sorted[0][1].pool.strategy) || "fill_first";
+	const pick = sorted.find(([, p]) => usable(p));
+	return { pid: pick ? pick[0] : null, provider: pick ? pick[1] : null, strategy, count: sorted.length };
+}
+
+function NowAccountLine({ account }) {
+	const t = useQT();
+	if (!account) return null;
+	if (account.strategy !== "fill_first" && account.count > 1) {
+		return jsx("div", { "data-now-account": "spread", style: { ...UI.meta }, children: t("nowAccountSpread", account.strategy) });
+	}
+	if (!account.provider) return jsx("div", { "data-now-account": "none", style: { ...UI.meta, color: "var(--ui-red)" }, children: t("planMultiAllOut") });
+	const windows = asWindowList(account.provider.windows);
+	const pctOf = (re) => {
+		const w = windows.find((x) => re.test(String(x.label || "")));
+		return w && finiteNumber(w.used_percent) != null ? fmtPct(Math.round(Number(w.used_percent))) : "—";
+	};
+	return jsxs("div", {
+		"data-now-account": account.pid,
+		style: { ...UI.row, gap: 6, minWidth: 0, flexWrap: "wrap", rowGap: 2 },
+		children: [
+			jsx(ProviderBadge, { pid: account.pid }),
+			jsx("span", { style: { ...UI.secondary, flex: "1 1 160px", minWidth: 0, overflowWrap: "anywhere", lineHeight: 1.35 }, children: t("nowAccount", providerDisplayName(account.pid, account.provider), pctOf(/session|^5h$/i), pctOf(/^(current week|weekly|week)$/i)) }),
+			jsx(PoolPill, { pool: account.provider.pool }),
+		],
+	});
+}
+
+/** Pinned "Now" block: accent stripe, the focused chat (if open) and the account in use. */
+function NowBlock({ children, account }) {
+	const t = useQT();
+	const kids = asList(Array.isArray(children) ? children : [children]).filter(Boolean);
+	if (!kids.length && !account) return null;
+	return jsxs("div", {
+		"data-now": true,
+		style: {
+			...UI.card,
+			...UI.col,
+			gap: 4,
+			padding: "6px 8px",
+			background: `linear-gradient(${isRtl() ? "270deg" : "90deg"}, ${tint("var(--ui-accent)", 12)}, transparent 60%)`,
+			boxShadow: `inset ${isRtl() ? -3 : 3}px 0 0 var(--ui-accent)`,
+		},
+		children: [
+			jsx("span", { style: { fontSize: "0.625rem", fontWeight: 650, letterSpacing: "0.06em", textTransform: "uppercase", color: "var(--ui-accent)" }, children: t("nowTitle") }, "title"),
+			...kids,
+			jsx(NowAccountLine, { account }, "account"),
+		],
+	});
+}
+
+/** Rows grouped by source: each Hermes profile, then Claude Code, Copilot CLI ... */
+function sourceGroups(rows, t) {
+	const groups = new Map();
+	for (const r of rows) {
+		const key = liveGroupKey(r);
+		if (!groups.has(key)) groups.set(key, { key, label: key.startsWith("p:") ? r.profile || "default" : r.source_name || r.kind, sub: key.startsWith("p:") ? r.source_name || "Hermes" : t("cliSource"), rows: [] });
+		groups.get(key).rows.push(r);
+	}
+	return [...groups.values()];
+}
+
 function LiveView({ mon }) {
 	const t = useQT();
 	const nowMs = useNow(15_000);
@@ -3871,6 +4017,9 @@ function LiveView({ mon }) {
 	const warn = useValue(contextWarnAtom);
 	const focusUsage = useValue(hostAtom("focusedUsage"));
 	const focusId = useValue(hostAtom("focusedStoredSessionId"));
+	const focusProfile = useValue(hostAtom("focusedSessionProfile"));
+	const { data: quotaData } = useQuota();
+	const account = anthropicInUse(quotaData && quotaData.providers);
 	const focusCtx = focusedContext(focusUsage);
 	const ctxOf = (r) => (focusCtx && focusId != null && String(r.id) === String(focusId) ? focusCtx.pct : rowContextPct(r));
 	const over = (r) => (contextLevel(ctxOf(r), warn) ? 0 : 1);
@@ -3882,19 +4031,11 @@ function LiveView({ mon }) {
 	}
 	const rank = (r) => STATE_RANK[sessionState(r)] ?? 4;
 	const byAttention = (a, b) => rank(a) - rank(b) || over(a) - over(b) || (Number(b.last) || 0) - (Number(a.last) || 0);
-	const mains = running.filter((r) => !r.subagent || !running.some((p) => p.id === r.parent)).sort(byAttention);
-	const groups = new Map();
-	for (const r of mains) {
-		const key = liveGroupKey(r);
-		if (!groups.has(key)) {
-			groups.set(key, {
-				label: key.startsWith("p:") ? r.profile || "default" : r.source_name || r.kind,
-				sub: key.startsWith("p:") ? r.source_name || "Hermes" : t("cliSource"),
-				rows: [],
-			});
-		}
-		groups.get(key).rows.push(r);
-	}
+	const allMains = running.filter((r) => !r.subagent || !running.some((p) => p.id === r.parent)).sort(byAttention);
+	// "In use now" is pinned on top; the rest follow grouped by source.
+	const nowRow = focusedLiveRow(allMains, focusId, focusProfile);
+	const mains = allMains.filter((r) => r !== nowRow);
+	const groups = new Map(sourceGroups(mains, t).map((g) => [g.key, g]));
 	const minutes = asList(live.tokens);
 	const tokenSeries = minutes.map(tokenTotal);
 	const sourceKeys = [];
@@ -3947,6 +4088,20 @@ function LiveView({ mon }) {
 			messages.some((v) => v > 0)
 				? jsx(Section, { title: t("messagesChart"), children: jsx(Sparkline, { values: messages, height: 30, color: "var(--ui-purple)", label: t("messagesChart") }) })
 				: null,
+			jsx(NowBlock, {
+				account,
+				children: nowRow
+					? jsx(LiveRow, {
+							row: nowRow,
+							scope: mon.scope,
+							snapshot,
+							nowSec,
+							ctxPct: ctxOf(nowRow),
+							warn,
+							children: asList(byParent.get(nowRow.id)).sort(byAttention).map((c) => jsx(LiveRow, { row: c, scope: mon.scope, snapshot, nowSec }, c.id)),
+						}, nowRow.id)
+					: null,
+			}, "now"),
 			attention.length
 				? jsx(Section, {
 						title: t("attentionTitle", attention.length),
@@ -3998,7 +4153,9 @@ function LiveView({ mon }) {
 							}),
 						}, key),
 					)
-				: jsx(Empty, { children: t("noOpenSessions") }),
+				: nowRow
+					? null
+					: jsx(Empty, { children: t("noOpenSessions") }),
 			jsx(SectionError, { snapshot, section: "live" }),
 		],
 	});
@@ -4836,7 +4993,19 @@ function AgentsCard({ snapshot, scope, close }) {
 	const live = asObject(snapshot && snapshot.live);
 	const nowSec = finiteNumber(live.now) ?? Date.now() / 1000;
 	const counts = liveCounts(live);
-	const groups = agentCardGroups(live);
+	const focusId = useValue(hostAtom("focusedStoredSessionId"));
+	const focusProfile = useValue(hostAtom("focusedSessionProfile"));
+	const { data: quotaData } = useQuota();
+	const account = anthropicInUse(quotaData && quotaData.providers);
+	const nowRow = focusedLiveRow(asList(live.running).filter((r) => r && !r.subagent && sessionState(r) !== "ended"), focusId, focusProfile);
+	// With monitorScope "all" the rows come from several sources: group by
+	// source (profile / Claude Code / Copilot). The active-only default keeps
+	// the attention-state grouping.
+	const bySource = live.scope === "all";
+	const groups = (bySource
+		? sourceGroups(asList(live.running).filter((r) => r && !r.subagent && sessionState(r) !== "ended" && r !== nowRow).sort((a, b) => (STATE_RANK[sessionState(a)] ?? 4) - (STATE_RANK[sessionState(b)] ?? 4)), t).map((g) => ({ ...g, state: g.key }))
+		: agentCardGroups(live).map((g) => ({ ...g, rows: g.rows.filter((r) => r !== nowRow) }))
+	).filter((g) => g.rows.length);
 	const series = tokenSeries(live, 60);
 	const pick = (row) => {
 		close();
@@ -4855,19 +5024,27 @@ function AgentsCard({ snapshot, scope, close }) {
 			series.some((v) => v > 0)
 				? jsx(Sparkline, { values: series, height: 24, color: counts.working ? STATE_STYLE.working : "var(--ui-accent)", label: t("tokensChart") }, "spark")
 				: null,
+			jsx(NowBlock, { account, children: nowRow ? jsx(AgentCardRow, { row: nowRow, nowSec, onPick: pick }, nowRow.id) : null }, "now"),
 			groups.length
 				? groups.map((g) =>
 						jsxs("div", {
 							"data-card-group": g.state,
 							style: { ...UI.col, gap: 1 },
 							children: [
-								jsxs("div", { style: { ...UI.row, gap: 6, padding: "0 0 2px" }, children: [jsx(StateBadge, { state: g.state }), jsx("span", { style: { ...UI.faint, ...UI.num }, children: String(g.rows.length) })] }),
+								jsxs("div", {
+									style: { ...UI.row, gap: 6, padding: "0 0 2px" },
+									children: bySource
+										? [jsx("span", { style: { ...UI.meta, fontWeight: 600 }, children: g.label }, "l"), jsx("span", { style: { ...UI.faint, ...UI.num }, children: `${g.sub} · ${g.rows.length}` }, "n")]
+										: [jsx(StateBadge, { state: g.state }, "b"), jsx("span", { style: { ...UI.faint, ...UI.num }, children: String(g.rows.length) }, "n")],
+								}),
 								...g.rows.slice(0, AGENT_CARD_ROWS).map((row) => jsx(AgentCardRow, { row, nowSec, onPick: pick }, row.id)),
 								g.rows.length > AGENT_CARD_ROWS ? jsx("span", { style: { ...UI.tiny, padding: "1px 6px" }, children: t("moreDetails", g.rows.length - AGENT_CARD_ROWS) }, "more") : null,
 							],
 						}, g.state),
 					)
-				: jsx(Empty, { children: t("noOpenSessions") }, "empty"),
+				: nowRow
+					? null
+					: jsx(Empty, { children: t("noOpenSessions") }, "empty"),
 			counts.subagents ? jsx("span", { style: UI.tiny, children: t("subagentsN", counts.subagents) }, "subs") : null,
 		],
 	});
@@ -5327,9 +5504,10 @@ function QuotaCardWindow({ w, nowMs }) {
 	const tone = toneForRemaining(r);
 	const label = w.label || "window";
 	const reset = w.reset_at ? relativeCountdown(w.reset_at, nowMs) : "";
+	const at = w.reset_at ? absoluteReset(w.reset_at) : "";
 	return jsxs("div", {
 		"data-card-window": label,
-		title: [label, r == null ? "—" : `${fmtPct(r)} ${t("left")}`, reset ? t("popoverReset", reset) : ""].filter(Boolean).join(" · "),
+		title: [label, r == null ? "—" : `${fmtPct(r)} ${t("left")}`, reset ? `${t("popoverReset", reset)}${at ? ` (${at})` : ""}` : ""].filter(Boolean).join(" · "),
 		style: { ...UI.col, alignItems: "center", gap: 2, width: 84 },
 		children: [
 			jsx(Ring, {
@@ -5528,6 +5706,12 @@ function SettingSwitch({ label, hint, checked, onChange }) {
 	return jsx(SettingRow, { label, hint, children: jsx(Switch, { checked, onCheckedChange: onChange }) });
 }
 
+function PlanTabControl() {
+	const t = useQT();
+	const on = useValue(planTabAtom);
+	return jsx(SettingSwitch, { label: t("planTabLabel"), hint: t("planTabHint"), checked: on, onChange: (v) => setStored(PLAN_TAB_KEY, !!v, planTabAtom) });
+}
+
 function AgentsChipControl() {
 	const t = useQT();
 	const chip = useValue(agentsChipAtom);
@@ -5686,14 +5870,146 @@ function MonitorSettings() {
 	});
 }
 
+
+// ---- Quota Notch: the optional native macOS companion (macos/ in the repo) ----
+// Hermes Desktop plugins cannot draw outside the app window, so the notch
+// island / menu bar extra is a separate native app. This card only explains it
+// and reports `hermes quota monitor companion --json` (installed, running,
+// whether the Mac has a notch -- the app itself reports that). Shown on macOS
+// renderers only; the backend may still be another machine (remote gateway).
+
+/** True on a macOS renderer (navigator is absent in tests and non-browser hosts). */
+function isMacRenderer() {
+	try {
+		const nav = typeof navigator !== "undefined" ? navigator : null;
+		if (!nav) return false;
+		const text = `${nav.platform || ""} ${(nav.userAgentData && nav.userAgentData.platform) || ""} ${nav.userAgent || ""}`;
+		return /\bMac/i.test(text);
+	} catch {
+		return false;
+	}
+}
+
+const COMPANION_ARGV = ["quota", "monitor", "companion", "--json"];
+
+function companionButton({ label, onClick, primary = false, data, title }) {
+	return jsx("button", {
+		type: "button",
+		[data]: true,
+		title,
+		className: primary ? "hover:opacity-90 transition-opacity" : "hover:bg-(--chrome-action-hover) transition-colors",
+		onClick,
+		style: primary
+			? { border: 0, borderRadius: 5, padding: "3px 10px", fontSize: "0.6875rem", fontWeight: 600, cursor: "pointer", background: "var(--ui-accent)", color: "var(--dt-midground-foreground, var(--ui-bg-editor))" }
+			: { border: "1px solid var(--ui-stroke-tertiary)", borderRadius: 5, padding: "2px 8px", fontSize: "0.6875rem", cursor: "pointer", background: "transparent", color: "var(--ui-text-secondary)" },
+		children: label,
+	});
+}
+
+async function openCompanion(scope, queryClient) {
+	let ok = false;
+	try {
+		const result = await quotaCli(scope, ["quota", "monitor", "companion", "--open", "--json"], MONITOR_TIMEOUT_MS);
+		const payload = parseJsonOutput(result.output || "", "monitor_version");
+		ok = Boolean(payload && payload.opened);
+	} catch {
+		ok = false;
+	}
+	if (!ok) {
+		try {
+			host.notify?.({ kind: "warning", message: tr("notchOpenFailed") });
+		} catch {
+			/* noop */
+		}
+	}
+	try {
+		queryClient?.invalidateQueries?.({ queryKey: monitorQueryKey(scope, "companion") });
+	} catch {
+		/* noop */
+	}
+	return ok;
+}
+
+function NotchCompanionCard() {
+	const t = useQT();
+	const mac = isMacRenderer();
+	const owner = useValue(host.state.focusedSessionOwner);
+	const scope = normalizeQuotaScope(owner);
+	const queryClient = useQueryClient();
+	const query = useQuery({
+		queryKey: monitorQueryKey(scope, "companion"),
+		queryFn: () => fetchMonitor(scope, COMPANION_ARGV),
+		enabled: Boolean(scope) && mac,
+		refetchInterval: 30_000,
+		refetchIntervalInBackground: false,
+		staleTime: 10_000,
+		retry: 0,
+	});
+	if (!mac) return null;
+	const raw = query.data;
+	const info = raw && !raw.unsupported && raw.platform ? raw : null;
+	const rows = [jsx("div", { style: { ...UI.secondary, lineHeight: 1.45, padding: "2px 0 6px" }, children: t("notchIntro") }, "intro")];
+	if (raw && raw.unsupported) {
+		rows.push(jsx("div", { "data-notch-state": "update", style: { ...UI.meta, padding: "4px 0 8px" }, children: t("notchUpdate") }, "update"));
+	} else if (!info) {
+		rows.push(jsx("div", { "data-notch-state": "loading", style: { ...UI.meta, padding: "4px 0 8px" }, children: query.isError ? t("notchUpdate") : t("notchLoading") }, "loading"));
+	} else if (!info.supported) {
+		rows.push(jsx("div", { "data-notch-state": "remote", style: { ...UI.meta, lineHeight: 1.45, padding: "4px 0 8px" }, children: t("notchRemote", String(info.platform)) }, "remote"));
+	} else {
+		const state = info.running ? "running" : info.installed ? "stopped" : "missing";
+		const color = state === "running" ? "var(--ui-green)" : state === "stopped" ? "var(--ui-yellow)" : "var(--ui-text-tertiary)";
+		const label = state === "running" ? t("notchRunning") : state === "stopped" ? t("notchStopped") : t("notchNotInstalled");
+		rows.push(jsx(SettingRow, {
+			label: t("notchStatus"),
+			hint: info.notch === true ? t("notchHasNotch") : info.notch === false ? t("notchNoNotch") : t("notchUnknown"),
+			children: [
+				jsx(Pill, { color, dot: true, "data-notch-state": state, children: label }, "pill"),
+				info.installed
+					? companionButton({ label: t("notchOpen"), primary: !info.running, data: "data-notch-open", onClick: () => void openCompanion(scope, queryClient) })
+					: null,
+			],
+		}, "status"));
+		if (!info.installed) {
+			const cmd = info.install_command;
+			rows.push(jsx(SettingRow, {
+				label: t("notchInstallLabel"),
+				hint: cmd ? null : t("notchNoScript", info.repo_url || ""),
+				block: true,
+				children: cmd
+					? jsxs("div", {
+							style: { ...UI.row, gap: 6 },
+							children: [
+								jsx("code", { "data-notch-install": cmd, style: { ...UI.meta, ...UI.ellipsis, fontFamily: "var(--dt-font-mono)", flex: "1 1 auto", padding: "3px 6px", borderRadius: 5, background: "var(--ui-bg-quaternary, transparent)", border: "1px solid var(--ui-stroke-tertiary)" }, title: cmd, children: cmd }, "cmd"),
+								companionButton({ label: t("notchCopyInstall"), data: "data-notch-copy", title: t("copyCommandTip", cmd), onClick: () => void copyCommand(cmd) }),
+							],
+						})
+					: null,
+			}, "install"));
+		}
+	}
+	return jsxs(SettingsCard, {
+		icon: "Laptop",
+		title: t("notchTitle"),
+		footer: t("notchPrivacy"),
+		children: rows,
+	});
+}
+
 // Agent Bar's view switcher: segments sized by their label (six fit a 300px
 // pane untruncated), the active one filled with the accent. Own markup (not
 // SegmentedControl) because the labels need tighter padding than core's control.
+/** Tabs on show: Quota always, Plan unless switched off, the rest with the monitor. */
+function visibleViews(monitorOn, accountsOn, planOn) {
+	return MONITOR_VIEWS.filter((id) => id === "quota" || (id === "plan" ? planOn : monitorOn && (id !== "accounts" || accountsOn)));
+}
+
 function MonitorTabs() {
 	const t = useQT();
 	const view = useValue(paneViewAtom);
 	const accountsOn = useValue(accountsTabAtom);
-	const views = MONITOR_VIEWS.filter((id) => id !== "accounts" || accountsOn);
+	const monitorOn = useValue(monitorEnabledAtom);
+	const planOn = useValue(planTabAtom);
+	const views = visibleViews(monitorOn, accountsOn, planOn);
 	return jsx("div", {
 		role: "tablist",
 		"data-tabs": views.join(","),
@@ -5735,6 +6051,8 @@ function MonitorTabs() {
 }
 
 function MonitorBody({ mon, view, page = false }) {
+	// Plan has its own query (`monitor plan`) and works without enrollment.
+	if (view === "plan") return jsx(PlanView, { page });
 	// Accounts has its own query (`monitor accounts`), independent of the snapshot.
 	if (view === "accounts") return mon.enabled ? jsx(AccountsView, { page }) : jsx(MonitorNotice, { mon });
 	if (!mon.snapshot) return jsx(MonitorNotice, { mon });
@@ -5745,16 +6063,365 @@ function MonitorBody({ mon, view, page = false }) {
 	return null;
 }
 
+// ---- Plan view (`hermes quota monitor plan --json`) ----
+//
+// A pacing analyst per account with a session (5h) and a week window: how many
+// sessions are left before the week resets, how much of the week each may use
+// (as week % and as session %), whether the current session can be used to
+// 100 %, the projected week at reset and, for several pooled accounts, which
+// one to use now. The backend does the maths (quota_monitor/plan.py); this view
+// only formats it. Without monitor enrollment the backend answers a degraded
+// plan from the quota cache alone and the view says so.
+
+function planQueryKey(scope) {
+	return monitorQueryKey(scope, "plan");
+}
+
+function usePlan(active) {
+	const owner = useValue(host.state.focusedSessionOwner);
+	const scope = normalizeQuotaScope(owner);
+	const query = useQuery({
+		queryKey: planQueryKey(scope),
+		queryFn: () => fetchMonitor(scope, ["quota", "monitor", "plan", "--json"]),
+		enabled: Boolean(scope) && Boolean(active),
+		refetchInterval: 120_000,
+		refetchIntervalInBackground: false,
+		staleTime: 30_000,
+		retry: 1,
+	});
+	const raw = query.data;
+	const payload = asMonitorPayload(raw);
+	const data = payload && !payload.error && Array.isArray(payload.providers) ? payload : null;
+	return {
+		data,
+		unsupported: Boolean(raw && raw.unsupported),
+		isError: Boolean(!data && (query.isError || (payload && payload.error))),
+		isLoading: Boolean(!data && !query.isError && !(raw && raw.unsupported) && !(payload && payload.error)),
+	};
+}
+
+function secondsIso(ts) {
+	const n = finiteNumber(ts);
+	return n == null ? "" : new Date(n * 1000).toISOString();
+}
+
+/** "1 decimal under 10, whole above" percent in the app locale. */
+function planPct(value) {
+	const n = finiteNumber(value);
+	if (n == null) return "—";
+	const rounded = Math.abs(n) < 10 ? Math.round(n * 10) / 10 : Math.round(n);
+	return fmtPct(rounded);
+}
+
+const PACE_COLOR = { under: "var(--ui-accent)", on_track: "var(--ui-green)", over: "var(--ui-red)" };
+
+function planStateText(t, acc) {
+	const cur = acc.current || {};
+	if (!cur.running) return t("planStateIdle");
+	if (cur.state === "over_target") return t("planStateOver");
+	if (cur.state === "near_target") return t("planStateNear");
+	if (cur.state === "keep_going") return cur.can_fill ? t("planStateFill") : t("planStateKeepGoing");
+	return t("planStateUnknown");
+}
+
+/** The one-sentence answer at the top of each account card. */
+function planHeadline(t, acc) {
+	const long = (acc.windows && acc.windows.long) || {};
+	const when = absoluteReset(secondsIso(long.reset)) || "—";
+	const n = Number(acc.sessions && acc.sessions.active) || 0;
+	const week = planPct(acc.budget && acc.budget.week_per_session);
+	const session = finiteNumber(acc.budget && acc.budget.session_per_session);
+	const used = planPct(acc.current && acc.current.used);
+	const state = planStateText(t, acc);
+	return session != null && session >= 100
+		? t("planHeadlineFull", n, when, week, used, state)
+		: t("planHeadline", n, when, week, session == null ? "—" : planPct(session), used, state);
+}
+
+function planFormula(t, acc) {
+	const r = finiteNumber(acc.ratio && acc.ratio.value);
+	const lines = [
+		t("planFormulaBudget", planPct(acc.week_left), acc.sessions && acc.sessions.active, planPct(acc.budget && acc.budget.week_per_session), r == null ? "—" : fmtNum(r, 3), planPct(acc.budget && acc.budget.session_per_session)),
+	];
+	const proj = acc.projection || {};
+	if (proj.method === "typical_session" && acc.typical_fill) {
+		lines.push(t("planFormulaTypical", planPct(acc.windows.long.used), planPct(acc.typical_fill.value), r == null ? "—" : fmtNum(r, 3), acc.sessions.active, planPct(proj.week_at_reset)));
+	} else {
+		lines.push(t("planFormulaLinear", planPct(acc.windows && acc.windows.long && acc.windows.long.used), planPct(proj.week_at_reset)));
+	}
+	lines.push(t("planFormulaRatio", acc.ratio && acc.ratio.samples, t(`planConfidence_${(acc.ratio && acc.ratio.confidence) || "low"}`)));
+	return lines.join("\n");
+}
+
+function planPaceText(t, acc) {
+	const pace = acc.pace || {};
+	if (pace.verdict === "under") return pace.extra_session_pct != null ? t("planPaceUnder", planPct(pace.extra_session_pct)) : t("planPaceUnderPlain");
+	if (pace.verdict === "over") return pace.slow_to_session_pct != null ? t("planPaceOver", planPct(pace.slow_to_session_pct)) : t("planPaceOverPlain");
+	return t("planPaceOnTrack");
+}
+
+/** Week used % since the week started: actual, the even pace to reset, and the projection. */
+function PlanChart({ chart, nowSec, verdict, height = 64 }) {
+	const t = useQT();
+	if (!chart || !Array.isArray(chart.actual)) return null;
+	const x0 = Number(chart.start);
+	const x1 = Number(chart.end);
+	if (!Number.isFinite(x0) || !Number.isFinite(x1) || x1 <= x0) return null;
+	const x = (ts) => ((Math.max(x0, Math.min(x1, Number(ts))) - x0) / (x1 - x0)) * 100;
+	const y = (v) => (height - 1 - (Math.max(0, Math.min(100, Number(v) || 0)) / 100) * (height - 2)).toFixed(2);
+	const path = (pts) => pts.filter((p) => Array.isArray(p)).map((p, j) => `${j ? "L" : "M"}${x(p[0]).toFixed(2)} ${y(p[1])}`).join(" ");
+	const projColor = verdict === "over" ? "var(--ui-red)" : "var(--ui-green)";
+	const nowX = x(nowSec);
+	const common = { fill: "none", vectorEffect: "non-scaling-stroke", strokeLinejoin: "round" };
+	return jsxs("div", {
+		"data-plan-chart": true,
+		style: { ...UI.col, gap: 4 },
+		children: [
+			jsx("span", { style: { ...UI.meta }, children: t("planChartTitle") }),
+			jsx("svg", {
+				viewBox: `0 0 100 ${height}`,
+				preserveAspectRatio: "none",
+				width: "100%",
+				height,
+				role: "img",
+				"aria-label": t("planChartTitle"),
+				style: { display: "block", overflow: "visible", borderBottom: "1px solid var(--ui-stroke-secondary)" },
+				children: [
+					...[25, 50, 75, 100].map((g) => jsx("line", { x1: 0, x2: 100, y1: y(g), y2: y(g), stroke: "var(--ui-stroke-tertiary)", strokeWidth: 1, vectorEffect: "non-scaling-stroke" }, `g${g}`)),
+					jsx("line", { x1: nowX, x2: nowX, y1: 0, y2: height, stroke: "var(--ui-stroke-secondary)", strokeWidth: 1, strokeDasharray: "2 2", vectorEffect: "non-scaling-stroke" }, "now"),
+					jsx("path", { d: path(chart.ideal || []), stroke: "var(--ui-text-quaternary)", strokeWidth: 1, strokeDasharray: "4 3", ...common }, "ideal"),
+					chart.projected ? jsx("path", { d: path(chart.projected), stroke: projColor, strokeWidth: 1.5, strokeDasharray: "3 2", ...common }, "proj") : null,
+					jsx("path", { d: path(chart.actual), stroke: "var(--ui-accent)", strokeWidth: 1.75, ...common }, "actual"),
+				],
+			}),
+			jsx(Legend, {
+				items: [
+					{ label: t("planChartActual"), color: "var(--ui-accent)" },
+					{ label: t("planChartIdeal"), color: "var(--ui-text-quaternary)" },
+					chart.projected ? { label: t("planChartProjected"), color: projColor } : null,
+				].filter(Boolean),
+			}),
+		],
+	});
+}
+
+function planAccountName(acc) {
+	return providerDisplayName(acc.provider, { account_label: acc.account_label });
+}
+
+function PoolPill({ pool }) {
+	const t = useQT();
+	if (!pool || finiteNumber(pool.priority) == null) return null;
+	const first = Number(pool.priority) === 1 && (pool.strategy || "fill_first") === "fill_first";
+	return jsx(Pill, {
+		color: first ? "var(--ui-accent)" : "var(--ui-text-tertiary)",
+		title: t("poolTip", pool.priority, pool.size || "?", pool.strategy || "fill_first"),
+		"data-pool-position": pool.priority,
+		children: first ? `${t("poolPosition", pool.priority, pool.size || "?")} · ${t("poolFirst")}` : t("poolPosition", pool.priority, pool.size || "?"),
+	});
+}
+
+function PlanAccountCard({ acc, nowSec, page }) {
+	const t = useQT();
+	const name = planAccountName(acc);
+	if (!acc.plannable) {
+		return jsxs("div", {
+			"data-plan-account": acc.provider,
+			style: { ...UI.card, ...UI.row, padding: "7px 10px", opacity: 0.65, flexWrap: "wrap" },
+			children: [
+				jsx(ProviderBadge, { pid: acc.provider }),
+				jsx("span", { style: { ...UI.text, fontWeight: 500, ...UI.ellipsis, flex: "1 1 auto" }, children: name }),
+				jsx(PoolPill, { pool: acc.pool }),
+				jsx("span", { style: UI.faint, children: t("planUnplannable", acc.reason || "—") }),
+			],
+		});
+	}
+	const verdict = (acc.pace && acc.pace.verdict) || "on_track";
+	const tone = PACE_COLOR[verdict] || "var(--ui-text-secondary)";
+	const cur = acc.current || {};
+	const proj = acc.projection || {};
+	const long = acc.windows.long || {};
+	const short = acc.windows.short || {};
+	const conf = acc.confidence || "low";
+	const formula = planFormula(t, acc);
+	const sessionBudget = finiteNumber(acc.budget.session_per_session);
+	const sourceText = t(`planSource_${acc.sessions.pattern || "calendar"}`);
+	const projSub = proj.exhausts_before_reset && proj.exhaust_at
+		? t("planRunsOut", absoluteReset(secondsIso(proj.exhaust_at)))
+		: proj.method === "typical_session" && acc.typical_fill
+			? t("planProjectedTypical", planPct(acc.typical_fill.value))
+			: t("planProjectedLinear");
+	const extras = asList(acc.windows.extra).filter((w) => w && finiteNumber(w.used) != null);
+	return jsxs("div", {
+		"data-plan-account": acc.provider,
+		"data-pace": verdict,
+		style: { ...UI.card, ...UI.col, gap: 9, padding: "9px 11px" },
+		children: [
+			jsxs("div", {
+				style: { ...UI.row, gap: 6, flexWrap: "wrap" },
+				children: [
+					jsx(ProviderBadge, { pid: acc.provider }),
+					jsx("span", { style: { ...UI.title, ...UI.ellipsis, flex: "1 1 auto" }, children: name }),
+					jsx(PoolPill, { pool: acc.pool }),
+					jsx(Pill, { color: conf === "high" ? "var(--ui-green)" : conf === "medium" ? "var(--ui-yellow)" : "var(--ui-orange)", title: formula, "data-plan-confidence": conf, children: t(`planConfidence_${conf}`) }),
+				],
+			}),
+			jsx("div", {
+				"data-plan-headline": true,
+				title: formula,
+				style: { fontSize: page ? "0.875rem" : "0.8125rem", lineHeight: 1.45, color: "var(--ui-text-primary)", fontWeight: 500, cursor: "help" },
+				children: planHeadline(t, acc),
+			}),
+			jsxs("div", {
+				"data-plan-verdict": verdict,
+				title: formula,
+				style: { display: "flex", alignItems: "baseline", gap: 6, padding: "3px 8px", borderRadius: 8, background: tint(tone, 12), color: tone, fontSize: "0.6875rem", fontWeight: 600, lineHeight: 1.35 },
+				children: [jsx(Dot, { color: tone, size: 6 }), jsx("span", { children: planPaceText(t, acc) })],
+			}),
+			jsxs(KpiGrid, {
+				min: page ? 190 : 112,
+				children: [
+					jsx(Kpi, { label: t("planSessionsLeft"), value: String(acc.sessions.active), sub: t("planSessionsSub", acc.sessions.calendar, sourceText) }, "sessions"),
+					jsx(Kpi, {
+						label: t("planBudget"),
+						value: t("planBudgetValue", planPct(acc.budget.week_per_session)),
+						sub: sessionBudget == null ? null : sessionBudget >= 100 ? t("planBudgetFull") : t("planBudgetSub", planPct(sessionBudget)),
+					}, "budget"),
+					jsx(Kpi, {
+						label: cur.running ? t("planTarget") : t("planNextSession"),
+						value: planPct(cur.target_used),
+						sub: t("planTargetSub", planPct(cur.fill_week_cost)),
+						tone: cur.state === "over_target" ? "var(--ui-red)" : undefined,
+					}, "target"),
+					jsx(Kpi, { label: t("planProjected"), value: planPct(proj.week_at_reset), sub: projSub, tone: proj.exhausts_before_reset ? "var(--ui-red)" : undefined }, "proj"),
+					jsx(Kpi, {
+						label: t("planSessionReset"),
+						value: cur.running && cur.seconds_to_reset != null ? fmtSpan(cur.seconds_to_reset) : "—",
+						sub: cur.running ? `${planPct(short.used)} · ${absoluteReset(secondsIso(cur.reset))}` : t("planStateIdle"),
+					}, "sreset"),
+					jsx(Kpi, {
+						label: t("planWeekReset"),
+						value: fmtSpan(acc.seconds_to_week_reset) || "—",
+						sub: `${planPct(long.used)} · ${absoluteReset(secondsIso(long.reset))}`,
+					}, "wreset"),
+				],
+			}),
+			jsx(PlanChart, { chart: acc.chart, nowSec, verdict }),
+			jsx(MetaLine, {
+				parts: [
+					t("planRatioLine", fmtNum(acc.ratio.value, 3)),
+					acc.typical_fill ? t("planTypicalLine", planPct(acc.typical_fill.value), acc.typical_fill.samples) : null,
+					...extras.map((w) => `${w.label} ${planPct(w.used)}`),
+				],
+			}),
+		],
+	});
+}
+
+function PlanMultiCard({ prov }) {
+	const t = useQT();
+	const multi = prov.multi;
+	if (!multi) return null;
+	const accounts = prov.accounts || [];
+	const nameAt = (i) => (i == null || !accounts[i] ? "—" : planAccountName(accounts[i]));
+	const lines = [];
+	if (multi.advice === "all_exhausted") lines.push(t("planMultiAllOut"));
+	else if (multi.advice === "spread") lines.push(t("planMultiSpread", multi.strategy));
+	else {
+		lines.push(t("planMultiUse", nameAt(multi.use_index)));
+		if (multi.advice === "switch_now" && multi.switch && multi.switch.next_index != null) lines.push(t("planMultiSwitchNow", nameAt(multi.switch.next_index)));
+		else if (multi.switch && multi.switch.at_session_used != null) {
+			lines.push(t("planMultiSwitch", planPct(multi.switch.at_session_used), multi.switch.reset ? absoluteReset(secondsIso(multi.switch.reset)) : "", nameAt(multi.switch.next_index)));
+		}
+		if (multi.advice === "reorder" && multi.headroom_index != null) lines.push(t("planMultiReorder", nameAt(multi.headroom_index)));
+	}
+	return jsx(Section, {
+		title: t("planMultiTitle"),
+		children: jsxs("div", {
+			"data-plan-multi": multi.advice,
+			style: { ...UI.card, ...UI.col, gap: 4, padding: "8px 11px", boxShadow: `inset ${isRtl() ? -2 : 2}px 0 0 var(--ui-accent)` },
+			children: [
+				...lines.map((line, i) => jsx("div", { style: i ? UI.secondary : { ...UI.text, fontWeight: 600 }, children: line }, i)),
+				jsx("div", { style: { ...UI.meta, ...UI.num }, children: t("planMultiCombined", planPct(multi.combined_week_left), planPct(multi.combined_week_per_session)) }, "combined"),
+			],
+		}),
+	});
+}
+
+function PlanView({ page = false }) {
+	const t = useQT();
+	const plan = usePlan(true);
+	const nowMs = useNow(30_000);
+	if (!plan.data) {
+		const text = plan.unsupported ? t("monitorUnsupported") : plan.isError ? t("planError") : t("loading");
+		return jsx("div", {
+			className: "rounded-lg border border-dashed px-3 py-2",
+			"data-plan-notice": plan.unsupported ? "unsupported" : plan.isError ? "error" : "pending",
+			style: { ...UI.meta, borderColor: "var(--ui-stroke-secondary)" },
+			children: text,
+		});
+	}
+	noteDataTimeZone(plan.data);
+	const providers = asList(plan.data.providers).filter((p) => p && Array.isArray(p.accounts));
+	const nowSec = finiteNumber(plan.data.generated_at) ?? nowMs / 1000;
+	return jsxs(ViewStack, {
+		name: "plan",
+		children: [
+			plan.data.degraded
+				? jsx("div", {
+						"data-plan-degraded": true,
+						className: "rounded-lg border border-dashed px-3 py-2",
+						style: { ...UI.meta, borderColor: "var(--ui-stroke-secondary)" },
+						children: t("planDegraded"),
+					}, "degraded")
+				: null,
+			providers.length
+				? null
+				: jsx(Empty, { children: t("planEmpty") }, "empty"),
+			...providers.map((prov) =>
+				jsxs("div", {
+					"data-plan-provider": prov.base,
+					style: { ...UI.col, gap: 8 },
+					children: [
+						jsx(PlanMultiCard, { prov }, "multi"),
+						...prov.accounts.map((acc) => jsx(PlanAccountCard, { acc, nowSec, page }, acc.provider)),
+					],
+				}, prov.base),
+			),
+			jsx("div", { style: { ...UI.faint, lineHeight: 1.4 }, children: t("planAssumptions") }, "assume"),
+		],
+	});
+}
+
 // ---- Accounts view (`hermes quota monitor accounts|set-priority|set-strategy`) ----
 //
 // Read-only view of which credentials profiles use, pool strategies, model and
 // fallback chains, and providers that are not signed in. This widget does not
-// expose order or strategy writes, even when an older backend advertises them.
+// expose order or strategy writes, even when an older backend advertises them —
+// unless the backend runs in full mode (`fullMode: true`; the accounts payload
+// then carries `full_mode: true`). In full mode two writes are enabled, both
+// delegated by the backend to Hermes' own CLI after validation:
+//   order    -> `hermes --profile <pool owner> auth priority <provider> <id> <n>`
+//   strategy -> `hermes --profile <profile> config set credential_pool_strategies.<provider> <s>`
+// Every write is confirmed in a dialog that names exactly what changes and for
+// which profiles; the UI is optimistic and rolls back when the write fails.
 
 const ACCOUNTS_TAB_KEY = "accountsTab";
 const accountsTabAtom = atom(true);
 const ACCOUNTS_STALE_S = 600; // older data than this pauses writes until a refetch
-const ACCOUNT_MUTATIONS_ENABLED = false; // backend flags cannot grant account-write authority to the widget
+// Capability flags alone never grant account-write authority to the widget:
+// only an explicit `full_mode: true` from a backend whose fullMode setting is on.
+const ACCOUNT_MUTATIONS_ENABLED = false;
+function accountMutationsEnabled(data) {
+	return ACCOUNT_MUTATIONS_ENABLED || Boolean(data && data.full_mode === true);
+}
+/** Footer hint of a multi-row pool: read-only in the trial, the drag hint (or why it is paused) in full mode. */
+function accountsPoolHint(ctl, pool, t) {
+	if (!accountMutationsEnabled(ctl.env.data)) return t("accountsDragHint");
+	if (!pool.writable) return t("accountsNotWritable");
+	const block = ctl.blocked();
+	return block ? t(`accountsBlocked_${block}`) : t("accountsDragHintEdit");
+}
 const STRATEGY_IDS = ["fill_first", "round_robin", "least_used", "random"];
 const ACCOUNTS_SIGNIN_VISIBLE = 6;
 
@@ -5817,8 +6484,8 @@ function accountsOfficialCommand(change) {
 }
 
 /** One write through the focused profile's gateway; the backend answers one JSON object. */
-async function runAccountsWrite(scope, argv) {
-	if (!ACCOUNT_MUTATIONS_ENABLED) throw new Error("Account changes are disabled in this widget.");
+async function runAccountsWrite(scope, argv, fullMode = false) {
+	if (!ACCOUNT_MUTATIONS_ENABLED && fullMode !== true) throw new Error("Account changes are disabled in this widget.");
 	let output;
 	try {
 		const result = await quotaCli(scope, argv, MONITOR_TIMEOUT_MS, { spawnPriority: "foreground" });
@@ -5930,7 +6597,7 @@ function createAccountsController(initial) {
 		},
 		canReorder(key) {
 			const pool = ctl.pool(key);
-			return Boolean(ACCOUNT_MUTATIONS_ENABLED && pool && pool.writable && !ctl.blocked() &&
+			return Boolean(accountMutationsEnabled(ctl.env.data) && pool && pool.writable && !ctl.blocked() &&
 				ctl.env.data.capabilities && ctl.env.data.capabilities.set_priority);
 		},
 		dragStart(key, id) {
@@ -5983,7 +6650,7 @@ function createAccountsController(initial) {
 			return ctl.state.strategies[k] || (pool.strategies && pool.strategies[profile]) || "fill_first";
 		},
 		proposeStrategy(pool, profile, strategy) {
-			if (!ACCOUNT_MUTATIONS_ENABLED || !pool || ctl.blocked() ||
+			if (!accountMutationsEnabled(ctl.env.data) || !pool || ctl.blocked() ||
 				!(ctl.env.data.capabilities && ctl.env.data.capabilities.set_strategy)) return null;
 			const supported = asList(ctl.env.data.strategies);
 			if (!supported.includes(strategy)) return null;
@@ -6017,13 +6684,14 @@ function createAccountsController(initial) {
 		},
 		async confirm() {
 			const change = ctl.state.confirm;
-			if (!ACCOUNT_MUTATIONS_ENABLED || !change || ctl.state.busy) return null;
+			const fullMode = accountMutationsEnabled(ctl.env.data);
+			if (!fullMode || !change || ctl.state.busy) return null;
 			// a retry after a failed attempt re-applies the optimistic value first
 			if (change.kind === "priority") ctl.set({ orders: { ...ctl.state.orders, [change.key]: change.ids } });
 			else ctl.set({ strategies: { ...ctl.state.strategies, [change.key]: change.to } });
 			ctl.set({ busy: true, error: null });
 			try {
-				const res = await ctl.env.write(ctl.env.scope, change.argv);
+				const res = await ctl.env.write(ctl.env.scope, change.argv, fullMode);
 				ctl.set({ busy: false });
 				ctl.rollback(change); // the server's state replaces the optimistic value
 				ctl.set({ confirm: null });
@@ -6199,7 +6867,7 @@ function StrategyControl({ ctl, pool, profile, page }) {
 	const t = useQT();
 	const value = ctl.strategyFor(pool, profile);
 	const supported = asList(ctl.env.data && ctl.env.data.strategies).filter((s) => STRATEGY_IDS.includes(s));
-	const blocked = !ACCOUNT_MUTATIONS_ENABLED || Boolean(ctl.blocked());
+	const blocked = !accountMutationsEnabled(ctl.env.data) || Boolean(ctl.blocked());
 	return jsxs("div", {
 		"data-strategy-profile": profile,
 		title: t(`strategyHint_${value}`),
@@ -6313,7 +6981,7 @@ function PoolCard({ ctl, pool, nowSec, page }) {
 				style: { ...UI.col, gap: 3, padding: page ? "6px 10px 8px" : "6px 8px 7px", borderTop: "1px solid var(--ui-stroke-tertiary)", background: "var(--ui-bg-tertiary)" },
 				children: [
 					rows.length > 1
-						? jsx("span", { style: { ...UI.tiny, lineHeight: 1.4 }, children: t("accountsDragHint") }, "hint")
+						? jsx("span", { style: { ...UI.tiny, lineHeight: 1.4 }, children: accountsPoolHint(ctl, pool, t) }, "hint")
 						: jsx("span", { style: { ...UI.tiny, lineHeight: 1.4 }, children: t("accountsSingle") }, "hint"),
 					pool.shared && rows.length > 1
 						? jsx("span", { "data-shared-warning": true, style: { ...UI.tiny, lineHeight: 1.4, color: "var(--ui-orange)" }, children: t("accountsSharedWarning", pool.owner, others.join(", ")) }, "warn")
@@ -6649,7 +7317,7 @@ function AccountsView({ page = false, initialState = null, accountsOverride = nu
 				"data-accounts-explainer": true,
 				className: "rounded-lg border border-dashed px-3 py-2",
 				style: { ...UI.meta, lineHeight: 1.45, borderColor: "var(--ui-stroke-secondary)" },
-				children: t("accountsExplainer"),
+				children: t(accountMutationsEnabled(data) ? "accountsExplainerEdit" : "accountsExplainer"),
 			}, "explain"),
 			block === "stale" || block === "loading"
 				? jsx("div", { "data-accounts-paused": block, style: { ...UI.meta, color: "var(--ui-yellow)" }, children: t(`accountsBlocked_${block}`) }, "paused")
@@ -7062,6 +7730,7 @@ const I18N_EN = {
 	accountsTabLabel: "Accounts tab",
 	accountsTabHint: "Read-only view of pool metadata, strategies, fallbacks and sign-in gaps. Hide it if you do not need this information.",
 	accountsExplainer: "Hermes picks credentials from provider pools. Profiles without their own login share the default profile's pool; strategy is per profile. This view is read-only: account order and strategy cannot be changed here, regardless of backend flags.",
+	accountsExplainerEdit: "Hermes picks a credential from a provider's pool. Profiles without their own login share the default profile's pool, so its order applies to all of them; the strategy is set per profile. Changes run Hermes' own CLI after you confirm.",
 	accountsPoolsTitle: "Credential pools",
 	accountsPoolsSub: (n) => `${n} pool${n === 1 ? "" : "s"}`,
 	accountsNoPools: "No pooled credentials yet. Sign in below or run `hermes auth add <provider>`.",
@@ -7089,6 +7758,7 @@ const I18N_EN = {
 	accountsMoveUp: (label) => `Move ${label} up`,
 	accountsMoveDown: (label) => `Move ${label} down`,
 	accountsDragHint: "Read-only: account order cannot be changed from this widget.",
+	accountsDragHintEdit: "Drag a row, or use ▲▼ / Alt+↑↓, to change which account is tried first.",
 	accountsNotWritable: "This pool can't be reordered from here (a row has no pool id).",
 	accountsSingle: "One account — nothing to order. Add another with `hermes auth add <provider>`.",
 	accountsBlocked_loading: "Refreshing account data… changes are paused until it is current.",
@@ -7434,6 +8104,92 @@ const I18N_EN = {
 	specialResetTipStaleChecked: (checked) => `Stale · checked ${checked}`,
 	specialResetData: (url) => `Data: ${url}`,
 	specialResetSourceLine: (url) => `Source: ${url}`,
+	// ---- plan tab + pool cards ----
+	tab_plan: "Plan",
+	planTabLabel: "Plan tab",
+	planTabHint: "Paces the weekly limit against session limits per account. Works without the monitor (current quota only); with the monitor it learns from your history.",
+	planHeadline: (n = "", when = "", week = "", session = "", used = "", state = "") => `${n} session${n === 1 ? "" : "s"} left until ${when}; you can use ~${week} of the week per session (≈ ${session} of a session). Current session: ${used} used — ${state}.`,
+	planHeadlineFull: (n = "", when = "", week = "", used = "", state = "") => `${n} session${n === 1 ? "" : "s"} left until ${when}; you can use ~${week} of the week per session — more than a full session. Current session: ${used} used — ${state}.`,
+	planStateKeepGoing: "keep going",
+	planStateFill: "you can use it to 100%",
+	planStateNear: "close to this session's share",
+	planStateOver: "over this session's share — slow down or switch account",
+	planStateIdle: "not started (begins with your next message)",
+	planStateUnknown: "no estimate",
+	planPaceUnder: (x) => `Under-using: you can spend ~${x} more of a session each time`,
+	planPaceUnderPlain: "Under-using: room to spend more per session",
+	planPaceOnTrack: "On track for the week",
+	planPaceOver: (y) => `Over pace: slow to ~${y} of a session per session or switch account`,
+	planPaceOverPlain: "Over pace: slow down or switch account",
+	planSessionsLeft: "Sessions left",
+	planSessionsSub: (cal = "", source = "") => `${cal} possible · ${source}`,
+	planSource_history: "your usual hours",
+	planSource_setting: "your active hours",
+	planSource_calendar: "every 5h window",
+	planBudget: "Budget per session",
+	planBudgetValue: (w) => `${w} of week`,
+	planBudgetSub: (s) => `≈ ${s} of a session`,
+	planBudgetFull: "more than a full session",
+	planTarget: "Stop this session at",
+	planNextSession: "Next session up to",
+	planTargetSub: (cost) => `filling it costs ${cost} of the week`,
+	planProjected: "Week at reset",
+	planProjectedTypical: (f) => `at your typical ${f} per session`,
+	planProjectedLinear: "at this week's pace so far",
+	planRunsOut: (when) => `runs out ${when}`,
+	planSessionReset: "Session resets in",
+	planWeekReset: "Week resets in",
+	planChartTitle: "Week used — actual vs. even pace to reset",
+	planChartActual: "actual",
+	planChartIdeal: "even pace",
+	planChartProjected: "projected",
+	planFormulaBudget: (left = "", n = "", b = "", r = "", s = "") => `budget = week left ${left} ÷ ${n} sessions = ${b} of the week; ÷ r ${r} = ${s} of a session`,
+	planFormulaTypical: (w = "", f = "", r = "", n = "", p = "") => `projected = week used ${w} + typical ${f} × r ${r} × ${n} sessions ≈ ${p}`,
+	planFormulaLinear: (w = "", p = "") => `projected = week used ${w} at the same rate until reset ≈ ${p}`,
+	planFormulaRatio: (n = "", conf = "") => `r = week % per 1% of session, weighted median of ${n} past sessions (${conf})`,
+	planConfidence_low: "low confidence",
+	planConfidence_medium: "medium confidence",
+	planConfidence_high: "high confidence",
+	planRatioLine: (r) => `1% session ≈ ${r}% week`,
+	planTypicalLine: (f = "", n = "") => `typical session ${f} (${n} sessions)`,
+	planAssumptions: "Estimate from your quota readings, not a provider guarantee. A session is a 5-hour window that starts with your first message; the week is reported in whole percents, so short sessions are noisy.",
+	planDegraded: "Monitor history is off: this plan uses the current quota only (default ratio r, every 5h window counted). Enable the monitor for a plan learned from your history.",
+	planEmpty: "No account exposes a session and a weekly window yet.",
+	planError: "Plan unavailable — the backend could not compute it.",
+	planUnplannable: (reason) => `no plan (${reason})`,
+	planMultiTitle: "Accounts",
+	planMultiUse: (name) => `Use ${name} now — Hermes tries it first.`,
+	planMultiSwitch: (pct = "", when = "", next = "") => `Switch to ${next} when its session reaches ~${pct}${when ? ` or wait until it resets ${when}` : ""}.`,
+	planMultiSwitchNow: (name) => `This session already used its share of the week: switch to ${name} now.`,
+	planMultiReorder: (name) => `${name} has the most weekly room per session — consider moving it first (hermes auth priority).`,
+	planMultiSpread: (strategy) => `Hermes spreads requests across accounts (${strategy}): pace by the combined budget.`,
+	planMultiAllOut: "Every account is out of session or weekly quota.",
+	planMultiCombined: (left = "", per = "") => `combined ${left} of a week left · ${per} per session`,
+	poolPosition: (n = "", size = "") => `#${n}/${size}`,
+	poolFirst: "tried first",
+	poolTip: (n = "", size = "", strategy = "") => `Hermes credential pool: position ${n} of ${size} (${strategy})`,
+	nowTitle: "Now",
+	nowAccount: (name = "", s = "", w = "") => `Claude account in use: ${name} · session ${s} · week ${w}`,
+	nowAccountSpread: (strategy) => `Claude accounts: Hermes spreads requests (${strategy})`,
+	// ---- notch companion ----
+	notchTitle: "Notch island (macOS)",
+	notchIntro: "Quota Notch is an optional native Mac app: quota rings, running sessions and alerts in the MacBook notch (or the menu bar), outside the Hermes window. It reads this plugin's own JSON; the plugin works without it.",
+	notchStatus: "Companion app",
+	notchRunning: "Running",
+	notchStopped: "Installed, not running",
+	notchNotInstalled: "Not installed",
+	notchHasNotch: "This Mac has a notch: the island sits around the camera.",
+	notchNoNotch: "This Mac has no notch: the companion runs in the menu bar instead.",
+	notchUnknown: "Start it once; it then reports whether this Mac has a notch (otherwise it uses the menu bar).",
+	notchInstallLabel: "Install (builds with the Xcode Command Line Tools)",
+	notchCopyInstall: "Copy",
+	notchOpen: "Open app",
+	notchLoading: "Checking the companion…",
+	notchUpdate: "Update the quota plugin backend to manage the notch companion here.",
+	notchPrivacy: "It only runs the hermes CLI (read-only quota/monitor JSON) and opens hermes:// links. No network, no credentials.",
+	notchOpenFailed: "Could not open Quota Notch.",
+	notchNoScript: (url) => `The installed plugin has no macos/ folder. Get it from ${url} and run macos/install.sh.`,
+	notchRemote: (platform) => `This gateway's backend runs on ${platform}; install the companion on the Mac that runs Hermes.`,
 };
 
 const I18N_TR = {
@@ -7493,6 +8249,7 @@ const I18N_TR = {
 	accountsTabLabel: "Hesaplar sekmesi",
 	accountsTabHint: "Havuz meta verileri, stratejiler, yedekler ve giriş eksikleri için salt okunur görünüm. Bu bilgiye ihtiyacın yoksa gizleyebilirsin.",
 	accountsExplainer: "Hermes sağlayıcı havuzlarından kimlik seçer. Kendi girişi olmayan profiller default profilin havuzunu paylaşır; strateji profil başınadır. Bu görünüm salt okunurdur: hesap sırası ve strateji, backend bayrakları ne olursa olsun burada değiştirilemez.",
+	accountsExplainerEdit: "Hermes bir sağlayıcının havuzundan bir kimlik seçer. Kendi girişi olmayan profiller default profilin havuzunu paylaşır; sıralama hepsine uygulanır, strateji ise profil başınadır. Değişiklikler sen onaylayınca Hermes'in kendi CLI'ı ile yapılır.",
 	accountsPoolsTitle: "Kimlik havuzları",
 	accountsPoolsSub: (n) => `${n} havuz`,
 	accountsNoPools: "Henüz havuzda kimlik yok. Aşağıdan giriş yap ya da `hermes auth add <sağlayıcı>` çalıştır.",
@@ -7520,6 +8277,7 @@ const I18N_TR = {
 	accountsMoveUp: (label) => `${label} yukarı taşı`,
 	accountsMoveDown: (label) => `${label} aşağı taşı`,
 	accountsDragHint: "Salt okunur: hesap sırası bu widget'tan değiştirilemez.",
+	accountsDragHintEdit: "İlk denenecek hesabı değiştirmek için satırı sürükle ya da ▲▼ / Alt+↑↓ kullan.",
 	accountsNotWritable: "Bu havuz buradan sıralanamaz (bir satırın havuz kimliği yok).",
 	accountsSingle: "Tek hesap — sıralanacak bir şey yok. Bir tane daha eklemek için `hermes auth add <sağlayıcı>`.",
 	accountsBlocked_loading: "Hesap verisi yenileniyor… güncel olana kadar değişiklikler durduruldu.",
@@ -7865,6 +8623,92 @@ const I18N_TR = {
 	specialResetTipStaleChecked: (checked) => `Eski · ${checked} tarihinde kontrol edildi`,
 	specialResetData: (url) => `Veri: ${url}`,
 	specialResetSourceLine: (url) => `Kaynak: ${url}`,
+	// ---- plan tab + pool cards ----
+	tab_plan: "Plan",
+	planTabLabel: "Plan sekmesi",
+	planTabHint: "Haftalık limiti hesap başına oturum limitlerine göre planlar. Monitör olmadan da çalışır (yalnızca güncel kota); monitörle geçmişinden öğrenir.",
+	planHeadline: (n = "", when = "", week = "", session = "", used = "", state = "") => `${when} tarihine kadar ${n} oturum kaldı; oturum başına haftanın ~${week} kadarını kullanabilirsin (≈ bir oturumun ${session} kadarı). Bu oturum: ${used} kullanıldı — ${state}.`,
+	planHeadlineFull: (n = "", when = "", week = "", used = "", state = "") => `${when} tarihine kadar ${n} oturum kaldı; oturum başına haftanın ~${week} kadarını kullanabilirsin — bir oturumdan fazlası. Bu oturum: ${used} kullanıldı — ${state}.`,
+	planStateKeepGoing: "devam et",
+	planStateFill: "%100'e kadar kullanabilirsin",
+	planStateNear: "bu oturumun payına yaklaştın",
+	planStateOver: "bu oturumun payını aştın — yavaşla ya da hesap değiştir",
+	planStateIdle: "başlamadı (bir sonraki mesajınla başlar)",
+	planStateUnknown: "tahmin yok",
+	planPaceUnder: (x) => `Az kullanıyorsun: her oturumda ~${x} daha fazla harcayabilirsin`,
+	planPaceUnderPlain: "Az kullanıyorsun: oturum başına daha fazla harcayabilirsin",
+	planPaceOnTrack: "Hafta için yolunda",
+	planPaceOver: (y) => `Hızlı gidiyorsun: oturum başına ~${y} seviyesine in ya da hesap değiştir`,
+	planPaceOverPlain: "Hızlı gidiyorsun: yavaşla ya da hesap değiştir",
+	planSessionsLeft: "Kalan oturum",
+	planSessionsSub: (cal = "", source = "") => `${cal} mümkün · ${source}`,
+	planSource_history: "her zamanki saatlerin",
+	planSource_setting: "aktif saatlerin",
+	planSource_calendar: "her 5 saatlik pencere",
+	planBudget: "Oturum başına bütçe",
+	planBudgetValue: (w) => `haftanın ${w}`,
+	planBudgetSub: (s) => `≈ bir oturumun ${s}`,
+	planBudgetFull: "bir oturumdan fazla",
+	planTarget: "Bu oturumu şurada bırak",
+	planNextSession: "Sonraki oturum en fazla",
+	planTargetSub: (cost) => `doldurmak haftanın ${cost} kadarı`,
+	planProjected: "Sıfırlamada hafta",
+	planProjectedTypical: (f) => `oturum başına her zamanki ${f} ile`,
+	planProjectedLinear: "bu haftaki hızla",
+	planRunsOut: (when) => `${when} biter`,
+	planSessionReset: "Oturum sıfırlanması",
+	planWeekReset: "Hafta sıfırlanması",
+	planChartTitle: "Haftalık kullanım — gerçek ve sıfırlamaya kadar eşit hız",
+	planChartActual: "gerçek",
+	planChartIdeal: "eşit hız",
+	planChartProjected: "tahmini",
+	planFormulaBudget: (left = "", n = "", b = "", r = "", s = "") => `bütçe = kalan hafta ${left} ÷ ${n} oturum = haftanın ${b}; ÷ r ${r} = bir oturumun ${s}`,
+	planFormulaTypical: (w = "", f = "", r = "", n = "", p = "") => `tahmin = kullanılan hafta ${w} + her zamanki ${f} × r ${r} × ${n} oturum ≈ ${p}`,
+	planFormulaLinear: (w = "", p = "") => `tahmin = kullanılan hafta ${w} aynı hızla sıfırlamaya kadar ≈ ${p}`,
+	planFormulaRatio: (n = "", conf = "") => `r = oturumun %1'i başına hafta yüzdesi, geçmiş ${n} oturumun ağırlıklı medyanı (${conf})`,
+	planConfidence_low: "düşük güven",
+	planConfidence_medium: "orta güven",
+	planConfidence_high: "yüksek güven",
+	planRatioLine: (r) => `oturumun %1'i ≈ haftanın %${r}'i`,
+	planTypicalLine: (f = "", n = "") => `her zamanki oturum ${f} (${n} oturum)`,
+	planAssumptions: "Kota okumalarından tahmindir, sağlayıcı garantisi değildir. Oturum, ilk mesajınla başlayan 5 saatlik bir penceredir; hafta tam yüzde olarak bildirildiği için kısa oturumlar gürültülüdür.",
+	planDegraded: "Monitör geçmişi kapalı: bu plan yalnızca güncel kotayı kullanır (varsayılan oran r, her 5 saatlik pencere sayılır). Geçmişinden öğrenen plan için monitörü aç.",
+	planEmpty: "Henüz oturum ve haftalık penceresi olan bir hesap yok.",
+	planError: "Plan kullanılamıyor — arka uç hesaplayamadı.",
+	planUnplannable: (reason) => `plan yok (${reason})`,
+	planMultiTitle: "Hesaplar",
+	planMultiUse: (name) => `Şimdi ${name} kullan — Hermes önce onu dener.`,
+	planMultiSwitch: (pct = "", when = "", next = "") => `Oturumu ~${pct} seviyesine gelince ${next} hesabına geç${when ? ` ya da ${when} sıfırlanmasını bekle` : ""}.`,
+	planMultiSwitchNow: (name) => `Bu oturum haftalık payını kullandı: şimdi ${name} hesabına geç.`,
+	planMultiReorder: (name) => `Oturum başına en çok haftalık payı ${name} hesabında — onu başa almayı düşün (hermes auth priority).`,
+	planMultiSpread: (strategy) => `Hermes istekleri hesaplara dağıtır (${strategy}): toplam bütçeye göre ilerle.`,
+	planMultiAllOut: "Tüm hesapların oturum ya da haftalık kotası bitti.",
+	planMultiCombined: (left = "", per = "") => `toplam ${left} hafta kaldı · oturum başına ${per}`,
+	poolPosition: (n = "", size = "") => `#${n}/${size}`,
+	poolFirst: "önce denenir",
+	poolTip: (n = "", size = "", strategy = "") => `Hermes kimlik havuzu: ${size} içinde ${n}. sıra (${strategy})`,
+	nowTitle: "Şimdi",
+	nowAccount: (name = "", s = "", w = "") => `Kullanılan Claude hesabı: ${name} · oturum ${s} · hafta ${w}`,
+	nowAccountSpread: (strategy) => `Claude hesapları: Hermes istekleri dağıtıyor (${strategy})`,
+	// ---- notch companion ----
+	notchTitle: "Çentik adası (macOS)",
+	notchIntro: "Quota Notch isteğe bağlı yerel bir Mac uygulamasıdır: kota halkaları, çalışan oturumlar ve uyarılar Hermes penceresinin dışında, MacBook çentiğinde (ya da menü çubuğunda). Bu eklentinin kendi JSON çıktısını okur; eklenti onsuz da çalışır.",
+	notchStatus: "Yardımcı uygulama",
+	notchRunning: "Çalışıyor",
+	notchStopped: "Kurulu, çalışmıyor",
+	notchNotInstalled: "Kurulu değil",
+	notchHasNotch: "Bu Mac'te çentik var: ada kameranın çevresinde durur.",
+	notchNoNotch: "Bu Mac'te çentik yok: uygulama onun yerine menü çubuğunda çalışır.",
+	notchUnknown: "Bir kez başlat; sonra bu Mac'te çentik olup olmadığını bildirir (yoksa menü çubuğunu kullanır).",
+	notchInstallLabel: "Kurulum (Xcode Command Line Tools ile derlenir)",
+	notchCopyInstall: "Kopyala",
+	notchOpen: "Uygulamayı aç",
+	notchLoading: "Yardımcı uygulama denetleniyor…",
+	notchUpdate: "Çentik uygulamasını buradan yönetmek için quota eklentisinin backend'ini güncelle.",
+	notchPrivacy: "Yalnızca hermes CLI'yi (salt okunur kota/monitor JSON) çalıştırır ve hermes:// bağlantılarını açar. Ağ yok, kimlik bilgisi yok.",
+	notchOpenFailed: "Quota Notch açılamadı.",
+	notchNoScript: (url) => `Kurulu eklentide macos/ klasörü yok. ${url} adresinden alıp macos/install.sh çalıştır.`,
+	notchRemote: (platform) => `Bu gateway'in backend'i ${platform} üzerinde çalışıyor; uygulamayı Hermes'i çalıştıran Mac'e kur.`,
 };
 
 /** Plural pick for bundle functions: `forms` keyed by Intl.PluralRules category. */
@@ -7946,6 +8790,7 @@ const I18N_DE = {
 	accountsTabLabel: "Konten-Tab",
 	accountsTabHint: "Schreibgeschützte Ansicht von Pool-Metadaten, Strategien, Fallbacks und fehlenden Anmeldungen. Ausblenden, wenn Sie diese Informationen nicht benötigen.",
 	accountsExplainer: "Hermes wählt Zugangsdaten aus Anbieter-Pools. Profile ohne eigene Anmeldung teilen den Pool des Standardprofils; die Strategie gilt pro Profil. Diese Ansicht ist schreibgeschützt: Konto-Reihenfolge und Strategie lassen sich hier unabhängig von Backend-Flags nicht ändern.",
+	accountsExplainerEdit: "Hermes wählt Zugangsdaten aus dem Pool eines Anbieters. Profile ohne eigene Anmeldung teilen den Pool des Standardprofils, seine Reihenfolge gilt also für alle; die Strategie wird pro Profil festgelegt. Änderungen laufen nach Ihrer Bestätigung über die Hermes-CLI.",
 	accountsPoolsTitle: "Zugangsdaten-Pools",
 	accountsPoolsSub: (n) => `${n} ${n === 1 ? "Pool" : "Pools"}`,
 	accountsNoPools: "Noch keine Zugangsdaten im Pool. Melden Sie sich unten an oder führen Sie `hermes auth add <provider>` aus.",
@@ -7973,6 +8818,7 @@ const I18N_DE = {
 	accountsMoveUp: (label) => `${label} nach oben`,
 	accountsMoveDown: (label) => `${label} nach unten`,
 	accountsDragHint: "Schreibgeschützt: Die Konto-Reihenfolge kann in diesem Widget nicht geändert werden.",
+	accountsDragHintEdit: "Zeile ziehen oder ▲▼ / Alt+↑↓ nutzen, um das zuerst probierte Konto zu ändern.",
 	accountsNotWritable: "Dieser Pool lässt sich hier nicht umsortieren (einer Zeile fehlt die Pool-ID).",
 	accountsSingle: "Ein Konto — nichts zu sortieren. Weitere mit `hermes auth add <provider>` hinzufügen.",
 	accountsBlocked_loading: "Kontodaten werden aktualisiert… Änderungen pausieren, bis sie aktuell sind.",
@@ -8318,6 +9164,92 @@ const I18N_DE = {
 	specialResetTipStaleChecked: (checked) => `Veraltet · geprüft ${checked}`,
 	specialResetData: (url) => `Daten: ${url}`,
 	specialResetSourceLine: (url) => `Quelle: ${url}`,
+	// ---- plan tab + pool cards ----
+	tab_plan: "Plan",
+	planTabLabel: "Plan-Tab",
+	planTabHint: "Teilt das Wochenlimit pro Konto auf die Sitzungslimits auf. Funktioniert ohne Monitor (nur aktuelles Kontingent); mit Monitor lernt es aus deinem Verlauf.",
+	planHeadline: (n = "", when = "", week = "", session = "", used = "", state = "") => `Noch ${n} ${n === 1 ? "Sitzung" : "Sitzungen"} bis ${when}; pro Sitzung kannst du ~${week} der Woche nutzen (≈ ${session} einer Sitzung). Aktuelle Sitzung: ${used} genutzt — ${state}.`,
+	planHeadlineFull: (n = "", when = "", week = "", used = "", state = "") => `Noch ${n} ${n === 1 ? "Sitzung" : "Sitzungen"} bis ${when}; pro Sitzung kannst du ~${week} der Woche nutzen — mehr als eine volle Sitzung. Aktuelle Sitzung: ${used} genutzt — ${state}.`,
+	planStateKeepGoing: "weiter so",
+	planStateFill: "du kannst sie voll ausschöpfen",
+	planStateNear: "fast am Anteil dieser Sitzung",
+	planStateOver: "über dem Anteil dieser Sitzung — langsamer machen oder Konto wechseln",
+	planStateIdle: "nicht gestartet (beginnt mit deiner nächsten Nachricht)",
+	planStateUnknown: "keine Schätzung",
+	planPaceUnder: (x) => `Unter Plan: pro Sitzung ~${x} mehr möglich`,
+	planPaceUnderPlain: "Unter Plan: pro Sitzung ist mehr möglich",
+	planPaceOnTrack: "Im Plan für die Woche",
+	planPaceOver: (y) => `Über Plan: auf ~${y} einer Sitzung pro Sitzung drosseln oder Konto wechseln`,
+	planPaceOverPlain: "Über Plan: langsamer machen oder Konto wechseln",
+	planSessionsLeft: "Sitzungen übrig",
+	planSessionsSub: (cal = "", source = "") => `${cal} möglich · ${source}`,
+	planSource_history: "deine üblichen Zeiten",
+	planSource_setting: "deine aktiven Stunden",
+	planSource_calendar: "jedes 5-h-Fenster",
+	planBudget: "Budget pro Sitzung",
+	planBudgetValue: (w) => `${w} der Woche`,
+	planBudgetSub: (s) => `≈ ${s} einer Sitzung`,
+	planBudgetFull: "mehr als eine volle Sitzung",
+	planTarget: "Diese Sitzung stoppen bei",
+	planNextSession: "Nächste Sitzung bis",
+	planTargetSub: (cost) => `voll ausgeschöpft kostet ${cost} der Woche`,
+	planProjected: "Woche beim Reset",
+	planProjectedTypical: (f) => `bei deinen üblichen ${f} pro Sitzung`,
+	planProjectedLinear: "beim bisherigen Wochentempo",
+	planRunsOut: (when) => `aufgebraucht ${when}`,
+	planSessionReset: "Sitzung setzt zurück in",
+	planWeekReset: "Woche setzt zurück in",
+	planChartTitle: "Woche genutzt — tatsächlich vs. gleichmäßiges Tempo bis zum Reset",
+	planChartActual: "tatsächlich",
+	planChartIdeal: "gleichmäßig",
+	planChartProjected: "Prognose",
+	planFormulaBudget: (left = "", n = "", b = "", r = "", s = "") => `Budget = Woche übrig ${left} ÷ ${n} Sitzungen = ${b} der Woche; ÷ r ${r} = ${s} einer Sitzung`,
+	planFormulaTypical: (w = "", f = "", r = "", n = "", p = "") => `Prognose = Woche genutzt ${w} + üblich ${f} × r ${r} × ${n} Sitzungen ≈ ${p}`,
+	planFormulaLinear: (w = "", p = "") => `Prognose = Woche genutzt ${w} im gleichen Tempo bis zum Reset ≈ ${p}`,
+	planFormulaRatio: (n = "", conf = "") => `r = Wochen-% pro 1 % Sitzung, gewichteter Median aus ${n} früheren Sitzungen (${conf})`,
+	planConfidence_low: "geringe Sicherheit",
+	planConfidence_medium: "mittlere Sicherheit",
+	planConfidence_high: "hohe Sicherheit",
+	planRatioLine: (r) => `1 % Sitzung ≈ ${r} % Woche`,
+	planTypicalLine: (f = "", n = "") => `übliche Sitzung ${f} (${n} Sitzungen)`,
+	planAssumptions: "Schätzung aus deinen Kontingent-Messungen, keine Anbietergarantie. Eine Sitzung ist ein 5-Stunden-Fenster ab deiner ersten Nachricht; die Woche wird in ganzen Prozent gemeldet, kurze Sitzungen sind daher ungenau.",
+	planDegraded: "Monitor-Verlauf ist aus: Dieser Plan nutzt nur das aktuelle Kontingent (Standard-Verhältnis r, jedes 5-h-Fenster gezählt). Aktiviere den Monitor für einen aus deinem Verlauf gelernten Plan.",
+	planEmpty: "Noch kein Konto mit Sitzungs- und Wochenfenster.",
+	planError: "Plan nicht verfügbar — das Backend konnte ihn nicht berechnen.",
+	planUnplannable: (reason) => `kein Plan (${reason})`,
+	planMultiTitle: "Konten",
+	planMultiUse: (name) => `Jetzt ${name} nutzen — Hermes versucht es zuerst.`,
+	planMultiSwitch: (pct = "", when = "", next = "") => `Zu ${next} wechseln, wenn die Sitzung ~${pct} erreicht${when ? `, oder bis zum Reset ${when} warten` : ""}.`,
+	planMultiSwitchNow: (name) => `Diese Sitzung hat ihren Wochenanteil verbraucht: jetzt zu ${name} wechseln.`,
+	planMultiReorder: (name) => `${name} hat pro Sitzung den meisten Wochenspielraum — erwäge, es nach vorn zu setzen (hermes auth priority).`,
+	planMultiSpread: (strategy) => `Hermes verteilt Anfragen auf die Konten (${strategy}): nach dem gemeinsamen Budget planen.`,
+	planMultiAllOut: "Alle Konten haben kein Sitzungs- oder Wochenkontingent mehr.",
+	planMultiCombined: (left = "", per = "") => `zusammen ${left} einer Woche übrig · ${per} pro Sitzung`,
+	poolPosition: (n = "", size = "") => `#${n}/${size}`,
+	poolFirst: "zuerst versucht",
+	poolTip: (n = "", size = "", strategy = "") => `Hermes-Zugangspool: Position ${n} von ${size} (${strategy})`,
+	nowTitle: "Jetzt",
+	nowAccount: (name = "", s = "", w = "") => `Claude-Konto in Nutzung: ${name} · Sitzung ${s} · Woche ${w}`,
+	nowAccountSpread: (strategy) => `Claude-Konten: Hermes verteilt Anfragen (${strategy})`,
+	// ---- notch companion ----
+	notchTitle: "Notch-Insel (macOS)",
+	notchIntro: "Quota Notch ist eine optionale native Mac-App: Kontingentringe, laufende Sitzungen und Hinweise in der MacBook-Notch (oder der Menüleiste), außerhalb des Hermes-Fensters. Sie liest das eigene JSON dieses Plugins; das Plugin funktioniert auch ohne sie.",
+	notchStatus: "Begleit-App",
+	notchRunning: "Läuft",
+	notchStopped: "Installiert, läuft nicht",
+	notchNotInstalled: "Nicht installiert",
+	notchHasNotch: "Dieser Mac hat eine Notch: Die Insel sitzt um die Kamera.",
+	notchNoNotch: "Dieser Mac hat keine Notch: Die App läuft stattdessen in der Menüleiste.",
+	notchUnknown: "Einmal starten; danach meldet sie, ob dieser Mac eine Notch hat (sonst nutzt sie die Menüleiste).",
+	notchInstallLabel: "Installation (baut mit den Xcode Command Line Tools)",
+	notchCopyInstall: "Kopieren",
+	notchOpen: "App öffnen",
+	notchLoading: "Begleit-App wird geprüft…",
+	notchUpdate: "Aktualisiere das Backend des Quota-Plugins, um die Notch-App hier zu verwalten.",
+	notchPrivacy: "Sie führt nur die hermes-CLI aus (schreibgeschütztes Kontingent-/Monitor-JSON) und öffnet hermes://-Links. Kein Netzwerk, keine Zugangsdaten.",
+	notchOpenFailed: "Quota Notch konnte nicht geöffnet werden.",
+	notchNoScript: (url) => `Das installierte Plugin hat keinen macos/-Ordner. Hole ihn von ${url} und führe macos/install.sh aus.`,
+	notchRemote: (platform) => `Das Backend dieses Gateways läuft auf ${platform}; installiere die App auf dem Mac, auf dem Hermes läuft.`,
 };
 
 const I18N_ES = {
@@ -8377,6 +9309,7 @@ const I18N_ES = {
 	accountsTabLabel: "Pestaña Cuentas",
 	accountsTabHint: "Vista de solo lectura de metadatos de pools, estrategias, respaldos y accesos pendientes. Ocúltala si no necesitas esta información.",
 	accountsExplainer: "Hermes elige credenciales de los pools de cada proveedor. Los perfiles sin inicio de sesión propio comparten el pool predeterminado; la estrategia es por perfil. Esta vista es de solo lectura: aquí no se puede cambiar el orden ni la estrategia, independientemente de las capacidades del backend.",
+	accountsExplainerEdit: "Hermes elige una credencial del pool de un proveedor. Los perfiles sin inicio de sesión propio comparten el pool del perfil predeterminado, así que su orden se aplica a todos; la estrategia es por perfil. Los cambios se hacen con la CLI de Hermes cuando confirmas.",
 	accountsPoolsTitle: "Pools de credenciales",
 	accountsPoolsSub: (n) => `${n} ${n === 1 ? "pool" : "pools"}`,
 	accountsNoPools: "Aún no hay credenciales en el pool. Inicia sesión abajo o ejecuta `hermes auth add <provider>`.",
@@ -8404,6 +9337,7 @@ const I18N_ES = {
 	accountsMoveUp: (label) => `Subir ${label}`,
 	accountsMoveDown: (label) => `Bajar ${label}`,
 	accountsDragHint: "Solo lectura: no se puede cambiar el orden de las cuentas desde este widget.",
+	accountsDragHintEdit: "Arrastra una fila, o usa ▲▼ / Alt+↑↓, para cambiar qué cuenta se prueba primero.",
 	accountsNotWritable: "Este pool no se puede reordenar desde aquí (a una fila le falta el id del pool).",
 	accountsSingle: "Una sola cuenta — nada que ordenar. Añade otra con `hermes auth add <provider>`.",
 	accountsBlocked_loading: "Actualizando datos de cuentas… los cambios esperan a que estén al día.",
@@ -8749,6 +9683,92 @@ const I18N_ES = {
 	specialResetTipStaleChecked: (checked) => `Desactualizado · comprobado ${checked}`,
 	specialResetData: (url) => `Datos: ${url}`,
 	specialResetSourceLine: (url) => `Fuente: ${url}`,
+	// ---- plan tab + pool cards ----
+	tab_plan: "Plan",
+	planTabLabel: "Pestaña Plan",
+	planTabHint: "Reparte el límite semanal entre los límites de sesión de cada cuenta. Funciona sin el monitor (solo la cuota actual); con el monitor aprende de tu historial.",
+	planHeadline: (n = "", when = "", week = "", session = "", used = "", state = "") => `Quedan ${n} ${n === 1 ? "sesión" : "sesiones"} hasta ${when}; puedes usar ~${week} de la semana por sesión (≈ ${session} de una sesión). Sesión actual: ${used} usado — ${state}.`,
+	planHeadlineFull: (n = "", when = "", week = "", used = "", state = "") => `Quedan ${n} ${n === 1 ? "sesión" : "sesiones"} hasta ${when}; puedes usar ~${week} de la semana por sesión — más que una sesión completa. Sesión actual: ${used} usado — ${state}.`,
+	planStateKeepGoing: "sigue",
+	planStateFill: "puedes usarla al 100 %",
+	planStateNear: "cerca de la parte de esta sesión",
+	planStateOver: "por encima de la parte de esta sesión — baja el ritmo o cambia de cuenta",
+	planStateIdle: "sin iniciar (empieza con tu próximo mensaje)",
+	planStateUnknown: "sin estimación",
+	planPaceUnder: (x) => `Por debajo: puedes gastar ~${x} más de cada sesión`,
+	planPaceUnderPlain: "Por debajo: hay margen para gastar más por sesión",
+	planPaceOnTrack: "En ritmo para la semana",
+	planPaceOver: (y) => `Por encima: baja a ~${y} de sesión por sesión o cambia de cuenta`,
+	planPaceOverPlain: "Por encima: baja el ritmo o cambia de cuenta",
+	planSessionsLeft: "Sesiones restantes",
+	planSessionsSub: (cal = "", source = "") => `${cal} posibles · ${source}`,
+	planSource_history: "tus horas habituales",
+	planSource_setting: "tus horas activas",
+	planSource_calendar: "cada ventana de 5 h",
+	planBudget: "Presupuesto por sesión",
+	planBudgetValue: (w) => `${w} de la semana`,
+	planBudgetSub: (s) => `≈ ${s} de una sesión`,
+	planBudgetFull: "más que una sesión completa",
+	planTarget: "Detén esta sesión en",
+	planNextSession: "Próxima sesión hasta",
+	planTargetSub: (cost) => `llenarla cuesta ${cost} de la semana`,
+	planProjected: "Semana al reiniciar",
+	planProjectedTypical: (f) => `a tu ritmo típico de ${f} por sesión`,
+	planProjectedLinear: "al ritmo de esta semana",
+	planRunsOut: (when) => `se agota ${when}`,
+	planSessionReset: "La sesión se reinicia en",
+	planWeekReset: "La semana se reinicia en",
+	planChartTitle: "Semana usada — real vs. ritmo uniforme hasta el reinicio",
+	planChartActual: "real",
+	planChartIdeal: "ritmo uniforme",
+	planChartProjected: "proyectado",
+	planFormulaBudget: (left = "", n = "", b = "", r = "", s = "") => `presupuesto = semana restante ${left} ÷ ${n} sesiones = ${b} de la semana; ÷ r ${r} = ${s} de una sesión`,
+	planFormulaTypical: (w = "", f = "", r = "", n = "", p = "") => `proyección = semana usada ${w} + típico ${f} × r ${r} × ${n} sesiones ≈ ${p}`,
+	planFormulaLinear: (w = "", p = "") => `proyección = semana usada ${w} al mismo ritmo hasta el reinicio ≈ ${p}`,
+	planFormulaRatio: (n = "", conf = "") => `r = % semanal por 1 % de sesión, mediana ponderada de ${n} sesiones pasadas (${conf})`,
+	planConfidence_low: "confianza baja",
+	planConfidence_medium: "confianza media",
+	planConfidence_high: "confianza alta",
+	planRatioLine: (r) => `1 % de sesión ≈ ${r} % de semana`,
+	planTypicalLine: (f = "", n = "") => `sesión típica ${f} (${n} sesiones)`,
+	planAssumptions: "Estimación a partir de tus lecturas de cuota, no una garantía del proveedor. Una sesión es una ventana de 5 horas que empieza con tu primer mensaje; la semana se informa en porcentajes enteros, así que las sesiones cortas son imprecisas.",
+	planDegraded: "El historial del monitor está desactivado: este plan usa solo la cuota actual (ratio r por defecto, cuenta cada ventana de 5 h). Activa el monitor para un plan aprendido de tu historial.",
+	planEmpty: "Aún ninguna cuenta tiene una ventana de sesión y una semanal.",
+	planError: "Plan no disponible: el backend no pudo calcularlo.",
+	planUnplannable: (reason) => `sin plan (${reason})`,
+	planMultiTitle: "Cuentas",
+	planMultiUse: (name) => `Usa ${name} ahora: Hermes lo prueba primero.`,
+	planMultiSwitch: (pct = "", when = "", next = "") => `Cambia a ${next} cuando su sesión llegue a ~${pct}${when ? ` o espera al reinicio ${when}` : ""}.`,
+	planMultiSwitchNow: (name) => `Esta sesión ya usó su parte de la semana: cambia a ${name} ahora.`,
+	planMultiReorder: (name) => `${name} tiene más margen semanal por sesión: considera ponerla primero (hermes auth priority).`,
+	planMultiSpread: (strategy) => `Hermes reparte las solicitudes entre cuentas (${strategy}): ajusta el ritmo al presupuesto combinado.`,
+	planMultiAllOut: "Todas las cuentas agotaron la cuota de sesión o semanal.",
+	planMultiCombined: (left = "", per = "") => `en total queda ${left} de una semana · ${per} por sesión`,
+	poolPosition: (n = "", size = "") => `#${n}/${size}`,
+	poolFirst: "se prueba primero",
+	poolTip: (n = "", size = "", strategy = "") => `Grupo de credenciales de Hermes: posición ${n} de ${size} (${strategy})`,
+	nowTitle: "Ahora",
+	nowAccount: (name = "", s = "", w = "") => `Cuenta de Claude en uso: ${name} · sesión ${s} · semana ${w}`,
+	nowAccountSpread: (strategy) => `Cuentas de Claude: Hermes reparte las solicitudes (${strategy})`,
+	// ---- notch companion ----
+	notchTitle: "Isla del notch (macOS)",
+	notchIntro: "Quota Notch es una app nativa opcional para Mac: anillos de cuota, sesiones en curso y avisos en el notch del MacBook (o en la barra de menús), fuera de la ventana de Hermes. Lee el JSON de este plugin; el plugin funciona sin ella.",
+	notchStatus: "App complementaria",
+	notchRunning: "En ejecución",
+	notchStopped: "Instalada, detenida",
+	notchNotInstalled: "No instalada",
+	notchHasNotch: "Este Mac tiene notch: la isla rodea la cámara.",
+	notchNoNotch: "Este Mac no tiene notch: la app se ejecuta en la barra de menús.",
+	notchUnknown: "Ábrela una vez; después indica si este Mac tiene notch (si no, usa la barra de menús).",
+	notchInstallLabel: "Instalación (se compila con las Xcode Command Line Tools)",
+	notchCopyInstall: "Copiar",
+	notchOpen: "Abrir app",
+	notchLoading: "Comprobando la app complementaria…",
+	notchUpdate: "Actualiza el backend del plugin de cuota para gestionar aquí la app del notch.",
+	notchPrivacy: "Solo ejecuta la CLI de hermes (JSON de cuota/monitor de solo lectura) y abre enlaces hermes://. Sin red ni credenciales.",
+	notchOpenFailed: "No se pudo abrir Quota Notch.",
+	notchNoScript: (url) => `El plugin instalado no incluye la carpeta macos/. Descárgala de ${url} y ejecuta macos/install.sh.`,
+	notchRemote: (platform) => `El backend de este gateway se ejecuta en ${platform}; instala la app en el Mac donde se ejecuta Hermes.`,
 };
 
 const I18N_FR = {
@@ -8808,6 +9828,7 @@ const I18N_FR = {
 	accountsTabLabel: "Onglet Comptes",
 	accountsTabHint: "Vue en lecture seule des métadonnées des pools, stratégies, secours et connexions manquantes. Masquez-la si ces informations ne vous sont pas utiles.",
 	accountsExplainer: "Hermes choisit des identifiants dans les pools des fournisseurs. Les profils sans connexion propre partagent le pool par défaut ; la stratégie est définie par profil. Cette vue est en lecture seule : l'ordre des comptes et la stratégie ne peuvent pas être modifiés ici, quelles que soient les capacités du backend.",
+	accountsExplainerEdit: "Hermes choisit un identifiant dans le pool d'un fournisseur. Les profils sans connexion propre partagent le pool du profil par défaut : son ordre s'applique donc à tous ; la stratégie se règle par profil. Les modifications passent par la CLI de Hermes après votre confirmation.",
 	accountsPoolsTitle: "Pools d'identifiants",
 	accountsPoolsSub: (n) => `${n} ${n === 1 ? "pool" : "pools"}`,
 	accountsNoPools: "Aucun identifiant dans un pool pour l'instant. Connectez-vous ci-dessous ou lancez `hermes auth add <provider>`.",
@@ -8835,6 +9856,7 @@ const I18N_FR = {
 	accountsMoveUp: (label) => `Monter ${label}`,
 	accountsMoveDown: (label) => `Descendre ${label}`,
 	accountsDragHint: "Lecture seule : l'ordre des comptes ne peut pas être modifié depuis ce widget.",
+	accountsDragHintEdit: "Faites glisser une ligne, ou utilisez ▲▼ / Alt+↑↓, pour changer le compte essayé en premier.",
 	accountsNotWritable: "Ce pool ne peut pas être réordonné d'ici (une ligne n'a pas d'id de pool).",
 	accountsSingle: "Un seul compte — rien à ordonner. Ajoutez-en un avec `hermes auth add <provider>`.",
 	accountsBlocked_loading: "Actualisation des données de compte… les modifications attendent qu'elles soient à jour.",
@@ -9180,6 +10202,92 @@ const I18N_FR = {
 	specialResetTipStaleChecked: (checked) => `Périmé · vérifié ${checked}`,
 	specialResetData: (url) => `Données : ${url}`,
 	specialResetSourceLine: (url) => `Source : ${url}`,
+	// ---- plan tab + pool cards ----
+	tab_plan: "Plan",
+	planTabLabel: "Onglet Plan",
+	planTabHint: "Répartit la limite hebdomadaire sur les limites de session de chaque compte. Fonctionne sans le moniteur (quota actuel seulement) ; avec le moniteur, il apprend de votre historique.",
+	planHeadline: (n = "", when = "", week = "", session = "", used = "", state = "") => `${n} session${n > 1 ? "s" : ""} restante${n > 1 ? "s" : ""} jusqu’à ${when} ; vous pouvez utiliser ~${week} de la semaine par session (≈ ${session} d’une session). Session en cours : ${used} utilisé — ${state}.`,
+	planHeadlineFull: (n = "", when = "", week = "", used = "", state = "") => `${n} session${n > 1 ? "s" : ""} restante${n > 1 ? "s" : ""} jusqu’à ${when} ; vous pouvez utiliser ~${week} de la semaine par session — plus qu’une session complète. Session en cours : ${used} utilisé — ${state}.`,
+	planStateKeepGoing: "continuez",
+	planStateFill: "vous pouvez l’utiliser à 100 %",
+	planStateNear: "proche de la part de cette session",
+	planStateOver: "au-delà de la part de cette session — ralentissez ou changez de compte",
+	planStateIdle: "pas commencée (débute avec votre prochain message)",
+	planStateUnknown: "pas d’estimation",
+	planPaceUnder: (x) => `Sous-utilisation : vous pouvez dépenser ~${x} de plus par session`,
+	planPaceUnderPlain: "Sous-utilisation : marge pour dépenser plus par session",
+	planPaceOnTrack: "Dans le rythme pour la semaine",
+	planPaceOver: (y) => `Trop rapide : ralentissez à ~${y} d’une session par session ou changez de compte`,
+	planPaceOverPlain: "Trop rapide : ralentissez ou changez de compte",
+	planSessionsLeft: "Sessions restantes",
+	planSessionsSub: (cal = "", source = "") => `${cal} possibles · ${source}`,
+	planSource_history: "vos heures habituelles",
+	planSource_setting: "vos heures actives",
+	planSource_calendar: "chaque fenêtre de 5 h",
+	planBudget: "Budget par session",
+	planBudgetValue: (w) => `${w} de la semaine`,
+	planBudgetSub: (s) => `≈ ${s} d’une session`,
+	planBudgetFull: "plus qu’une session complète",
+	planTarget: "Arrêter cette session à",
+	planNextSession: "Prochaine session jusqu’à",
+	planTargetSub: (cost) => `la remplir coûte ${cost} de la semaine`,
+	planProjected: "Semaine à la réinitialisation",
+	planProjectedTypical: (f) => `à votre rythme habituel de ${f} par session`,
+	planProjectedLinear: "au rythme de la semaine jusqu’ici",
+	planRunsOut: (when) => `épuisé ${when}`,
+	planSessionReset: "Session réinitialisée dans",
+	planWeekReset: "Semaine réinitialisée dans",
+	planChartTitle: "Semaine utilisée — réel vs rythme régulier jusqu’à la réinitialisation",
+	planChartActual: "réel",
+	planChartIdeal: "rythme régulier",
+	planChartProjected: "projeté",
+	planFormulaBudget: (left = "", n = "", b = "", r = "", s = "") => `budget = semaine restante ${left} ÷ ${n} sessions = ${b} de la semaine ; ÷ r ${r} = ${s} d’une session`,
+	planFormulaTypical: (w = "", f = "", r = "", n = "", p = "") => `projection = semaine utilisée ${w} + habituel ${f} × r ${r} × ${n} sessions ≈ ${p}`,
+	planFormulaLinear: (w = "", p = "") => `projection = semaine utilisée ${w} au même rythme jusqu’à la réinitialisation ≈ ${p}`,
+	planFormulaRatio: (n = "", conf = "") => `r = % de semaine par 1 % de session, médiane pondérée de ${n} sessions passées (${conf})`,
+	planConfidence_low: "confiance faible",
+	planConfidence_medium: "confiance moyenne",
+	planConfidence_high: "confiance élevée",
+	planRatioLine: (r) => `1 % de session ≈ ${r} % de semaine`,
+	planTypicalLine: (f = "", n = "") => `session habituelle ${f} (${n} sessions)`,
+	planAssumptions: "Estimation à partir de vos relevés de quota, pas une garantie du fournisseur. Une session est une fenêtre de 5 heures qui commence avec votre premier message ; la semaine est donnée en pourcentage entier, les sessions courtes sont donc imprécises.",
+	planDegraded: "L’historique du moniteur est désactivé : ce plan utilise seulement le quota actuel (ratio r par défaut, chaque fenêtre de 5 h comptée). Activez le moniteur pour un plan appris de votre historique.",
+	planEmpty: "Aucun compte n’expose encore de fenêtre de session et de semaine.",
+	planError: "Plan indisponible — le backend n’a pas pu le calculer.",
+	planUnplannable: (reason) => `pas de plan (${reason})`,
+	planMultiTitle: "Comptes",
+	planMultiUse: (name) => `Utilisez ${name} maintenant — Hermes l’essaie en premier.`,
+	planMultiSwitch: (pct = "", when = "", next = "") => `Passez à ${next} quand sa session atteint ~${pct}${when ? ` ou attendez la réinitialisation ${when}` : ""}.`,
+	planMultiSwitchNow: (name) => `Cette session a déjà utilisé sa part de la semaine : passez à ${name} maintenant.`,
+	planMultiReorder: (name) => `${name} a le plus de marge hebdomadaire par session — envisagez de le placer en premier (hermes auth priority).`,
+	planMultiSpread: (strategy) => `Hermes répartit les requêtes entre les comptes (${strategy}) : réglez le rythme sur le budget combiné.`,
+	planMultiAllOut: "Tous les comptes ont épuisé leur quota de session ou de semaine.",
+	planMultiCombined: (left = "", per = "") => `au total ${left} d’une semaine restant · ${per} par session`,
+	poolPosition: (n = "", size = "") => `n° ${n}/${size}`,
+	poolFirst: "essayé en premier",
+	poolTip: (n = "", size = "", strategy = "") => `Pool d’identifiants Hermes : position ${n} sur ${size} (${strategy})`,
+	nowTitle: "Maintenant",
+	nowAccount: (name = "", s = "", w = "") => `Compte Claude utilisé : ${name} · session ${s} · semaine ${w}`,
+	nowAccountSpread: (strategy) => `Comptes Claude : Hermes répartit les requêtes (${strategy})`,
+	// ---- notch companion ----
+	notchTitle: "Îlot de l'encoche (macOS)",
+	notchIntro: "Quota Notch est une app Mac native facultative : anneaux de quota, sessions en cours et alertes dans l'encoche du MacBook (ou la barre des menus), hors de la fenêtre Hermes. Elle lit le JSON de ce plugin ; le plugin fonctionne sans elle.",
+	notchStatus: "App compagnon",
+	notchRunning: "En cours",
+	notchStopped: "Installée, arrêtée",
+	notchNotInstalled: "Non installée",
+	notchHasNotch: "Ce Mac a une encoche : l'îlot entoure la caméra.",
+	notchNoNotch: "Ce Mac n'a pas d'encoche : l'app s'exécute dans la barre des menus.",
+	notchUnknown: "Lancez-la une fois ; elle indique ensuite si ce Mac a une encoche (sinon elle utilise la barre des menus).",
+	notchInstallLabel: "Installation (compilée avec les Xcode Command Line Tools)",
+	notchCopyInstall: "Copier",
+	notchOpen: "Ouvrir l'app",
+	notchLoading: "Vérification de l'app compagnon…",
+	notchUpdate: "Mettez à jour le backend du plugin de quota pour gérer l'app de l'encoche ici.",
+	notchPrivacy: "Elle n'exécute que la CLI hermes (JSON de quota/moniteur en lecture seule) et ouvre les liens hermes://. Pas de réseau, pas d'identifiants.",
+	notchOpenFailed: "Impossible d'ouvrir Quota Notch.",
+	notchNoScript: (url) => `Le plugin installé n'a pas de dossier macos/. Récupérez-le sur ${url} et lancez macos/install.sh.`,
+	notchRemote: (platform) => `Le backend de cette passerelle tourne sous ${platform} ; installez l'app sur le Mac qui exécute Hermes.`,
 };
 
 const I18N_RU = {
@@ -9239,6 +10347,7 @@ const I18N_RU = {
 	accountsTabLabel: "Вкладка «Аккаунты»",
 	accountsTabHint: "Раздел только для чтения: метаданные пулов, стратегии, резервные модели и недостающие входы. Скройте, если эта информация не нужна.",
 	accountsExplainer: "Hermes выбирает учетные данные из пулов провайдеров. Профили без собственного входа используют пул по умолчанию; стратегия задается для каждого профиля. Этот раздел доступен только для чтения: порядок учетных данных и стратегию здесь изменить нельзя независимо от флагов backend.",
+	accountsExplainerEdit: "Hermes берёт учётные данные из пула провайдера. Профили без собственного входа используют пул профиля по умолчанию, поэтому его порядок действует для всех; стратегия задаётся для каждого профиля. Изменения выполняются через CLI Hermes после вашего подтверждения.",
 	accountsPoolsTitle: "Пулы учётных данных",
 	accountsPoolsSub: (n) => ruN(n, "пул", "пула", "пулов"),
 	accountsNoPools: "В пулах пока нет учётных данных. Войдите ниже или выполните `hermes auth add <provider>`.",
@@ -9266,6 +10375,7 @@ const I18N_RU = {
 	accountsMoveUp: (label) => `Переместить ${label} выше`,
 	accountsMoveDown: (label) => `Переместить ${label} ниже`,
 	accountsDragHint: "Только чтение: порядок учетных данных нельзя изменить в этом виджете.",
+	accountsDragHintEdit: "Перетащите строку или используйте ▲▼ / Alt+↑↓, чтобы выбрать аккаунт, который пробуется первым.",
 	accountsNotWritable: "Этот пул нельзя переупорядочить отсюда (у строки нет id пула).",
 	accountsSingle: "Один аккаунт — упорядочивать нечего. Добавьте ещё: `hermes auth add <provider>`.",
 	accountsBlocked_loading: "Данные аккаунтов обновляются… изменения ждут актуальных данных.",
@@ -9611,6 +10721,92 @@ const I18N_RU = {
 	specialResetTipStaleChecked: (checked) => `Устарело · проверено ${checked}`,
 	specialResetData: (url) => `Данные: ${url}`,
 	specialResetSourceLine: (url) => `Источник: ${url}`,
+	// ---- plan tab + pool cards ----
+	tab_plan: "План",
+	planTabLabel: "Вкладка «План»",
+	planTabHint: "Распределяет недельный лимит по лимитам сессий для каждого аккаунта. Работает без монитора (только текущая квота); с монитором учится на вашей истории.",
+	planHeadline: (n = "", when = "", week = "", session = "", used = "", state = "") => `До ${when} осталось ${ruN(n, "сессия", "сессии", "сессий")}; на сессию можно тратить ~${week} недели (≈ ${session} сессии). Текущая сессия: использовано ${used} — ${state}.`,
+	planHeadlineFull: (n = "", when = "", week = "", used = "", state = "") => `До ${when} осталось ${ruN(n, "сессия", "сессии", "сессий")}; на сессию можно тратить ~${week} недели — больше полной сессии. Текущая сессия: использовано ${used} — ${state}.`,
+	planStateKeepGoing: "продолжайте",
+	planStateFill: "можно использовать на 100 %",
+	planStateNear: "почти исчерпана доля этой сессии",
+	planStateOver: "доля сессии превышена — сбавьте темп или смените аккаунт",
+	planStateIdle: "не начата (начнётся со следующего сообщения)",
+	planStateUnknown: "нет оценки",
+	planPaceUnder: (x) => `Недорасход: можно тратить ещё ~${x} сессии за раз`,
+	planPaceUnderPlain: "Недорасход: на сессию можно тратить больше",
+	planPaceOnTrack: "Темп на неделю в норме",
+	planPaceOver: (y) => `Перерасход: снизьте до ~${y} сессии за сессию или смените аккаунт`,
+	planPaceOverPlain: "Перерасход: сбавьте темп или смените аккаунт",
+	planSessionsLeft: "Осталось сессий",
+	planSessionsSub: (cal = "", source = "") => `${cal} возможно · ${source}`,
+	planSource_history: "ваши обычные часы",
+	planSource_setting: "ваши активные часы",
+	planSource_calendar: "каждое окно 5 ч",
+	planBudget: "Бюджет на сессию",
+	planBudgetValue: (w) => `${w} недели`,
+	planBudgetSub: (s) => `≈ ${s} сессии`,
+	planBudgetFull: "больше полной сессии",
+	planTarget: "Остановить сессию на",
+	planNextSession: "Следующая сессия до",
+	planTargetSub: (cost) => `заполнить — ${cost} недели`,
+	planProjected: "Неделя к сбросу",
+	planProjectedTypical: (f) => `при обычных ${f} за сессию`,
+	planProjectedLinear: "при текущем темпе недели",
+	planRunsOut: (when) => `закончится ${when}`,
+	planSessionReset: "Сброс сессии через",
+	planWeekReset: "Сброс недели через",
+	planChartTitle: "Использование недели — факт и ровный темп до сброса",
+	planChartActual: "факт",
+	planChartIdeal: "ровный темп",
+	planChartProjected: "прогноз",
+	planFormulaBudget: (left = "", n = "", b = "", r = "", s = "") => `бюджет = остаток недели ${left} ÷ ${n} сессий = ${b} недели; ÷ r ${r} = ${s} сессии`,
+	planFormulaTypical: (w = "", f = "", r = "", n = "", p = "") => `прогноз = использовано ${w} + обычно ${f} × r ${r} × ${n} сессий ≈ ${p}`,
+	planFormulaLinear: (w = "", p = "") => `прогноз = использовано ${w} с тем же темпом до сброса ≈ ${p}`,
+	planFormulaRatio: (n = "", conf = "") => `r = % недели на 1 % сессии, взвешенная медиана ${n} прошлых сессий (${conf})`,
+	planConfidence_low: "низкая точность",
+	planConfidence_medium: "средняя точность",
+	planConfidence_high: "высокая точность",
+	planRatioLine: (r) => `1 % сессии ≈ ${r} % недели`,
+	planTypicalLine: (f = "", n = "") => `обычная сессия ${f} (${n} сессий)`,
+	planAssumptions: "Оценка по показаниям квоты, а не гарантия провайдера. Сессия — окно 5 часов с первого сообщения; неделя сообщается в целых процентах, поэтому короткие сессии неточны.",
+	planDegraded: "История монитора выключена: план использует только текущую квоту (r по умолчанию, учитываются все окна по 5 ч). Включите монитор, чтобы план учился на вашей истории.",
+	planEmpty: "Пока нет аккаунта с окнами сессии и недели.",
+	planError: "План недоступен — бэкенд не смог его рассчитать.",
+	planUnplannable: (reason) => `нет плана (${reason})`,
+	planMultiTitle: "Аккаунты",
+	planMultiUse: (name) => `Сейчас используйте ${name} — Hermes пробует его первым.`,
+	planMultiSwitch: (pct = "", when = "", next = "") => `Переключитесь на ${next}, когда сессия дойдёт до ~${pct}${when ? `, или дождитесь сброса ${when}` : ""}.`,
+	planMultiSwitchNow: (name) => `Эта сессия уже израсходовала свою долю недели: переключитесь на ${name}.`,
+	planMultiReorder: (name) => `У ${name} больше всего недельного запаса на сессию — поставьте его первым (hermes auth priority).`,
+	planMultiSpread: (strategy) => `Hermes распределяет запросы по аккаунтам (${strategy}): ориентируйтесь на общий бюджет.`,
+	planMultiAllOut: "У всех аккаунтов закончилась квота сессии или недели.",
+	planMultiCombined: (left = "", per = "") => `всего осталось ${left} недели · ${per} на сессию`,
+	poolPosition: (n = "", size = "") => `№${n}/${size}`,
+	poolFirst: "пробуется первым",
+	poolTip: (n = "", size = "", strategy = "") => `Пул учётных данных Hermes: позиция ${n} из ${size} (${strategy})`,
+	nowTitle: "Сейчас",
+	nowAccount: (name = "", s = "", w = "") => `Аккаунт Claude сейчас: ${name} · сессия ${s} · неделя ${w}`,
+	nowAccountSpread: (strategy) => `Аккаунты Claude: Hermes распределяет запросы (${strategy})`,
+	// ---- notch companion ----
+	notchTitle: "Остров в вырезе (macOS)",
+	notchIntro: "Quota Notch — необязательное нативное приложение для Mac: кольца квот, активные сессии и уведомления в вырезе MacBook (или в строке меню), вне окна Hermes. Оно читает JSON этого плагина; плагин работает и без него.",
+	notchStatus: "Приложение-компаньон",
+	notchRunning: "Запущено",
+	notchStopped: "Установлено, не запущено",
+	notchNotInstalled: "Не установлено",
+	notchHasNotch: "У этого Mac есть вырез: остров располагается вокруг камеры.",
+	notchNoNotch: "У этого Mac нет выреза: приложение работает в строке меню.",
+	notchUnknown: "Запустите его один раз; затем оно сообщит, есть ли у этого Mac вырез (иначе использует строку меню).",
+	notchInstallLabel: "Установка (сборка с Xcode Command Line Tools)",
+	notchCopyInstall: "Копировать",
+	notchOpen: "Открыть",
+	notchLoading: "Проверка приложения-компаньона…",
+	notchUpdate: "Обновите backend плагина квот, чтобы управлять приложением здесь.",
+	notchPrivacy: "Оно запускает только CLI hermes (JSON квот/монитора только для чтения) и открывает ссылки hermes://. Без сети и учётных данных.",
+	notchOpenFailed: "Не удалось открыть Quota Notch.",
+	notchNoScript: (url) => `В установленном плагине нет папки macos/. Возьмите её с ${url} и запустите macos/install.sh.`,
+	notchRemote: (platform) => `Backend этого шлюза работает на ${platform}; установите приложение на Mac, где запущен Hermes.`,
 };
 
 const I18N_JA = {
@@ -9670,6 +10866,7 @@ const I18N_JA = {
 	accountsTabLabel: "アカウントタブ",
 	accountsTabHint: "プールのメタデータ、戦略、代替モデル、未サインインを表示する読み取り専用の画面です。不要なら非表示にできます。",
 	accountsExplainer: "Hermes はプロバイダーのプールから認証情報を選びます。自分のログインがないプロファイルは default のプールを共有し、戦略はプロファイルごとです。この画面は読み取り専用です。backend の機能フラグにかかわらず、アカウント順序や戦略は変更できません。",
+	accountsExplainerEdit: "Hermes はプロバイダーのプールから認証情報を選びます。自分のログインを持たないプロファイルは default プロファイルのプールを共有するため、その順序はすべてに適用されます。戦略はプロファイルごとです。変更は確認後に Hermes 自身の CLI で実行されます。",
 	accountsPoolsTitle: "認証情報プール",
 	accountsPoolsSub: (n) => `${n} 個のプール`,
 	accountsNoPools: "プールに認証情報がまだありません。下でサインインするか `hermes auth add <provider>` を実行してください。",
@@ -9697,6 +10894,7 @@ const I18N_JA = {
 	accountsMoveUp: (label) => `${label} を上へ`,
 	accountsMoveDown: (label) => `${label} を下へ`,
 	accountsDragHint: "読み取り専用: このウィジェットからアカウントの順序は変更できません。",
+	accountsDragHintEdit: "行をドラッグするか ▲▼ / Alt+↑↓ で、最初に試すアカウントを変更します。",
 	accountsNotWritable: "このプールはここでは並べ替えできません（プール ID のない行があります）。",
 	accountsSingle: "アカウントは 1 つだけ — 並べ替えるものはありません。`hermes auth add <provider>` で追加できます。",
 	accountsBlocked_loading: "アカウントデータを更新中… 最新になるまで変更は保留されます。",
@@ -10042,6 +11240,92 @@ const I18N_JA = {
 	specialResetTipStaleChecked: (checked) => `古いデータ · ${checked} に確認`,
 	specialResetData: (url) => `データ: ${url}`,
 	specialResetSourceLine: (url) => `出典: ${url}`,
+	// ---- plan tab + pool cards ----
+	tab_plan: "プラン",
+	planTabLabel: "プランタブ",
+	planTabHint: "アカウントごとに週間上限をセッション上限に割り振ります。モニターなしでも動作し（現在のクォータのみ）、モニターがあれば履歴から学習します。",
+	planHeadline: (n = "", when = "", week = "", session = "", used = "", state = "") => `${when}まで残り${n}セッション。1セッションあたり週の約${week}（セッションの約${session}）を使えます。現在のセッション: ${used}使用 — ${state}。`,
+	planHeadlineFull: (n = "", when = "", week = "", used = "", state = "") => `${when}まで残り${n}セッション。1セッションあたり週の約${week}を使えます（1セッション分以上）。現在のセッション: ${used}使用 — ${state}。`,
+	planStateKeepGoing: "このまま続けてOK",
+	planStateFill: "100%まで使えます",
+	planStateNear: "このセッションの配分に近づいています",
+	planStateOver: "このセッションの配分を超えています — ペースを落とすかアカウントを切り替えてください",
+	planStateIdle: "未開始（次のメッセージで開始）",
+	planStateUnknown: "推定なし",
+	planPaceUnder: (x) => `余裕あり: 1セッションあたりさらに約${x}使えます`,
+	planPaceUnderPlain: "余裕あり: セッションごとにもっと使えます",
+	planPaceOnTrack: "週のペースどおり",
+	planPaceOver: (y) => `ペース超過: 1セッションあたり約${y}に抑えるかアカウントを切り替えてください`,
+	planPaceOverPlain: "ペース超過: ペースを落とすかアカウントを切り替えてください",
+	planSessionsLeft: "残りセッション",
+	planSessionsSub: (cal = "", source = "") => `最大${cal} · ${source}`,
+	planSource_history: "いつもの時間帯",
+	planSource_setting: "設定した活動時間",
+	planSource_calendar: "5時間枠すべて",
+	planBudget: "1セッションの予算",
+	planBudgetValue: (w) => `週の${w}`,
+	planBudgetSub: (s) => `≈ セッションの${s}`,
+	planBudgetFull: "1セッション分以上",
+	planTarget: "このセッションの目安",
+	planNextSession: "次のセッションの目安",
+	planTargetSub: (cost) => `使い切ると週の${cost}`,
+	planProjected: "リセット時の週",
+	planProjectedTypical: (f) => `いつもの1セッション${f}のペースで`,
+	planProjectedLinear: "今週これまでのペースで",
+	planRunsOut: (when) => `${when}に枯渇`,
+	planSessionReset: "セッションリセットまで",
+	planWeekReset: "週リセットまで",
+	planChartTitle: "週の使用量 — 実績とリセットまでの均等ペース",
+	planChartActual: "実績",
+	planChartIdeal: "均等ペース",
+	planChartProjected: "予測",
+	planFormulaBudget: (left = "", n = "", b = "", r = "", s = "") => `予算 = 週の残り ${left} ÷ ${n}セッション = 週の${b}; ÷ r ${r} = セッションの${s}`,
+	planFormulaTypical: (w = "", f = "", r = "", n = "", p = "") => `予測 = 週の使用 ${w} + いつもの ${f} × r ${r} × ${n}セッション ≈ ${p}`,
+	planFormulaLinear: (w = "", p = "") => `予測 = 週の使用 ${w} を同じペースでリセットまで ≈ ${p}`,
+	planFormulaRatio: (n = "", conf = "") => `r = セッション1%あたりの週%、過去${n}セッションの加重中央値（${conf}）`,
+	planConfidence_low: "信頼度低",
+	planConfidence_medium: "信頼度中",
+	planConfidence_high: "信頼度高",
+	planRatioLine: (r) => `セッション1% ≈ 週${r}%`,
+	planTypicalLine: (f = "", n = "") => `通常のセッション ${f}（${n}セッション）`,
+	planAssumptions: "クォータの読み取り値からの推定で、プロバイダーの保証ではありません。セッションは最初のメッセージから始まる5時間枠で、週は整数パーセントで報告されるため短いセッションは誤差が大きくなります。",
+	planDegraded: "モニター履歴がオフです。このプランは現在のクォータのみを使います（既定の比率 r、5時間枠をすべて計上）。履歴から学習したプランにはモニターを有効にしてください。",
+	planEmpty: "セッション枠と週枠を持つアカウントはまだありません。",
+	planError: "プランを利用できません — バックエンドが計算できませんでした。",
+	planUnplannable: (reason) => `プランなし（${reason}）`,
+	planMultiTitle: "アカウント",
+	planMultiUse: (name) => `今は${name}を使用 — Hermesが最初に試します。`,
+	planMultiSwitch: (pct = "", when = "", next = "") => `セッションが約${pct}に達したら${next}へ切り替え${when ? `、または${when}のリセットを待つ` : ""}。`,
+	planMultiSwitchNow: (name) => `このセッションは週の配分を使い切りました。今すぐ${name}へ切り替えてください。`,
+	planMultiReorder: (name) => `${name}が1セッションあたりの週の余裕が最大です。先頭に移すことを検討してください（hermes auth priority）。`,
+	planMultiSpread: (strategy) => `Hermesはリクエストをアカウント間で分散します（${strategy}）。合計予算でペース配分してください。`,
+	planMultiAllOut: "すべてのアカウントでセッションまたは週のクォータが尽きています。",
+	planMultiCombined: (left = "", per = "") => `合計で週の${left}が残り · 1セッション${per}`,
+	poolPosition: (n = "", size = "") => `#${n}/${size}`,
+	poolFirst: "最初に試行",
+	poolTip: (n = "", size = "", strategy = "") => `Hermes認証プール: ${size}件中${n}番目（${strategy}）`,
+	nowTitle: "現在",
+	nowAccount: (name = "", s = "", w = "") => `使用中のClaudeアカウント: ${name} · セッション ${s} · 週 ${w}`,
+	nowAccountSpread: (strategy) => `Claudeアカウント: Hermesがリクエストを分散（${strategy}）`,
+	// ---- notch companion ----
+	notchTitle: "ノッチアイランド (macOS)",
+	notchIntro: "Quota Notch は任意のネイティブ Mac アプリです。クォータのリング、実行中のセッション、通知を Hermes ウィンドウの外、MacBook のノッチ（またはメニューバー）に表示します。このプラグインの JSON を読み取るだけで、プラグインはアプリなしでも動作します。",
+	notchStatus: "コンパニオンアプリ",
+	notchRunning: "実行中",
+	notchStopped: "インストール済み・停止中",
+	notchNotInstalled: "未インストール",
+	notchHasNotch: "この Mac にはノッチがあります。アイランドはカメラの周りに表示されます。",
+	notchNoNotch: "この Mac にはノッチがありません。代わりにメニューバーで動作します。",
+	notchUnknown: "一度起動すると、この Mac にノッチがあるかを報告します（ない場合はメニューバーを使います）。",
+	notchInstallLabel: "インストール（Xcode Command Line Tools でビルド）",
+	notchCopyInstall: "コピー",
+	notchOpen: "アプリを開く",
+	notchLoading: "コンパニオンを確認中…",
+	notchUpdate: "ここでノッチアプリを管理するには quota プラグインの backend を更新してください。",
+	notchPrivacy: "hermes CLI（読み取り専用のクォータ／モニター JSON）の実行と hermes:// リンクを開くことのみ行います。ネットワーク通信や認証情報の読み取りはありません。",
+	notchOpenFailed: "Quota Notch を開けませんでした。",
+	notchNoScript: (url) => `インストール済みのプラグインに macos/ フォルダーがありません。${url} から取得して macos/install.sh を実行してください。`,
+	notchRemote: (platform) => `このゲートウェイの backend は ${platform} で動作しています。Hermes を実行している Mac にアプリをインストールしてください。`,
 };
 
 const I18N_ZH = {
@@ -10101,6 +11385,7 @@ const I18N_ZH = {
 	accountsTabLabel: "账号标签页",
 	accountsTabHint: "只读查看凭据池元数据、策略、备用模型和未登录项。如果不需要这些信息，可以隐藏。",
 	accountsExplainer: "Hermes 从提供方的凭据池中选取凭据。没有自己登录的配置共用默认配置的池，策略按配置单独设置。此视图为只读：无论后端能力标志如何，都不能在此更改账号顺序或策略。",
+	accountsExplainerEdit: "Hermes 从提供方的凭据池中选取凭据。没有自己登录的配置共用默认配置的池，因此池的顺序对它们全部生效；策略按配置单独设置。确认后，变更通过 Hermes 自己的 CLI 执行。",
 	accountsPoolsTitle: "凭据池",
 	accountsPoolsSub: (n) => `${n} 个池`,
 	accountsNoPools: "池中还没有凭据。在下方登录，或运行 `hermes auth add <provider>`。",
@@ -10128,6 +11413,7 @@ const I18N_ZH = {
 	accountsMoveUp: (label) => `上移 ${label}`,
 	accountsMoveDown: (label) => `下移 ${label}`,
 	accountsDragHint: "只读：无法从此 widget 更改账号顺序。",
+	accountsDragHintEdit: "拖动一行，或使用 ▲▼ / Alt+↑↓，更改优先尝试的账号。",
 	accountsNotWritable: "无法在此调整此池的顺序（有一行缺少池 ID）。",
 	accountsSingle: "只有一个账号 — 无需排序。可用 `hermes auth add <provider>` 再添加。",
 	accountsBlocked_loading: "正在刷新账号数据… 数据最新前暂停变更。",
@@ -10473,6 +11759,92 @@ const I18N_ZH = {
 	specialResetTipStaleChecked: (checked) => `已过期 · 检查于 ${checked}`,
 	specialResetData: (url) => `数据：${url}`,
 	specialResetSourceLine: (url) => `来源：${url}`,
+	// ---- plan tab + pool cards ----
+	tab_plan: "计划",
+	planTabLabel: "计划标签页",
+	planTabHint: "按账号把每周额度分配到各个会话额度。无需监视器即可使用（仅当前额度）；启用监视器后会从历史中学习。",
+	planHeadline: (n = "", when = "", week = "", session = "", used = "", state = "") => `距 ${when} 还剩 ${n} 个会话；每个会话可用本周约 ${week}（约为一个会话的 ${session}）。当前会话：已用 ${used} — ${state}。`,
+	planHeadlineFull: (n = "", when = "", week = "", used = "", state = "") => `距 ${when} 还剩 ${n} 个会话；每个会话可用本周约 ${week}——超过一个完整会话。当前会话：已用 ${used} — ${state}。`,
+	planStateKeepGoing: "继续",
+	planStateFill: "可以用满 100%",
+	planStateNear: "接近本会话的份额",
+	planStateOver: "已超出本会话份额——放慢或切换账号",
+	planStateIdle: "未开始（下一条消息时开始）",
+	planStateUnknown: "暂无估计",
+	planPaceUnder: (x) => `用量偏低：每个会话还可多用约 ${x}`,
+	planPaceUnderPlain: "用量偏低：每个会话还可多用",
+	planPaceOnTrack: "本周节奏正常",
+	planPaceOver: (y) => `超出节奏：每个会话降到约 ${y}，或切换账号`,
+	planPaceOverPlain: "超出节奏：放慢或切换账号",
+	planSessionsLeft: "剩余会话",
+	planSessionsSub: (cal = "", source = "") => `最多 ${cal} · ${source}`,
+	planSource_history: "你的常用时段",
+	planSource_setting: "你设置的活跃时段",
+	planSource_calendar: "每个 5 小时窗口",
+	planBudget: "每会话预算",
+	planBudgetValue: (w) => `本周 ${w}`,
+	planBudgetSub: (s) => `≈ 一个会话的 ${s}`,
+	planBudgetFull: "超过一个完整会话",
+	planTarget: "本会话停在",
+	planNextSession: "下一会话最多",
+	planTargetSub: (cost) => `用满需本周 ${cost}`,
+	planProjected: "重置时本周",
+	planProjectedTypical: (f) => `按你通常每会话 ${f}`,
+	planProjectedLinear: "按本周目前的速度",
+	planRunsOut: (when) => `${when} 用完`,
+	planSessionReset: "会话重置还剩",
+	planWeekReset: "本周重置还剩",
+	planChartTitle: "本周用量——实际与到重置的均匀节奏",
+	planChartActual: "实际",
+	planChartIdeal: "均匀节奏",
+	planChartProjected: "预测",
+	planFormulaBudget: (left = "", n = "", b = "", r = "", s = "") => `预算 = 本周剩余 ${left} ÷ ${n} 个会话 = 本周 ${b}；÷ r ${r} = 一个会话的 ${s}`,
+	planFormulaTypical: (w = "", f = "", r = "", n = "", p = "") => `预测 = 本周已用 ${w} + 通常 ${f} × r ${r} × ${n} 个会话 ≈ ${p}`,
+	planFormulaLinear: (w = "", p = "") => `预测 = 本周已用 ${w} 按相同速度到重置 ≈ ${p}`,
+	planFormulaRatio: (n = "", conf = "") => `r = 每 1% 会话对应的本周百分比，取过去 ${n} 个会话的加权中位数（${conf}）`,
+	planConfidence_low: "置信度低",
+	planConfidence_medium: "置信度中",
+	planConfidence_high: "置信度高",
+	planRatioLine: (r) => `1% 会话 ≈ 本周 ${r}%`,
+	planTypicalLine: (f = "", n = "") => `通常会话 ${f}（${n} 个会话）`,
+	planAssumptions: "根据额度读数估算，并非服务商保证。会话是从你第一条消息开始的 5 小时窗口；本周用量以整数百分比报告，短会话误差较大。",
+	planDegraded: "监视器历史已关闭：此计划仅使用当前额度（默认比率 r，计入每个 5 小时窗口）。启用监视器可获得从历史学习的计划。",
+	planEmpty: "暂无同时提供会话和每周窗口的账号。",
+	planError: "计划不可用——后端无法计算。",
+	planUnplannable: (reason) => `无计划（${reason}）`,
+	planMultiTitle: "账号",
+	planMultiUse: (name) => `现在使用 ${name}——Hermes 会先尝试它。`,
+	planMultiSwitch: (pct = "", when = "", next = "") => `会话达到约 ${pct} 时切换到 ${next}${when ? `，或等到 ${when} 重置` : ""}。`,
+	planMultiSwitchNow: (name) => `本会话已用完本周份额：现在切换到 ${name}。`,
+	planMultiReorder: (name) => `${name} 每会话的每周余量最多——可考虑把它排到第一（hermes auth priority）。`,
+	planMultiSpread: (strategy) => `Hermes 会把请求分散到各账号（${strategy}）：按合计预算控制节奏。`,
+	planMultiAllOut: "所有账号的会话或每周额度均已用完。",
+	planMultiCombined: (left = "", per = "") => `合计剩余一周的 ${left} · 每会话 ${per}`,
+	poolPosition: (n = "", size = "") => `#${n}/${size}`,
+	poolFirst: "优先尝试",
+	poolTip: (n = "", size = "", strategy = "") => `Hermes 凭据池：第 ${n} / ${size} 位（${strategy}）`,
+	nowTitle: "当前",
+	nowAccount: (name = "", s = "", w = "") => `正在使用的 Claude 账号：${name} · 会话 ${s} · 本周 ${w}`,
+	nowAccountSpread: (strategy) => `Claude 账号：Hermes 分散请求（${strategy}）`,
+	// ---- notch companion ----
+	notchTitle: "刘海岛（macOS）",
+	notchIntro: "Quota Notch 是一个可选的原生 Mac 应用：在 Hermes 窗口之外的 MacBook 刘海（或菜单栏）中显示配额环、运行中的会话和提醒。它读取此插件自己的 JSON；没有它插件也能正常工作。",
+	notchStatus: "配套应用",
+	notchRunning: "运行中",
+	notchStopped: "已安装，未运行",
+	notchNotInstalled: "未安装",
+	notchHasNotch: "这台 Mac 有刘海：岛围绕摄像头显示。",
+	notchNoNotch: "这台 Mac 没有刘海：应用改为在菜单栏中运行。",
+	notchUnknown: "启动一次后，它会报告这台 Mac 是否有刘海（没有则使用菜单栏）。",
+	notchInstallLabel: "安装（使用 Xcode Command Line Tools 构建）",
+	notchCopyInstall: "复制",
+	notchOpen: "打开应用",
+	notchLoading: "正在检查配套应用…",
+	notchUpdate: "请更新配额插件的 backend，以便在此管理刘海应用。",
+	notchPrivacy: "它只运行 hermes CLI（只读的配额/监控 JSON）并打开 hermes:// 链接。不联网，不读取凭据。",
+	notchOpenFailed: "无法打开 Quota Notch。",
+	notchNoScript: (url) => `已安装的插件没有 macos/ 文件夹。请从 ${url} 获取并运行 macos/install.sh。`,
+	notchRemote: (platform) => `此网关的 backend 运行在 ${platform} 上；请在运行 Hermes 的 Mac 上安装该应用。`,
 };
 
 const I18N_ZH_HANT = {
@@ -10532,6 +11904,7 @@ const I18N_ZH_HANT = {
 	accountsTabLabel: "帳號分頁",
 	accountsTabHint: "唯讀檢視憑證池中繼資料、策略、備用模型和未登入項。如果不需要這些資訊，可以隱藏。",
 	accountsExplainer: "Hermes 從提供方的憑證池中選取憑證。沒有自己登入的設定檔共用預設設定檔的池，策略按設定檔單獨設定。此檢視為唯讀：無論後端能力旗標如何，都不能在此變更帳號順序或策略。",
+	accountsExplainerEdit: "Hermes 從提供方的憑證池中選取憑證。沒有自己登入的設定檔共用預設設定檔的池，因此池的順序對它們全部生效；策略按設定檔單獨設定。確認後，變更通過 Hermes 自己的 CLI 執行。",
 	accountsPoolsTitle: "憑證池",
 	accountsPoolsSub: (n) => `${n} 個池`,
 	accountsNoPools: "池中還沒有憑證。在下方登入，或執行 `hermes auth add <provider>`。",
@@ -10559,6 +11932,7 @@ const I18N_ZH_HANT = {
 	accountsMoveUp: (label) => `上移 ${label}`,
 	accountsMoveDown: (label) => `下移 ${label}`,
 	accountsDragHint: "唯讀：無法從此 widget 變更帳號順序。",
+	accountsDragHintEdit: "拖動一行，或使用 ▲▼ / Alt+↑↓，更改優先嘗試的帳號。",
 	accountsNotWritable: "無法在此調整此池的順序（有一行缺少池 ID）。",
 	accountsSingle: "只有一個帳號 — 無需排序。可用 `hermes auth add <provider>` 再新增。",
 	accountsBlocked_loading: "正在重新整理帳號資料… 資料最新前暫停變更。",
@@ -10904,6 +12278,92 @@ const I18N_ZH_HANT = {
 	specialResetTipStaleChecked: (checked) => `已過期 · 檢查於 ${checked}`,
 	specialResetData: (url) => `資料：${url}`,
 	specialResetSourceLine: (url) => `來源：${url}`,
+	// ---- plan tab + pool cards ----
+	tab_plan: "計畫",
+	planTabLabel: "計畫分頁",
+	planTabHint: "依帳號把每週額度分配到各個工作階段額度。不需監視器即可使用（僅目前額度）；啟用監視器後會從歷史學習。",
+	planHeadline: (n = "", when = "", week = "", session = "", used = "", state = "") => `距 ${when} 還剩 ${n} 個工作階段；每個工作階段可用本週約 ${week}（約為一個工作階段的 ${session}）。目前工作階段：已用 ${used} — ${state}。`,
+	planHeadlineFull: (n = "", when = "", week = "", used = "", state = "") => `距 ${when} 還剩 ${n} 個工作階段；每個工作階段可用本週約 ${week}——超過一個完整工作階段。目前工作階段：已用 ${used} — ${state}。`,
+	planStateKeepGoing: "繼續",
+	planStateFill: "可以用滿 100%",
+	planStateNear: "接近本工作階段的份額",
+	planStateOver: "已超出本工作階段份額——放慢或切換帳號",
+	planStateIdle: "未開始（下一則訊息時開始）",
+	planStateUnknown: "暫無估計",
+	planPaceUnder: (x) => `用量偏低：每個工作階段還可多用約 ${x}`,
+	planPaceUnderPlain: "用量偏低：每個工作階段還可多用",
+	planPaceOnTrack: "本週節奏正常",
+	planPaceOver: (y) => `超出節奏：每個工作階段降到約 ${y}，或切換帳號`,
+	planPaceOverPlain: "超出節奏：放慢或切換帳號",
+	planSessionsLeft: "剩餘工作階段",
+	planSessionsSub: (cal = "", source = "") => `最多 ${cal} · ${source}`,
+	planSource_history: "你的常用時段",
+	planSource_setting: "你設定的活躍時段",
+	planSource_calendar: "每個 5 小時視窗",
+	planBudget: "每工作階段預算",
+	planBudgetValue: (w) => `本週 ${w}`,
+	planBudgetSub: (s) => `≈ 一個工作階段的 ${s}`,
+	planBudgetFull: "超過一個完整工作階段",
+	planTarget: "本工作階段停在",
+	planNextSession: "下一工作階段最多",
+	planTargetSub: (cost) => `用滿需本週 ${cost}`,
+	planProjected: "重置時本週",
+	planProjectedTypical: (f) => `依你通常每工作階段 ${f}`,
+	planProjectedLinear: "依本週目前的速度",
+	planRunsOut: (when) => `${when} 用完`,
+	planSessionReset: "工作階段重置還剩",
+	planWeekReset: "本週重置還剩",
+	planChartTitle: "本週用量——實際與到重置的均勻節奏",
+	planChartActual: "實際",
+	planChartIdeal: "均勻節奏",
+	planChartProjected: "預測",
+	planFormulaBudget: (left = "", n = "", b = "", r = "", s = "") => `預算 = 本週剩餘 ${left} ÷ ${n} 個工作階段 = 本週 ${b}；÷ r ${r} = 一個工作階段的 ${s}`,
+	planFormulaTypical: (w = "", f = "", r = "", n = "", p = "") => `預測 = 本週已用 ${w} + 通常 ${f} × r ${r} × ${n} 個工作階段 ≈ ${p}`,
+	planFormulaLinear: (w = "", p = "") => `預測 = 本週已用 ${w} 依相同速度到重置 ≈ ${p}`,
+	planFormulaRatio: (n = "", conf = "") => `r = 每 1% 工作階段對應的本週百分比，取過去 ${n} 個工作階段的加權中位數（${conf}）`,
+	planConfidence_low: "信心度低",
+	planConfidence_medium: "信心度中",
+	planConfidence_high: "信心度高",
+	planRatioLine: (r) => `1% 工作階段 ≈ 本週 ${r}%`,
+	planTypicalLine: (f = "", n = "") => `通常工作階段 ${f}（${n} 個工作階段）`,
+	planAssumptions: "根據額度讀數估算，並非服務商保證。工作階段是從你第一則訊息開始的 5 小時視窗；本週用量以整數百分比回報，短工作階段誤差較大。",
+	planDegraded: "監視器歷史已關閉：此計畫僅使用目前額度（預設比率 r，計入每個 5 小時視窗）。啟用監視器可取得從歷史學習的計畫。",
+	planEmpty: "尚無同時提供工作階段與每週視窗的帳號。",
+	planError: "計畫無法使用——後端無法計算。",
+	planUnplannable: (reason) => `無計畫（${reason}）`,
+	planMultiTitle: "帳號",
+	planMultiUse: (name) => `現在使用 ${name}——Hermes 會先嘗試它。`,
+	planMultiSwitch: (pct = "", when = "", next = "") => `工作階段達到約 ${pct} 時切換到 ${next}${when ? `，或等到 ${when} 重置` : ""}。`,
+	planMultiSwitchNow: (name) => `本工作階段已用完本週份額：現在切換到 ${name}。`,
+	planMultiReorder: (name) => `${name} 每工作階段的每週餘量最多——可考慮把它排到第一（hermes auth priority）。`,
+	planMultiSpread: (strategy) => `Hermes 會把請求分散到各帳號（${strategy}）：依合計預算控制節奏。`,
+	planMultiAllOut: "所有帳號的工作階段或每週額度皆已用完。",
+	planMultiCombined: (left = "", per = "") => `合計剩餘一週的 ${left} · 每工作階段 ${per}`,
+	poolPosition: (n = "", size = "") => `#${n}/${size}`,
+	poolFirst: "優先嘗試",
+	poolTip: (n = "", size = "", strategy = "") => `Hermes 憑證池：第 ${n} / ${size} 位（${strategy}）`,
+	nowTitle: "目前",
+	nowAccount: (name = "", s = "", w = "") => `正在使用的 Claude 帳號：${name} · 工作階段 ${s} · 本週 ${w}`,
+	nowAccountSpread: (strategy) => `Claude 帳號：Hermes 分散請求（${strategy}）`,
+	// ---- notch companion ----
+	notchTitle: "瀏海島（macOS）",
+	notchIntro: "Quota Notch 是選用的原生 Mac 應用程式：在 Hermes 視窗之外的 MacBook 瀏海（或選單列）中顯示配額環、執行中的工作階段和提醒。它讀取此外掛自己的 JSON；沒有它外掛也能正常運作。",
+	notchStatus: "配套應用程式",
+	notchRunning: "執行中",
+	notchStopped: "已安裝，未執行",
+	notchNotInstalled: "未安裝",
+	notchHasNotch: "這台 Mac 有瀏海：島會圍繞相機顯示。",
+	notchNoNotch: "這台 Mac 沒有瀏海：應用程式改在選單列中執行。",
+	notchUnknown: "啟動一次後，它會回報這台 Mac 是否有瀏海（沒有則使用選單列）。",
+	notchInstallLabel: "安裝（使用 Xcode Command Line Tools 建置）",
+	notchCopyInstall: "複製",
+	notchOpen: "開啟應用程式",
+	notchLoading: "正在檢查配套應用程式…",
+	notchUpdate: "請更新配額外掛的 backend，以便在此管理瀏海應用程式。",
+	notchPrivacy: "它只執行 hermes CLI（唯讀的配額／監控 JSON）並開啟 hermes:// 連結。不連網，不讀取憑證。",
+	notchOpenFailed: "無法開啟 Quota Notch。",
+	notchNoScript: (url) => `已安裝的外掛沒有 macos/ 資料夾。請從 ${url} 取得並執行 macos/install.sh。`,
+	notchRemote: (platform) => `此閘道的 backend 執行於 ${platform}；請在執行 Hermes 的 Mac 上安裝該應用程式。`,
 };
 
 const I18N_AR = {
@@ -10963,6 +12423,7 @@ const I18N_AR = {
 	accountsTabLabel: "تبويب الحسابات",
 	accountsTabHint: "عرض للقراءة فقط لبيانات المجمّعات والاستراتيجيات والبدائل وتسجيلات الدخول الناقصة. أخفِه إن لم تكن بحاجة إلى هذه المعلومات.",
 	accountsExplainer: "يختار Hermes بيانات اعتماد من مجمّعات المزوّدين. تتشارك الملفات التي لا تملك تسجيل دخول خاصًا بها المجمّع الافتراضي، والاستراتيجية خاصة بكل ملف. هذا العرض للقراءة فقط: لا يمكن تغيير ترتيب الحسابات أو الاستراتيجية هنا مهما كانت أعلام قدرات backend.",
+	accountsExplainerEdit: "يختار Hermes بيانات اعتماد من مجمّع المزوّد. الملفات الشخصية التي لا تملك تسجيل دخول خاصًا بها تتشارك مجمّع الملف الافتراضي، فيسري ترتيبه عليها كلها؛ أما الاستراتيجية فتُضبط لكل ملف. تُنفَّذ التغييرات عبر واجهة Hermes السطرية بعد تأكيدك.",
 	accountsPoolsTitle: "مجمّعات بيانات الاعتماد",
 	accountsPoolsSub: (n) => arN(n, "مجمّع واحد", "مجمّعان", "مجمّعات", "مجمّعًا"),
 	accountsNoPools: "لا توجد بيانات اعتماد في المجمّعات بعد. سجّل الدخول أدناه أو شغّل `hermes auth add <provider>`.",
@@ -10990,6 +12451,7 @@ const I18N_AR = {
 	accountsMoveUp: (label) => `نقل ${label} للأعلى`,
 	accountsMoveDown: (label) => `نقل ${label} للأسفل`,
 	accountsDragHint: "للقراءة فقط: لا يمكن تغيير ترتيب الحسابات من هذه الأداة.",
+	accountsDragHintEdit: "اسحب صفًا، أو استخدم ▲▼ / Alt+↑↓، لتغيير الحساب الذي يُجرَّب أولًا.",
 	accountsNotWritable: "لا يمكن إعادة ترتيب هذا المجمّع من هنا (أحد الصفوف بلا معرّف مجمّع).",
 	accountsSingle: "حساب واحد — لا شيء لترتيبه. أضف آخر عبر `hermes auth add <provider>`.",
 	accountsBlocked_loading: "جارٍ تحديث بيانات الحسابات… التغييرات متوقفة حتى تصبح حديثة.",
@@ -11335,6 +12797,92 @@ const I18N_AR = {
 	specialResetTipStaleChecked: (checked) => `قديم · تم التحقق ${checked}`,
 	specialResetData: (url) => `البيانات: ${url}`,
 	specialResetSourceLine: (url) => `المصدر: ${url}`,
+	// ---- plan tab + pool cards ----
+	tab_plan: "الخطة",
+	planTabLabel: "تبويب الخطة",
+	planTabHint: "يوزّع الحد الأسبوعي على حدود الجلسات لكل حساب. يعمل دون المراقب (الحصة الحالية فقط)، ومع المراقب يتعلّم من سجلك.",
+	planHeadline: (n = "", when = "", week = "", session = "", used = "", state = "") => `تبقّى ${arN(n, "جلسة واحدة", "جلستان", "جلسات", "جلسة")} حتى ${when}؛ يمكنك استخدام نحو ${week} من الأسبوع لكل جلسة (≈ ${session} من جلسة). الجلسة الحالية: استُخدم ${used} — ${state}.`,
+	planHeadlineFull: (n = "", when = "", week = "", used = "", state = "") => `تبقّى ${arN(n, "جلسة واحدة", "جلستان", "جلسات", "جلسة")} حتى ${when}؛ يمكنك استخدام نحو ${week} من الأسبوع لكل جلسة — أكثر من جلسة كاملة. الجلسة الحالية: استُخدم ${used} — ${state}.`,
+	planStateKeepGoing: "تابع",
+	planStateFill: "يمكنك استخدامها حتى 100%",
+	planStateNear: "قريب من حصة هذه الجلسة",
+	planStateOver: "تجاوزت حصة هذه الجلسة — خفّف الوتيرة أو بدّل الحساب",
+	planStateIdle: "لم تبدأ (تبدأ مع رسالتك التالية)",
+	planStateUnknown: "لا يوجد تقدير",
+	planPaceUnder: (x) => `استخدام أقل من المتاح: يمكنك إنفاق نحو ${x} إضافية من كل جلسة`,
+	planPaceUnderPlain: "استخدام أقل من المتاح: يمكنك إنفاق المزيد لكل جلسة",
+	planPaceOnTrack: "على المسار الصحيح للأسبوع",
+	planPaceOver: (y) => `وتيرة أعلى من اللازم: خفّف إلى نحو ${y} من الجلسة لكل جلسة أو بدّل الحساب`,
+	planPaceOverPlain: "وتيرة أعلى من اللازم: خفّف أو بدّل الحساب",
+	planSessionsLeft: "الجلسات المتبقية",
+	planSessionsSub: (cal = "", source = "") => `${cal} ممكنة · ${source}`,
+	planSource_history: "ساعاتك المعتادة",
+	planSource_setting: "ساعاتك النشطة",
+	planSource_calendar: "كل نافذة 5 ساعات",
+	planBudget: "الميزانية لكل جلسة",
+	planBudgetValue: (w) => `${w} من الأسبوع`,
+	planBudgetSub: (s) => `≈ ${s} من جلسة`,
+	planBudgetFull: "أكثر من جلسة كاملة",
+	planTarget: "أوقف هذه الجلسة عند",
+	planNextSession: "الجلسة التالية حتى",
+	planTargetSub: (cost) => `ملؤها يكلّف ${cost} من الأسبوع`,
+	planProjected: "الأسبوع عند إعادة الضبط",
+	planProjectedTypical: (f) => `بمعدلك المعتاد ${f} لكل جلسة`,
+	planProjectedLinear: "بوتيرة هذا الأسبوع حتى الآن",
+	planRunsOut: (when) => `ينفد ${when}`,
+	planSessionReset: "إعادة ضبط الجلسة بعد",
+	planWeekReset: "إعادة ضبط الأسبوع بعد",
+	planChartTitle: "استخدام الأسبوع — الفعلي مقابل الوتيرة المتساوية حتى إعادة الضبط",
+	planChartActual: "الفعلي",
+	planChartIdeal: "وتيرة متساوية",
+	planChartProjected: "المتوقع",
+	planFormulaBudget: (left = "", n = "", b = "", r = "", s = "") => `الميزانية = المتبقي من الأسبوع ${left} ÷ ${n} جلسات = ${b} من الأسبوع؛ ÷ r ${r} = ${s} من جلسة`,
+	planFormulaTypical: (w = "", f = "", r = "", n = "", p = "") => `المتوقع = المستخدم ${w} + المعتاد ${f} × r ${r} × ${n} جلسات ≈ ${p}`,
+	planFormulaLinear: (w = "", p = "") => `المتوقع = المستخدم ${w} بالوتيرة نفسها حتى إعادة الضبط ≈ ${p}`,
+	planFormulaRatio: (n = "", conf = "") => `r = نسبة الأسبوع لكل 1% من الجلسة، الوسيط الموزون لـ ${n} جلسات سابقة (${conf})`,
+	planConfidence_low: "ثقة منخفضة",
+	planConfidence_medium: "ثقة متوسطة",
+	planConfidence_high: "ثقة عالية",
+	planRatioLine: (r) => `1% من الجلسة ≈ ${r}% من الأسبوع`,
+	planTypicalLine: (f = "", n = "") => `الجلسة المعتادة ${f} (${n} جلسات)`,
+	planAssumptions: "تقدير من قراءات حصتك، وليس ضمانًا من المزوّد. الجلسة نافذة مدتها 5 ساعات تبدأ مع رسالتك الأولى؛ يُبلَّغ عن الأسبوع بنسب مئوية صحيحة، لذا تكون الجلسات القصيرة غير دقيقة.",
+	planDegraded: "سجل المراقب متوقف: تستخدم هذه الخطة الحصة الحالية فقط (النسبة r الافتراضية، وتُحتسب كل نافذة 5 ساعات). فعّل المراقب لخطة متعلَّمة من سجلك.",
+	planEmpty: "لا يوجد حساب يعرض نافذة جلسة ونافذة أسبوعية بعد.",
+	planError: "الخطة غير متاحة — تعذّر على الخادم حسابها.",
+	planUnplannable: (reason) => `لا خطة (${reason})`,
+	planMultiTitle: "الحسابات",
+	planMultiUse: (name) => `استخدم ${name} الآن — يجرّبه Hermes أولًا.`,
+	planMultiSwitch: (pct = "", when = "", next = "") => `بدّل إلى ${next} عندما تبلغ الجلسة نحو ${pct}${when ? ` أو انتظر إعادة الضبط ${when}` : ""}.`,
+	planMultiSwitchNow: (name) => `استهلكت هذه الجلسة حصتها من الأسبوع: بدّل إلى ${name} الآن.`,
+	planMultiReorder: (name) => `لدى ${name} أكبر هامش أسبوعي لكل جلسة — فكّر في نقله إلى الأولوية (hermes auth priority).`,
+	planMultiSpread: (strategy) => `يوزّع Hermes الطلبات على الحسابات (${strategy}): اضبط وتيرتك على الميزانية المجمّعة.`,
+	planMultiAllOut: "نفدت حصة الجلسة أو الأسبوع في كل الحسابات.",
+	planMultiCombined: (left = "", per = "") => `المتبقي إجمالًا ${left} من أسبوع · ${per} لكل جلسة`,
+	poolPosition: (n = "", size = "") => `#${n}/${size}`,
+	poolFirst: "يُجرَّب أولًا",
+	poolTip: (n = "", size = "", strategy = "") => `مجموعة بيانات اعتماد Hermes: الموضع ${n} من ${size} (${strategy})`,
+	nowTitle: "الآن",
+	nowAccount: (name = "", s = "", w = "") => `حساب Claude المستخدم: ${name} · الجلسة ${s} · الأسبوع ${w}`,
+	nowAccountSpread: (strategy) => `حسابات Claude: يوزّع Hermes الطلبات (${strategy})`,
+	// ---- notch companion ----
+	notchTitle: "جزيرة النتوء (macOS)",
+	notchIntro: "Quota Notch تطبيق Mac أصلي اختياري: حلقات الحصص والجلسات الجارية والتنبيهات في نتوء MacBook (أو شريط القوائم) خارج نافذة Hermes. يقرأ JSON الخاص بهذه الإضافة فقط، وتعمل الإضافة بدونه.",
+	notchStatus: "التطبيق المرافق",
+	notchRunning: "قيد التشغيل",
+	notchStopped: "مثبّت، غير مشغّل",
+	notchNotInstalled: "غير مثبّت",
+	notchHasNotch: "لهذا الـ Mac نتوء: تظهر الجزيرة حول الكاميرا.",
+	notchNoNotch: "ليس لهذا الـ Mac نتوء: يعمل التطبيق في شريط القوائم بدلًا من ذلك.",
+	notchUnknown: "شغّله مرة واحدة؛ بعدها يبلغ إن كان لهذا الـ Mac نتوء (وإلا يستخدم شريط القوائم).",
+	notchInstallLabel: "التثبيت (يُبنى باستخدام Xcode Command Line Tools)",
+	notchCopyInstall: "نسخ",
+	notchOpen: "فتح التطبيق",
+	notchLoading: "جارٍ التحقق من التطبيق المرافق…",
+	notchUpdate: "حدّث backend إضافة الحصص لإدارة تطبيق النتوء من هنا.",
+	notchPrivacy: "لا يشغّل إلا واجهة hermes السطرية (JSON للحصص/المراقبة للقراءة فقط) ويفتح روابط hermes://. لا شبكة ولا بيانات اعتماد.",
+	notchOpenFailed: "تعذّر فتح Quota Notch.",
+	notchNoScript: (url) => `الإضافة المثبّتة لا تحتوي على مجلد macos/. احصل عليه من ${url} وشغّل macos/install.sh.`,
+	notchRemote: (platform) => `يعمل backend هذه البوابة على ${platform}؛ ثبّت التطبيق على الـ Mac الذي يشغّل Hermes.`,
 };
 
 const I18N_BUNDLES = {

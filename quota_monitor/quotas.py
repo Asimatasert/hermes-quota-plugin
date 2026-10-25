@@ -45,6 +45,22 @@ def items_from_cache(cache: Optional[Dict[str, Any]] = None) -> List[Dict[str, A
     nested in one record; each becomes ``openai-codex:<account id>``."""
     trial.require_enrollment()
     cache = read_cache() if cache is None else cache
+    return cache_items(cache)
+
+
+def read_cache_unenrolled() -> Dict[str, Any]:
+    """The quota cache the Quota tab already shows (``quota status --json``), for the degraded plan only.
+
+    This is the plugin's own cache, not monitor data: no history, sessions or store are read.
+    """
+    data = read_json(hermes_home() / CACHE_NAME)
+    if isinstance(data, dict) and isinstance(data.get("providers"), dict):
+        return data
+    return {"fetched_at": None, "providers": {}}
+
+
+def cache_items(cache: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """``items_from_cache`` without the enrollment gate (callers gate or use the plain cache)."""
     fetched = iso_ts(cache.get("fetched_at"))
     items = []
     for key, rec in (cache.get("providers") or {}).items():
@@ -68,8 +84,23 @@ def items_from_cache(cache: Optional[Dict[str, Any]] = None) -> List[Dict[str, A
                 "plan": r.get("plan"), "windows": _windows(r),
                 "details": [str(d) for d in details], "unavailable": r.get("unavailable_reason") or None,
                 "stale": any("stale" in str(d).lower() for d in details), "fetched_at": fetched,
+                "pool": _pool_meta(r.get("pool")),
             })
     return items
+
+
+def _pool_meta(value: Any) -> Optional[Dict[str, Any]]:
+    """Only the whitelisted pool position fields (order, size, strategy)."""
+    if not isinstance(value, dict):
+        return None
+    out: Dict[str, Any] = {}
+    for key in ("priority", "size", "credentials", "unverified"):
+        v = value.get(key)
+        if isinstance(v, int) and not isinstance(v, bool):
+            out[key] = v
+    if isinstance(value.get("strategy"), str):
+        out["strategy"] = value["strategy"][:32]
+    return out or None
 
 
 def readings(items: List[Dict[str, Any]]) -> List[Tuple[str, str, float, Optional[float]]]:
