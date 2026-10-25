@@ -1041,7 +1041,25 @@ const SNAPSHOT_KEY = "lastPayload";
 const CLI_TIMEOUT_MS = 15_000;
 const _refreshInFlight = new Set();
 
+/**
+ * The host reports a null owner when the focused chat is not (yet) in its
+ * session list — e.g. on the /quota page after a gateway reconnect. Every
+ * query then stayed disabled ("Loading…" forever). Fall back to the app's
+ * active connection + profile, which is what the user is looking at.
+ */
+function ownerOrActive(owner) {
+	if (owner) return owner;
+	try {
+		const connectionId = String(host.state.connectionId?.get?.() || "").trim();
+		const profile = String(host.state.profile?.get?.() || "").trim() || "default";
+		return connectionId ? { connectionId, profile } : null;
+	} catch {
+		return null;
+	}
+}
+
 function normalizeQuotaScope(owner) {
+	owner = ownerOrActive(owner);
 	const connectionId = String(owner?.connectionId || "").trim();
 	const profile = String(owner?.profile || "").trim();
 	if (connectionId && profile) return { connectionId, profile };
