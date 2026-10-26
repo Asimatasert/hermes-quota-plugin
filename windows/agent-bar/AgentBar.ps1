@@ -102,6 +102,7 @@ $C = @{
     Bg = Brush '#FF000000'; Card = Brush '#FF0E0E10'; Section = Brush '#FF18181B'; Track = Brush '#FF2C2C30'
     Text = Brush '#FFF2F2F7'; Sub = Brush '#FF8E8E93'; Green = Brush '#FF30D158'; Yellow = Brush '#FFFFD60A'
     Orange = Brush '#FFFF9F0A'; Red = Brush '#FFFF453A'; Blue = Brush '#FF0A84FF'; Grey = Brush '#FF636366'
+    Purple = Brush '#FFBF5AF2'; Teal = Brush '#FF64D2FF'; Pink = Brush '#FFFF375F'
 }
 
 # ---- state ----------------------------------------------------------------------------------
@@ -112,6 +113,7 @@ $script:S = @{
     Cpu = -1; TotalGB = 0; FreeGB = 0
     LastRefresh = [DateTime]::MinValue
     QuotaCliAt = [DateTime]::MinValue; QuotaMtime = [DateTime]::MinValue; SnapStarted = [DateTime]::MinValue
+    Board = $null; BoardAt = $null; BoardMtime = [DateTime]::MinValue
     Expanded = $false; Tick = 0
 }
 $script:Pending = @{}
@@ -259,6 +261,36 @@ function Update-System {
     $m = [AgentBarNative]::Memory()
     $script:S.TotalGB = $m[0] / 1GB; $script:S.FreeGB = $m[1] / 1GB
     $script:S.Cpu = [AgentBarNative]::CpuPercent()
+}
+
+# ---- kanban board (written every minute by the board watchdog; reading it costs no CLI call) ----
+$BoardFile = Join-Path (Split-Path $PSScriptRoot -Parent) 'board-state.json'
+function Update-Board {
+    try {
+        if (-not (Test-Path $BoardFile)) { $script:S.Board = $null; return }
+        $fi = Get-Item $BoardFile
+        if ($script:S.BoardMtime -eq $fi.LastWriteTimeUtc) { return }
+        $script:S.Board = [IO.File]::ReadAllText($BoardFile) | ConvertFrom-Json
+        $script:S.BoardMtime = $fi.LastWriteTimeUtc; $script:S.BoardAt = Get-Date
+    } catch { Write-Log "board: $($_.Exception.Message)" }
+}
+function Get-Board {
+    $b = $script:S.Board
+    if (-not $b) { return $null }
+    if (([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [int64]$b.at) -gt 300) { return $null }   # watchdog silent > 5 min
+    return $b
+}
+function Get-BoardCards($b) { return @($b.cards | Where-Object { $_ }) }
+function Count-Of($counts, [string]$k) { if ($counts -and $counts.PSObject.Properties[$k]) { return [int]$counts.$k } else { return 0 } }
+function Format-Ago([int64]$ts) {
+    if ($ts -le 0) { return '' }
+    $sec = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - $ts
+    if ($sec -lt 60) { return 'şimdi' }
+    if ($sec -lt 3600) { return ('{0} dk' -f [math]::Floor($sec / 60)) }
+    return ('{0} sa {1} dk' -f [math]::Floor($sec / 3600), [math]::Floor(($sec % 3600) / 60))
+}
+function Profile-Brush([string]$p) {
+    switch ($p) { 'lead' { $C.Purple } 'developer' { $C.Blue } 'reviewer' { $C.Teal } 'security' { $C.Red } 'uxtester' { $C.Orange } 'designer' { $C.Pink } default { $C.Grey } }
 }
 
 # ---- derived values --------------------------------------------------------------------------
@@ -509,19 +541,22 @@ function Set-Pulse([bool]$on) {
 function Render {
     try {
         $run = Get-Running
-        $working = $(if ($run) { $run.Working } else { 0 })
+        $board = Get-Board
+        $working = $(if ($board) { (Get-BoardCards $board).Count } elseif ($run) { $run.Working } else { 0 })
+        $qstop = $(if ($board -and $board.quota_stop_pct) { [double]$board.quota_stop_pct } else { 20 })
         $week = Get-WeekMax
         $freePct = $(if ($script:S.TotalGB -gt 0) { 100 * $script:S.FreeGB / $script:S.TotalGB } else { 100 })
         $usedPct = 100 - $freePct
 
-        if (($week -ne $null -and $week -ge 20) -or $freePct -lt 20) { $dot = $C.Red; $pulse = $false }
-        elseif ($week -ne $null -and $week -ge 15) { $dot = $C.Orange; $pulse = $false }
+        if (($week -ne $null -and $week -ge $qstop) -or $freePct -lt 20 -or ($board -and $board.stop)) { $dot = $C.Red; $pulse = $false }
+        elseif ($week -ne $null -and $week -ge ($qstop - 5)) { $dot = $C.Orange; $pulse = $false }
         elseif ($working -gt 0) { $dot = $C.Blue; $pulse = $true }
         else { $dot = $C.Green; $pulse = $false }
         $script:Dot.Fill = $dot
         Set-Pulse $pulse
 
-        if ($working -gt 0) { $script:PillText.Text = ('{0} iş · %{1:0} RAM' -f $working, $usedPct) }
+        if ($board -and $board.stop) { $script:PillText.Text = ('durdu · {0} kart' -f $working) }
+        elseif ($working -gt 0) { $script:PillText.Text = ('{0} {1} · %{2:0} RAM' -f $working, $(if ($board) { 'kart' } else { 'iş' }), $usedPct) }
         elseif (-not $run -and $script:S.SnapErr -and -not $script:S.Quota) { $script:PillText.Text = 'veri yok' }
         else { $script:PillText.Text = 'boşta' }
 
@@ -536,6 +571,7 @@ function Render {
 function Build-Body {
     $b = $script:Body
     $b.Children.Clear()
+    $board = Get-Board
 
     # 1. Kota
     $sec = New-Section 'KOTA'
@@ -585,11 +621,48 @@ function Build-Body {
     $working = $(if ($run) { $run.Working } else { 0 })
     $extra = [math]::Floor(($free - 0.20 * $total) / 3)
     if ($extra -lt 0) { $extra = 0 }
-    $cap = $extra + $working
-    [void]$sec.Panel.Children.Add((New-Row 'Kapasite' ('{0}/{1} iş' -f $working, $cap) $(if ($working -ge $cap) { $C.Orange } else { $C.Green })))
+    $cap = $extra + $working; $unit = 'iş'
+    if ($board) { $working = (Get-BoardCards $board).Count; $cap = [int]$board.cap; $unit = 'kart' }
+    [void]$sec.Panel.Children.Add((New-Row 'Kapasite' ('{0}/{1} {2} · %20 RAM boş kalır' -f $working, $cap, $unit) $(if ($working -ge $cap) { $C.Orange } else { $C.Green })))
     [void]$b.Children.Add($sec.Border)
 
-    # 3. İşler
+    # 3. Pano (kanban board on this PC) - falls back to Hermes sessions when the watchdog is silent
+    if ($board) {
+    $sec = New-Section 'PANO'
+    if ($board.stop) {
+        $why = [string]$board.stop
+        if ($why -eq 'pause') { $why = 'elle duraklatıldı' } elseif ($why -like 'quota*') { $why = ('kota freni · %{0} sınırı' -f $board.quota_stop_pct) }
+        $bb = New-Badge ('DURDU · ' + $why) $C.Red; $bb.HorizontalAlignment = 'Left'; $bb.Margin = New-Object System.Windows.Thickness (0, 0, 0, 6)
+        [void]$sec.Panel.Children.Add($bb)
+    }
+    $cards = Get-BoardCards $board
+    if ($cards.Count -eq 0) { [void]$sec.Panel.Children.Add((New-Text 'çalışan kart yok' 12.5 $C.Sub)) }
+    $shown = 0
+    foreach ($r in $cards) {
+        if ($shown -ge 6) { break }
+        $shown++
+        $g = New-Object System.Windows.Controls.Grid
+        $g.Margin = New-Object System.Windows.Thickness (0, 2, 0, 2)
+        foreach ($w in @('Auto', 'Star', 'Auto')) {
+            $cd = New-Object System.Windows.Controls.ColumnDefinition
+            $cd.Width = $(if ($w -eq 'Star') { New-Object System.Windows.GridLength (1, 'Star') } else { [System.Windows.GridLength]::Auto })
+            [void]$g.ColumnDefinitions.Add($cd)
+        }
+        $badge = New-Badge ([string]$r.assignee) (Profile-Brush ([string]$r.assignee)); $badge.VerticalAlignment = 'Center'
+        $t = New-Text ([string]$r.title) 12.5 $C.Text; $t.Margin = New-Object System.Windows.Thickness (8, 0, 8, 0); $t.VerticalAlignment = 'Center'
+        $t.TextTrimming = 'CharacterEllipsis'; $t.ToolTip = ('{0} · {1}' -f $r.id, $r.title)
+        $m = New-Text (Format-Ago ([int64]$r.started_at)) 11 $C.Sub; $m.VerticalAlignment = 'Center'
+        [System.Windows.Controls.Grid]::SetColumn($t, 1); [System.Windows.Controls.Grid]::SetColumn($m, 2)
+        [void]$g.Children.Add($badge); [void]$g.Children.Add($t); [void]$g.Children.Add($m)
+        [void]$sec.Panel.Children.Add($g)
+    }
+    if ($cards.Count -gt 6) { [void]$sec.Panel.Children.Add((New-Text ('+{0} kart daha' -f ($cards.Count - 6)) 11 $C.Sub)) }
+    $cn = $board.counts
+    $q = 'hazır {0} · bekleyen {1} · bloke {2} · park {3}' -f (Count-Of $cn 'ready'), (Count-Of $cn 'todo'), (Count-Of $cn 'blocked'), (Count-Of $cn 'scheduled')
+    $qr = New-Row 'Kuyruk' $q $(if ((Count-Of $cn 'blocked') -gt 0) { $C.Orange } else { $C.Sub }); $qr.Margin = New-Object System.Windows.Thickness (0, 6, 0, 0)
+    [void]$sec.Panel.Children.Add($qr)
+    [void]$b.Children.Add($sec.Border)
+    } else {
     $sec = New-Section 'İŞLER'
     if (-not $run) {
         $n = @(Get-Process -Name hermes -ErrorAction SilentlyContinue).Count
@@ -628,6 +701,7 @@ function Build-Body {
         if ($run.Rows.Count -gt 5) { [void]$sec.Panel.Children.Add((New-Text ('+{0} oturum daha' -f ($run.Rows.Count - 5)) 11 $C.Sub)) }
     }
     [void]$b.Children.Add($sec.Border)
+    }
 
     # 4. WSL
     $sec = New-Section "WSL · $WslDistro"
@@ -637,7 +711,7 @@ function Build-Body {
     [void]$sec.Panel.Children.Add((New-Row 'Durum' $wslTxt $wslBrush))
     [void]$b.Children.Add($sec.Border)
 
-    $stamp = $script:S.QuotaAt; if ($script:S.SnapAt -and (-not $stamp -or $script:S.SnapAt -gt $stamp)) { $stamp = $script:S.SnapAt }
+    $stamp = $script:S.QuotaAt; if ($script:S.BoardAt -and (-not $stamp -or $script:S.BoardAt -gt $stamp)) { $stamp = $script:S.BoardAt }; if ($script:S.SnapAt -and (-not $stamp -or $script:S.SnapAt -gt $stamp)) { $stamp = $script:S.SnapAt }
     $foot = New-Text $(if ($stamp) { 'güncellendi {0:HH:mm:ss}' -f $stamp } else { 'veri bekleniyor…' }) 10 $C.Grey
     $foot.HorizontalAlignment = 'Center'; $foot.Margin = New-Object System.Windows.Thickness (0, 0, 0, 2)
     [void]$b.Children.Add($foot)
@@ -658,7 +732,7 @@ $miClose = New-Object System.Windows.Controls.MenuItem; $miClose.Header = 'Kapat
 [void]$menu.Items.Add($miRefresh); [void]$menu.Items.Add($miClose)
 $script:Card.ContextMenu = $menu
 $miRefresh.Add_Click({
-    Update-System; Update-Wsl
+    Update-System; Update-Board; Update-Wsl
     if (-not (HermesBusy)) {
         if (((Get-Date) - $script:S.LastRefresh).TotalMinutes -ge 15) { Start-Refresh } else { Update-Quota }
     }
@@ -678,7 +752,7 @@ $script:SysTimer.Add_Tick({
     try {
         $script:S.Tick++
         Place-Window   # follows resolution / primary-monitor changes
-        Update-System
+        Update-System; Update-Board
         if ($script:S.Tick % 3 -eq 0) { Update-Wsl }
         if ($script:S.Tick % 12 -eq 0 -and -not $script:S.Expanded) { Compact-Memory }   # every 2 min
         Render
@@ -694,6 +768,7 @@ $script:DataTimer.Add_Tick({
     try {
         $script:DataTick++
         if ($script:DataTick % 2 -eq 0) { Tick-Quota }
+        if (Get-Board) { return }   # board file covers running work: skip the Python session snapshot
         $run = Get-Running
         $every = $(if ($script:S.Expanded) { 30 } elseif ($run -and $run.Working -gt 0) { 60 } else { 120 })
         if (((Get-Date) - $script:S.SnapStarted).TotalSeconds -ge ($every - 1)) { Update-Snapshot }
@@ -720,7 +795,7 @@ $script:TrimTimer.Add_Tick({
 })
 
 $script:Win.Add_Loaded({
-    Update-System; [void][AgentBarNative]::CpuPercent()
+    Update-System; Update-Board; [void][AgentBarNative]::CpuPercent()
     Render
     $script:S.QuotaMtime = Get-QuotaMtime
     Update-Quota; Update-Wsl
