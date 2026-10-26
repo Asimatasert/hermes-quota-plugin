@@ -3,9 +3,13 @@
 
   Built only on what ships with Windows: Windows PowerShell 5.1 + WPF. No modules, no runtimes.
   Data comes from the Hermes CLI (quota plugin):
-    hermes quota status --json --cached       quota rings          (every 30 s)
-    hermes quota monitor --json snapshot      running jobs         (every 30 s, staggered by 15 s)
-    hermes quota refresh                      cache refresh        (at most every 15 min, background)
+    hermes quota status --json --cached       quota rings   (checked every 30 s; the CLI runs only when
+                                                             quota_cache.json changed, or every 5 min)
+    hermes quota monitor --json snapshot      running jobs  (30 s while the card is open, 60 s while
+                                                             jobs run, 120 s when idle)
+    hermes quota refresh                      cache refresh (cache older than 15 min, at most every 15 min)
+  Each Hermes CLI call costs a few CPU-seconds of Python, so the bar never runs two at once and skips
+  calls that cannot return anything new.
   RAM / CPU come from kernel32 (GlobalMemoryStatusEx / GetSystemTimes) every 10 s.
   Every CLI call runs as an async child process; the UI thread never waits on it.
 
@@ -36,8 +40,7 @@ function Write-Log([string]$msg) {
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
-if (-not ('AgentBarNative' -as [type])) {
-    Add-Type -TypeDefinition @'
+$nativeSrc = @'
 using System;
 using System.Runtime.InteropServices;
 public static class AgentBarNative {
@@ -75,6 +78,22 @@ public static class AgentBarNative {
     }
 }
 '@
+# Compile the P/Invoke helper once into a hash-named DLL next to the script and load that on later
+# starts, so csc.exe does not run at every logon.
+if (-not ('AgentBarNative' -as [type])) {
+    $sha = [System.Security.Cryptography.SHA1]::Create()
+    $hash = -join ($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($nativeSrc))[0..4] | ForEach-Object { $_.ToString('x2') })
+    $dll = Join-Path $script:Dir "AgentBarNative.$hash.dll"
+    try {
+        if (-not (Test-Path $dll)) {
+            Get-ChildItem -Path $script:Dir -Filter 'AgentBarNative.*.dll' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+            Add-Type -TypeDefinition $nativeSrc -OutputAssembly $dll -OutputType Library
+        }
+        Add-Type -Path $dll
+    } catch {
+        Write-Log "native dll: $($_.Exception.Message); compiling in memory"
+        if (-not ('AgentBarNative' -as [type])) { Add-Type -TypeDefinition $nativeSrc }
+    }
 }
 
 # ---- palette (Apple system colours, same as the macOS Agent Bar) -------------------------------
@@ -92,6 +111,7 @@ $script:S = @{
     Wsl = 'bilinmiyor'; WslContainers = $null
     Cpu = -1; TotalGB = 0; FreeGB = 0
     LastRefresh = [DateTime]::MinValue
+    QuotaCliAt = [DateTime]::MinValue; QuotaMtime = [DateTime]::MinValue; SnapStarted = [DateTime]::MinValue
     Expanded = $false; Tick = 0
 }
 $script:Pending = @{}
@@ -161,16 +181,38 @@ function Parse-Json([string]$text) {
 }
 
 # ---- data collectors -----------------------------------------------------------------------
+$script:QuotaCacheFile = Join-Path $(if ($env:HERMES_HOME) { $env:HERMES_HOME } else { Join-Path $env:LOCALAPPDATA 'hermes' }) 'quota_cache.json'
+
+function Get-QuotaMtime {
+    try { if (Test-Path $script:QuotaCacheFile) { return [System.IO.File]::GetLastWriteTimeUtc($script:QuotaCacheFile) } } catch { }
+    return $null
+}
+
+function HermesBusy { return ($script:Pending.ContainsKey('quota') -or $script:Pending.ContainsKey('snap') -or $script:Pending.ContainsKey('refresh')) }
+
+# Quota tick (30 s): read via the CLI only when the cache file changed (or every 5 min / if the
+# file cannot be found); refresh in the background when the cache is older than 15 min.
+function Tick-Quota {
+    $m = Get-QuotaMtime
+    if ($m -and ([DateTime]::UtcNow - $m).TotalMinutes -gt 15 -and ((Get-Date) - $script:S.LastRefresh).TotalMinutes -ge 15 -and -not (HermesBusy)) {
+        Start-Refresh; return
+    }
+    $stale = ((Get-Date) - $script:S.QuotaCliAt).TotalMinutes -ge 5
+    if (-not $m -or $m -ne $script:S.QuotaMtime -or $stale) {
+        $script:S.QuotaMtime = $m
+        Update-Quota
+    }
+}
+
 function Update-Quota {
+    if (HermesBusy) { return }
+    $script:S.QuotaCliAt = Get-Date
     Start-Job2 'quota' $script:Hermes 'quota status --json --cached' 20 {
         param($out, $err)
         $q = $null
         if (-not $err) { try { $q = Parse-Json $out } catch { $err = 'JSON okunamadı' } }
         if ($q) {
             $script:S.Quota = $q; $script:S.QuotaAt = Get-Date; $script:S.QuotaErr = $null
-            # cache older than 15 min -> background refresh, at most once per 15 min
-            $age = 0; try { $age = [double]$q.age_s } catch { }
-            if ($age -gt 900 -and ((Get-Date) - $script:S.LastRefresh).TotalMinutes -ge 15) { Start-Refresh }
         } else { $script:S.QuotaErr = $(if ($err) { $err } else { 'veri yok' }) }
         Render
     } $null
@@ -178,10 +220,12 @@ function Update-Quota {
 
 function Start-Refresh {
     $script:S.LastRefresh = Get-Date
-    Start-Job2 'refresh' $script:Hermes 'quota refresh' 180 { param($out, $err) if ($err) { Write-Log "refresh: $err" } else { Update-Quota } } $null
+    Start-Job2 'refresh' $script:Hermes 'quota refresh' 180 { param($out, $err) if ($err) { Write-Log "refresh: $err" } else { $script:S.QuotaMtime = Get-QuotaMtime; Update-Quota } } $null
 }
 
 function Update-Snapshot {
+    if (HermesBusy) { return }
+    $script:S.SnapStarted = Get-Date
     Start-Job2 'snap' $script:Hermes 'quota monitor --json snapshot' 30 {
         param($out, $err)
         $s = $null
@@ -350,7 +394,7 @@ function New-Badge([string]$text, $brush) {
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Hermes Agent Bar" WindowStyle="None" AllowsTransparency="True" Background="Transparent"
         Topmost="True" ShowInTaskbar="False" ShowActivated="False" ResizeMode="NoResize"
-        Width="440" Height="700" UseLayoutRounding="True" SnapsToDevicePixels="True"
+        Width="200" Height="30" UseLayoutRounding="True" SnapsToDevicePixels="True"
         FontFamily="Segoe UI Variable Text, Segoe UI" TextOptions.TextFormattingMode="Display">
   <Grid>
     <Border x:Name="Card" HorizontalAlignment="Center" VerticalAlignment="Top" Width="200" Height="30"
@@ -401,6 +445,14 @@ function Animate($target, $prop, [double]$to, [int]$ms) {
     $a.EasingFunction = $script:Ease
     [System.Windows.Media.Animation.Timeline]::SetDesiredFrameRate($a, 60)
     $target.BeginAnimation($prop, $a)
+    return $a
+}
+
+# The layered window is only as big as the pill while collapsed: every redraw (pulse frames)
+# then touches 200x30 px instead of the whole 440x700 card area.
+function Set-WindowSize([bool]$big) {
+    if ($big) { $script:Win.Width = 440; $script:Win.Height = 700 } else { $script:Win.Width = $CollapsedW; $script:Win.Height = $CollapsedH }
+    Place-Window
 }
 
 function Get-BodyHeight {
@@ -411,29 +463,40 @@ function Get-BodyHeight {
 
 function Expand {
     $script:S.Expanded = $true
+    Set-WindowSize $true
+    if (((Get-Date) - $script:S.SnapStarted).TotalSeconds -ge 15) { Update-Snapshot }
     Build-Body
     $script:Card.CornerRadius = New-Object System.Windows.CornerRadius (0, 0, 22, 22)
     $script:Card.Background = $C.Card
-    Animate $script:Card ([System.Windows.FrameworkElement]::WidthProperty) $ExpandedW 220
-    Animate $script:Card ([System.Windows.FrameworkElement]::HeightProperty) (Get-BodyHeight) 240
-    Animate $script:Body ([System.Windows.UIElement]::OpacityProperty) 1 260
+    [void](Animate $script:Card ([System.Windows.FrameworkElement]::WidthProperty) $ExpandedW 220)
+    [void](Animate $script:Card ([System.Windows.FrameworkElement]::HeightProperty) (Get-BodyHeight) 240)
+    [void](Animate $script:Body ([System.Windows.UIElement]::OpacityProperty) 1 260)
 }
 
 function Collapse {
     if ($Pinned) { return }
     $script:S.Expanded = $false
-    Animate $script:Body ([System.Windows.UIElement]::OpacityProperty) 0 120
-    Animate $script:Card ([System.Windows.FrameworkElement]::WidthProperty) $CollapsedW 200
-    Animate $script:Card ([System.Windows.FrameworkElement]::HeightProperty) $CollapsedH 200
-    $script:Card.CornerRadius = New-Object System.Windows.CornerRadius (0, 0, 14, 14)
-    $script:Card.Background = $C.Bg
+    [void](Animate $script:Body ([System.Windows.UIElement]::OpacityProperty) 0 120)
+    [void](Animate $script:Card ([System.Windows.FrameworkElement]::WidthProperty) $CollapsedW 200)
+    $a = New-Object System.Windows.Media.Animation.DoubleAnimation
+    $a.To = $CollapsedH; $a.Duration = New-Object System.Windows.Duration ([TimeSpan]::FromMilliseconds(200)); $a.EasingFunction = $script:Ease
+    $a.Add_Completed({
+        if (-not $script:S.Expanded) {
+            $script:Card.CornerRadius = New-Object System.Windows.CornerRadius (0, 0, 14, 14)
+            $script:Card.Background = $C.Bg
+            $script:Body.Children.Clear()
+            Set-WindowSize $false
+            Compact-Memory
+        }
+    })
+    $script:Card.BeginAnimation([System.Windows.FrameworkElement]::HeightProperty, $a)
 }
 
 # pulsing dot (only while jobs run; low frame rate keeps the layered window cheap)
 $script:Pulse = New-Object System.Windows.Media.Animation.DoubleAnimation (1.0, 0.3, (New-Object System.Windows.Duration ([TimeSpan]::FromMilliseconds(900))))
 $script:Pulse.AutoReverse = $true
 $script:Pulse.RepeatBehavior = [System.Windows.Media.Animation.RepeatBehavior]::Forever
-[System.Windows.Media.Animation.Timeline]::SetDesiredFrameRate($script:Pulse, 12)
+[System.Windows.Media.Animation.Timeline]::SetDesiredFrameRate($script:Pulse, 8)
 $script:Pulsing = $false
 function Set-Pulse([bool]$on) {
     if ($on -eq $script:Pulsing) { return }
@@ -465,7 +528,7 @@ function Render {
         if ($script:S.Expanded) {
             Build-Body
             $h = Get-BodyHeight
-            if ([math]::Abs($script:Card.ActualHeight - $h) -gt 1) { Animate $script:Card ([System.Windows.FrameworkElement]::HeightProperty) $h 160 }
+            if ([math]::Abs($script:Card.ActualHeight - $h) -gt 1) { [void](Animate $script:Card ([System.Windows.FrameworkElement]::HeightProperty) $h 160) }
         }
     } catch { Write-Log "render: $($_.Exception.Message)" }
 }
@@ -595,8 +658,10 @@ $miClose = New-Object System.Windows.Controls.MenuItem; $miClose.Header = 'Kapat
 [void]$menu.Items.Add($miRefresh); [void]$menu.Items.Add($miClose)
 $script:Card.ContextMenu = $menu
 $miRefresh.Add_Click({
-    Update-System; Update-Quota; Update-Snapshot; Update-Wsl
-    if (((Get-Date) - $script:S.LastRefresh).TotalMinutes -ge 15) { Start-Refresh }
+    Update-System; Update-Wsl
+    if (-not (HermesBusy)) {
+        if (((Get-Date) - $script:S.LastRefresh).TotalMinutes -ge 15) { Start-Refresh } else { Update-Quota }
+    }
     Render
 })
 $miClose.Add_Click({ $script:Win.Close() })
@@ -615,33 +680,49 @@ $script:SysTimer.Add_Tick({
         Place-Window   # follows resolution / primary-monitor changes
         Update-System
         if ($script:S.Tick % 3 -eq 0) { Update-Wsl }
+        if ($script:S.Tick % 12 -eq 0 -and -not $script:S.Expanded) { Compact-Memory }   # every 2 min
         Render
     } catch { Write-Log "sys: $($_.Exception.Message)" }
 })
 
-# 15 s, alternating: quota (30 s) / snapshot (30 s) -> never two hermes processes at once
-$script:DataFlip = $false
+# 15 s scheduler: quota check every 2nd tick (30 s); snapshot by interval (30/60/120 s).
+# Update-* return early while another Hermes call runs, so at most one Python process at a time.
+$script:DataTick = 0
 $script:DataTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:DataTimer.Interval = [TimeSpan]::FromSeconds(15)
 $script:DataTimer.Add_Tick({
     try {
-        $script:DataFlip = -not $script:DataFlip
-        if ($script:DataFlip) { Update-Snapshot } else { Update-Quota }
+        $script:DataTick++
+        if ($script:DataTick % 2 -eq 0) { Tick-Quota }
+        $run = Get-Running
+        $every = $(if ($script:S.Expanded) { 30 } elseif ($run -and $run.Working -gt 0) { 60 } else { 120 })
+        if (((Get-Date) - $script:S.SnapStarted).TotalSeconds -ge ($every - 1)) { Update-Snapshot }
     } catch { Write-Log "data: $($_.Exception.Message)" }
 })
+
+# Parsed JSON / rebuilt card visuals are short-lived garbage; a full blocking collection with LOH
+# compaction every 2 min (a few ms) keeps the committed heap small for a long-running bar.
+function Compact-Memory {
+    try {
+        [System.Runtime.GCSettings]::LargeObjectHeapCompactionMode = 'CompactOnce'
+        [GC]::Collect(2, [GCCollectionMode]::Forced, $true, $true)
+        [GC]::WaitForPendingFinalizers()
+    } catch { }
+}
 
 # trim the start-up working set once (WPF + Add-Type compile garbage)
 $script:TrimTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:TrimTimer.Interval = [TimeSpan]::FromSeconds(20)
 $script:TrimTimer.Add_Tick({
     $script:TrimTimer.Stop()
-    [GC]::Collect(); [GC]::WaitForPendingFinalizers()
+    Compact-Memory
     try { [void][AgentBarNative]::EmptyWorkingSet((Get-Process -Id $PID).Handle) } catch { }
 })
 
 $script:Win.Add_Loaded({
     Update-System; [void][AgentBarNative]::CpuPercent()
     Render
+    $script:S.QuotaMtime = Get-QuotaMtime
     Update-Quota; Update-Wsl
     $script:SysTimer.Start(); $script:DataTimer.Start(); $script:TrimTimer.Start()
     if ($Pinned) { Expand }

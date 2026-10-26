@@ -31,13 +31,17 @@ Right-click the pill for a menu with **Yenile** (refresh now) and **Kapat** (qui
 
 ## Cost
 
+Each Hermes CLI call starts Python. On the reference PC, `quota status --json --cached` costs about 4 CPU-seconds and `quota monitor --json snapshot` about 7. That is far more than the bar itself, so the bar avoids calls that cannot return anything new:
+
 | What | How often |
 |---|---|
 | RAM / CPU (kernel32 `GlobalMemoryStatusEx`, `GetSystemTimes`) | every 10 s |
-| `hermes quota status --json --cached` | every 30 s |
-| `hermes quota monitor --json snapshot` | every 30 s, 15 s offset from the quota call, so only one hermes process runs at a time |
+| `hermes quota status --json --cached` | checked every 30 s, but only run when `$HERMES_HOME\quota_cache.json` changed, and at least every 5 min |
+| `hermes quota monitor --json snapshot` | every 30 s while the card is open, 60 s while jobs run, 120 s when idle; on hover, run at once if the last result is older than 15 s |
 | `wsl -l --running` (+ `docker ps -q` when the distro runs) | every 30 s |
-| `hermes quota refresh` | only when the cache is older than 15 min, at most once every 15 min |
+| `hermes quota refresh` | when the cache file is older than 15 min, at most once every 15 min |
+
+At most one Hermes process runs at a time.
 
 Every CLI call runs as an asynchronous child process with a timeout. The UI thread never waits on one, so a slow or missing Hermes CLI shows `veri yok` (no data) instead of freezing the bar.
 
